@@ -1,0 +1,11 @@
+REQUIREMENTS.md
+
+.DS_Store
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.*
+.vscode/
+.idea/
