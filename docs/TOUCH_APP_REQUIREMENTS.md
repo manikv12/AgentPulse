@@ -1,10 +1,10 @@
-# CodexPulse Touch App Requirements
+# AgentPulse Touch App Requirements
 
 ## Summary
 
-CodexPulse v1 is a touch-controlled app for Codex.
+AgentPulse v1 is a touch-controlled app for Codex.
 
-The first version runs as a local web app on an iPad, Android tablet, or small touch-screen browser device. The Mac runs Codex and the CodexPulse helper. The tablet is the control screen.
+The first version runs as a local web app on an iPad, Android tablet, or small touch-screen browser device. The Mac runs Codex and the AgentPulse helper. The tablet is the control screen.
 
 ## Goal
 
@@ -23,7 +23,7 @@ The user should be able to tap a thread on the tablet and open that thread in Co
 - **Thread**: a Codex conversation as shown in Codex Desktop / VS Code, identified by a stable thread ID.
 - **Session**: a single run of Codex producing turns and tool calls for a thread.
 - **Rollout**: the on-disk JSONL file under `~/.codex/sessions/...` that records a session's events.
-- **Helper**: the local CodexPulse Mac service that reads Codex state and serves the touch app.
+- **Helper**: the local AgentPulse Mac service that reads Codex state and serves the touch app.
 - **Tablet**: any paired browser client (iPad Safari, Android Chrome, kiosk browser).
 
 In the API and UI, "thread" is the user-visible unit. Sessions and rollouts are implementation details inside the helper.
@@ -60,7 +60,7 @@ The tablet should be able to feel like a dedicated Codex panel.
 
 For iPad:
 
-- Open the CodexPulse touch app in Safari.
+- Open the AgentPulse touch app in Safari.
 - Add it to the Home Screen.
 - Use Guided Access to lock the iPad to that app.
 
@@ -70,7 +70,7 @@ For Android:
 - Use Fully Kiosk Browser for stronger kiosk mode.
 - Use Android Enterprise or MDM later if a managed setup is needed.
 
-CodexPulse only needs to provide a clean full-screen web app that works well in these modes.
+AgentPulse only needs to provide a clean full-screen web app that works well in these modes.
 
 ## Thread Status Model
 
@@ -114,7 +114,7 @@ The v1 touch app includes:
 
 Example flow:
 
-1. User opens CodexPulse on an iPad.
+1. User opens AgentPulse on an iPad.
 2. The iPad shows the running Codex threads from the Mac.
 3. One thread changes to yellow because it needs approval.
 4. User taps that thread on the iPad.
@@ -132,11 +132,11 @@ iPad or Android tablet
         |
         | browser, paired token
         v
-CodexPulse touch web app
+AgentPulse touch web app
         |
         | local network API
         v
-CodexPulse helper on Mac
+AgentPulse helper on Mac
         |
         +--> codex app-server
         +--> ~/.codex local state
@@ -149,7 +149,7 @@ The tablet does not read Codex files directly. The tablet does not connect direc
 
 ## Codex Data Sources
 
-The helper uses the same safe data sources already researched for CodexPulse:
+The helper uses the same safe data sources already researched for AgentPulse:
 
 - `codex app-server` for live Codex events where possible.
 - `~/.codex/state_5.sqlite` for thread metadata.
@@ -178,7 +178,7 @@ Requirements:
 ### Port and discovery
 
 - Default port: configurable in helper settings; helper picks a free high port on first run and persists it.
-- mDNS/Bonjour: helper advertises `_codexpulse._tcp` on the LAN so tablets can discover `mac-name.local`.
+- mDNS/Bonjour: helper advertises `_agentpulse._tcp` on the LAN so tablets can discover `mac-name.local`.
 - Fallback: helper settings screen shows the raw IP + port for networks where mDNS is blocked. The tablet pairing screen accepts either form.
 
 ### Transport
@@ -193,7 +193,7 @@ Requirements:
 
 ## Security Requirements
 
-CodexPulse must be careful because Codex can affect local files and projects.
+AgentPulse must be careful because Codex can affect local files and projects.
 
 Security rules:
 
@@ -208,7 +208,7 @@ Security rules:
 
 ### Token lifetime
 
-- Tokens are stored in macOS Keychain under a CodexPulse service entry (e.g. `com.codexpulse.helper`), scoped per device.
+- Tokens are stored in macOS Keychain under a AgentPulse service entry (e.g. `com.agentpulse.helper`), scoped per device.
 - Tokens have no fixed expiry but can be rotated or revoked at any time from helper settings.
 - Helper restart preserves tokens; reinstalling the helper or clearing the Keychain entry resets all pairings.
 - A "rotate token" action invalidates the old token and emits a fresh pairing PIN for that device.
@@ -332,7 +332,7 @@ For v1:
 
 - Do not depend on Codex `remote_control`.
 - Do not require OpenAI backend enrollment for the tablet app.
-- Use CodexPulse's own local helper API.
+- Use AgentPulse's own local helper API.
 
 Future:
 

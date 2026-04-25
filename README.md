@@ -1,8 +1,8 @@
-# CodexPulse
+# AgentPulse
 
-A touch-controlled Codex dashboard for iPad, Android tablet, and small desk displays.
+A touch-controlled dashboard for local AI coding agents (Codex, Claude Code, GitHub Copilot CLI), built for iPad, Android tablet, and small desk displays.
 
-CodexPulse shows the Codex threads running on your Mac on a touch screen, with color-coded status so you can quickly see which ones are active, idle, waiting on approval, or errored. Tapping a thread opens that thread in Codex on the Mac.
+AgentPulse shows the agent threads running on your Mac on a touch screen, with color-coded status so you can quickly see which ones are active, idle, waiting on approval, or errored. Tapping a thread opens that thread in the underlying agent on the Mac. v1 targets Codex; Claude Code and Copilot CLI adapters are planned.
 
 ## Status
 
