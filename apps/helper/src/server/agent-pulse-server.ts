@@ -760,12 +760,18 @@ function createApp(
       const sendOptions = viaAppServer && override
         ? { model: override.model, ...(override.effort ? { effort: override.effort } : {}) }
         : undefined;
-      const sendCall = () =>
-        viaAppServer
-          ? options.appServer!.sendMessage(threadId, parsed.text, sendOptions)
-          : (sender as CodexMirrorBridge).sendMessage(threadId, parsed.text);
+      // Only the mirror path needs ownership wrangling. App-server talks JSON-RPC directly to
+      // a Codex backend (no ownership concept), so skip the 4-second opener/wait — sending must
+      // feel instant when the thread isn't focused on the Mac.
       const result = ThreadMessageResponseSchema.parse(
-        await runWithFollowerOwnership(sendCall, options.opener, threadId, options.mirror)
+        viaAppServer
+          ? await options.appServer!.sendMessage(threadId, parsed.text, sendOptions)
+          : await runWithFollowerOwnership(
+              () => (sender as CodexMirrorBridge).sendMessage(threadId, parsed.text),
+              options.opener,
+              threadId,
+              options.mirror
+            )
       );
       // Once the override has been delivered (either as part of an app-server turn/start, or via
       // a successful mirror send through an owning window), drop it.

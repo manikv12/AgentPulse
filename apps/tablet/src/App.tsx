@@ -613,6 +613,17 @@ export function App() {
 
         if (liveEvent.type === 'thread/transcript/changed') {
           setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
+          // Also hydrate the model state from the transcript — Codex doesn't always emit a
+          // standalone model-changed event, so this keeps the chip in sync regardless.
+          if (liveEvent.payload.model) {
+            const transcriptModel = liveEvent.payload.model;
+            const transcriptThreadId = liveEvent.payload.threadId;
+            setThreadModels((current) =>
+              current[transcriptThreadId] === transcriptModel
+                ? current
+                : { ...current, [transcriptThreadId]: transcriptModel }
+            );
+          }
         }
 
         if (liveEvent.type === 'thread/streaming-changed') {
@@ -677,6 +688,14 @@ export function App() {
               try {
                 const transcript = await fetchThreadTranscript(session, conversationId);
                 setTranscripts((current) => upsertTranscriptCache(current, transcript));
+                if (transcript.model) {
+                  const refetchedModel = transcript.model;
+                  setThreadModels((current) =>
+                    current[conversationId] === refetchedModel
+                      ? current
+                      : { ...current, [conversationId]: refetchedModel }
+                  );
+                }
               } catch {
                 // ignore — the next polling refresh or broadcast will retry
               }
@@ -780,6 +799,14 @@ export function App() {
 
       const transcript = await fetchThreadTranscript(session, threadId, options);
       setTranscripts((current) => upsertTranscriptCache(current, transcript));
+      if (transcript.model) {
+        const fetchedModel = transcript.model;
+        setThreadModels((current) =>
+          current[threadId] === fetchedModel
+            ? current
+            : { ...current, [threadId]: fetchedModel }
+        );
+      }
       return transcript;
     },
     [session]
@@ -793,6 +820,12 @@ export function App() {
 
       const result = await sendThreadMessage(session, threadId, text);
       setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
+      if (result.transcript.model) {
+        const sentModel = result.transcript.model;
+        setThreadModels((current) =>
+          current[threadId] === sentModel ? current : { ...current, [threadId]: sentModel }
+        );
+      }
       return result;
     },
     [session]

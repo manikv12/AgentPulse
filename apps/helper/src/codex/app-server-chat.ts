@@ -17,6 +17,11 @@ export type CodexAppServerTransport = {
 
 type AppServerThreadResponse = {
   thread: AppServerThread;
+  // The desktop's `thread/resume` response also surfaces the current model + effort at the
+  // top level. We hand these through onto the transcript so the tablet's chip stays in sync
+  // with what the user (or another window) selected — without relying on the broadcast.
+  model?: string;
+  reasoningEffort?: string;
 };
 
 type AppServerThreadTurnsListResponse = {
@@ -34,6 +39,10 @@ type AppServerThread = {
   preview?: string;
   updatedAt?: number;
   createdAt?: number;
+  // Threads created via thread/resume also carry the model + reasoning effort directly on
+  // the thread object in some Codex builds.
+  model?: string | null;
+  reasoningEffort?: string | null;
 };
 
 type AppServerThreadStatus =
@@ -241,9 +250,13 @@ export class CodexAppServerChat {
         }),
         this.loadRecentTurns(threadId).catch(() => [] as AppServerTurn[])
       ]);
+      // The current model/effort are returned at the response level (alongside `thread`).
+      // We bake them onto the thread object so mapThreadToTranscript can surface them.
       return {
         ...resumeResponse.thread,
-        turns
+        turns,
+        model: resumeResponse.model ?? resumeResponse.thread.model ?? null,
+        reasoningEffort: resumeResponse.reasoningEffort ?? resumeResponse.thread.reasoningEffort ?? null
       };
     } catch {
       const response = await this.transport.request<AppServerThreadResponse>('thread/read', {
@@ -252,7 +265,9 @@ export class CodexAppServerChat {
       });
       return {
         ...response.thread,
-        turns: recentTurns(response.thread.turns)
+        turns: recentTurns(response.thread.turns),
+        model: response.model ?? response.thread.model ?? null,
+        reasoningEffort: response.reasoningEffort ?? response.thread.reasoningEffort ?? null
       };
     }
   }
@@ -319,12 +334,19 @@ function mapThreadToTranscript(thread: AppServerThread): ThreadTranscript {
   const activeTurn = inProgressTurn;
   const sendState = sendStateForThread(thread, activeTurn);
   const messages = thread.turns.flatMap((turn) => mapTurnMessages(turn)).slice(-180);
+  const model = typeof thread.model === 'string' && thread.model.trim() ? thread.model.trim() : undefined;
+  const reasoningEffort =
+    typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim()
+      ? thread.reasoningEffort.trim()
+      : undefined;
 
   return ThreadTranscriptSchema.parse({
     threadId: thread.id,
     activeTurnId: activeTurn?.id ?? null,
     sendState,
-    messages
+    messages,
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {})
   });
 }
 

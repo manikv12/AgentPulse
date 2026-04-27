@@ -268,7 +268,12 @@ export const ThreadTranscriptSchema = z.object({
   activeTurnId: z.string().min(1).nullable(),
   sendState: ThreadSendStateSchema,
   messages: z.array(ChatMessageSchema),
-  usage: ThreadUsageSchema.optional()
+  usage: ThreadUsageSchema.optional(),
+  // Current model + reasoning effort recorded for this conversation. Sourced from the
+  // thread/resume response so the tablet stays in sync with whatever the desktop changed
+  // without us needing to listen for the snapshot broadcast.
+  model: z.string().min(1).optional(),
+  reasoningEffort: z.string().min(1).optional()
 });
 
 export type ThreadTranscript = z.infer<typeof ThreadTranscriptSchema>;
