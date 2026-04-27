@@ -138,6 +138,21 @@ export class CodexAppServerChat {
     return mapThreadToTranscript(thread);
   }
 
+  async readFullTranscript(threadId: string): Promise<ThreadTranscript> {
+    const response = await this.transport.request<AppServerThreadResponse>('thread/read', {
+      threadId,
+      includeTurns: true
+    });
+    return mapThreadToTranscript(
+      {
+        ...response.thread,
+        model: response.model ?? response.thread.model ?? null,
+        reasoningEffort: response.reasoningEffort ?? response.thread.reasoningEffort ?? null
+      },
+      { messageLimit: null }
+    );
+  }
+
   async sendMessage(
     threadId: string,
     text: string,
@@ -329,11 +344,27 @@ function userTextInput(text: string) {
   ];
 }
 
-function mapThreadToTranscript(thread: AppServerThread): ThreadTranscript {
+type TranscriptMapOptions = {
+  messageLimit?: number | null;
+};
+
+const APP_SERVER_ACTIVE_TURN_PREFIX = 'app-server-active:';
+
+function appServerActiveTurnId(threadId: string): string {
+  return `${APP_SERVER_ACTIVE_TURN_PREFIX}${threadId}`;
+}
+
+function mapThreadToTranscript(
+  thread: AppServerThread,
+  options: TranscriptMapOptions = {}
+): ThreadTranscript {
   const inProgressTurn = thread.turns.find((turn) => turn.status === 'inProgress') ?? null;
-  const activeTurn = inProgressTurn;
-  const sendState = sendStateForThread(thread, activeTurn);
-  const messages = thread.turns.flatMap((turn) => mapTurnMessages(turn)).slice(-180);
+  const activeTurnId =
+    inProgressTurn?.id ?? (thread.status.type === 'active' ? appServerActiveTurnId(thread.id) : null);
+  const sendState = sendStateForThread(thread, inProgressTurn);
+  const allMessages = thread.turns.flatMap((turn) => mapTurnMessages(turn));
+  const messageLimit = options.messageLimit === undefined ? 180 : options.messageLimit;
+  const messages = messageLimit === null ? allMessages : allMessages.slice(-messageLimit);
   const model = typeof thread.model === 'string' && thread.model.trim() ? thread.model.trim() : undefined;
   const reasoningEffort =
     typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim()
@@ -342,7 +373,7 @@ function mapThreadToTranscript(thread: AppServerThread): ThreadTranscript {
 
   return ThreadTranscriptSchema.parse({
     threadId: thread.id,
-    activeTurnId: activeTurn?.id ?? null,
+    activeTurnId,
     sendState,
     messages,
     ...(model ? { model } : {}),
@@ -373,6 +404,14 @@ function sendStateForThread(thread: AppServerThread, activeTurn: AppServerTurn |
         canSend: false,
         reason: 'waiting_on_user_input',
         label: 'Codex needs input on the Mac.'
+      };
+    }
+
+    if (!activeTurn) {
+      return {
+        canSend: false,
+        reason: 'missing_active_turn',
+        label: 'Codex is working'
       };
     }
   }

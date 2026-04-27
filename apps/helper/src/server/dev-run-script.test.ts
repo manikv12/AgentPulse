@@ -16,7 +16,7 @@ describe('dev-run Cloudflare wiring', () => {
     expect(script).toContain('AGENT_PULSE_HMR_CLIENT_PORT="443"');
     expect(script).toContain('pnpm --filter @agent-pulse/tablet dev');
     expect(script).toContain('vite_origin="${vite_url%/}"');
-    expect(script).toContain('tunnel_origin="$helper_url"');
+    expect(script).toContain('tunnel_origin="${helper_url//localhost/127.0.0.1}"');
     expect(script).toContain('if [[ "$tunnel_target" == "vite" ]]');
     expect(script).toContain('service: $tunnel_origin');
     expect(script).toContain('origin_url="$tunnel_origin"');

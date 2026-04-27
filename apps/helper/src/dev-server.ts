@@ -11,6 +11,7 @@ import { DeviceRegistry, PairingManager } from './auth/pairing';
 import { CodexThreadReader, readUsageFromRollout } from './codex/thread-reader';
 import { createRolloutLookup } from './codex/rollout-lookup';
 import { createThreadOpener } from './codex/thread-opener';
+import { debugLog } from './debug';
 import { startAgentPulseServer, type RunningAgentPulseServer } from './server/agent-pulse-server';
 import { CloudflareTunnelSupervisor } from './server/cloudflare-tunnel';
 import { BonjourAdvertiser } from './server/mdns';
@@ -48,8 +49,8 @@ const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: '0.
 const ipc = createIpcClient({
   clientType: 'agent-pulse',
   logger: {
-    debug: (msg, extra) => console.debug(`[ipc] ${msg}`, extra ?? ''),
-    info: (msg, extra) => console.info(`[ipc] ${msg}`, extra ?? ''),
+    debug: (msg, extra) => debugLog(`[ipc] ${msg}`, extra ?? ''),
+    info: (msg, extra) => debugLog(`[ipc] ${msg}`, extra ?? ''),
     warn: (msg, extra) => console.warn(`[ipc] ${msg}`, extra ?? '')
   }
 });

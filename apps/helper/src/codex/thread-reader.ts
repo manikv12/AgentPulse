@@ -480,7 +480,8 @@ function parseUsageLine(line: string): ThreadUsage | undefined {
   }
   const info = payloadObj.info as Record<string, unknown> | undefined;
   const total = info?.total_token_usage as Record<string, unknown> | undefined;
-  const contextTokens = numberField(total, 'total_tokens');
+  const last = info?.last_token_usage as Record<string, unknown> | undefined;
+  const contextTokens = numberField(last, 'total_tokens') ?? numberField(total, 'total_tokens');
   const contextWindow = numberField(info, 'model_context_window');
   const contextUsedPercent =
     contextTokens !== undefined && contextWindow && contextWindow > 0

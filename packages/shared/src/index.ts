@@ -278,6 +278,17 @@ export const ThreadTranscriptSchema = z.object({
 
 export type ThreadTranscript = z.infer<typeof ThreadTranscriptSchema>;
 
+// Response shape for the "load older messages" endpoint. Distinct from a full
+// transcript fetch because it only carries a window of messages and a flag
+// telling the client whether more history is available.
+export const OlderThreadMessagesResponseSchema = z.object({
+  threadId: z.string().min(1),
+  messages: z.array(ChatMessageSchema),
+  hasMore: z.boolean()
+});
+
+export type OlderThreadMessagesResponse = z.infer<typeof OlderThreadMessagesResponseSchema>;
+
 export const ThreadMessageRequestSchema = z.object({
   text: z.string().trim().min(1).max(4000)
 });
@@ -290,6 +301,12 @@ export const ThreadMessageResponseSchema = z.object({
 });
 
 export type ThreadMessageResponse = z.infer<typeof ThreadMessageResponseSchema>;
+
+export const ThreadStopResponseSchema = z.object({
+  ok: z.literal(true)
+});
+
+export type ThreadStopResponse = z.infer<typeof ThreadStopResponseSchema>;
 
 export const DeviceRevokeRequestSchema = z.object({
   deviceId: z.string().min(1)
@@ -330,7 +347,8 @@ export const CatalogSkillSchema = z.object({
   description: z.string().optional(),
   argumentHint: z.string().optional(),
   source: z.enum(['user', 'project']),
-  scopePath: z.string().optional()
+  scopePath: z.string().optional(),
+  iconUrl: z.string().min(1).optional()
 });
 
 export type CatalogSkill = z.infer<typeof CatalogSkillSchema>;

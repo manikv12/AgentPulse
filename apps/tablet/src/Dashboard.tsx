@@ -4,6 +4,7 @@ import type {
   CatalogPlugin,
   CatalogSkill,
   HelperHealth,
+  OlderThreadMessagesResponse,
   Project,
   Thread,
   ThreadMessageResponse,
@@ -34,6 +35,12 @@ export type DashboardProps = {
     options?: FetchThreadTranscriptOptions
   ) => Promise<ThreadTranscript>;
   sendMessage?: (threadId: string, text: string) => Promise<ThreadMessageResponse>;
+  stopWork?: (threadId: string) => Promise<void>;
+  fetchOlderMessages?: (
+    threadId: string,
+    beforeMessageId: string,
+    limit?: number
+  ) => Promise<OlderThreadMessagesResponse>;
   transcriptUpdates?: Record<string, ThreadTranscript>;
   threadModels?: Record<string, string>;
   threadReasoningEfforts?: Record<string, string>;
@@ -84,6 +91,8 @@ export function Dashboard({
   onOpenSettings,
   fetchTranscript,
   sendMessage,
+  stopWork,
+  fetchOlderMessages,
   transcriptUpdates = {},
   threadModels = {},
   threadReasoningEfforts = {},
@@ -129,6 +138,11 @@ export function Dashboard({
 
   const workingThreadIds = useMemo(() => {
     const ids = new Set<string>();
+    for (const thread of visibleThreads) {
+      if (thread.status === 'running') {
+        ids.add(thread.threadId);
+      }
+    }
     for (const [threadId, transcript] of Object.entries(transcriptUpdates)) {
       if (transcript?.activeTurnId) {
         ids.add(threadId);
@@ -140,7 +154,7 @@ export function Dashboard({
       }
     }
     return ids;
-  }, [transcriptUpdates, streamingThreadIds]);
+  }, [transcriptUpdates, streamingThreadIds, visibleThreads]);
 
   const updateActiveThreadId = (threadId: string | undefined) => {
     if (controlledActiveThreadId === undefined) {
@@ -256,13 +270,20 @@ export function Dashboard({
             onOpenSidebar={() => setSidebarOpen(true)}
             fetchTranscript={fetchTranscript}
             sendMessage={sendMessage}
+            stopWork={stopWork}
+            fetchOlderMessages={
+              fetchOlderMessages
+                ? (beforeMessageId: string, limit?: number) =>
+                    fetchOlderMessages(activeThread.threadId, beforeMessageId, limit)
+                : undefined
+            }
             openThreadInCodex={onOpenThreadInCodex}
             liveTranscript={transcriptUpdates[activeThread.threadId]}
             modelName={threadModels[activeThread.threadId]}
             selectedModelSlug={threadModels[activeThread.threadId]}
             selectedReasoningEffort={threadReasoningEfforts[activeThread.threadId]}
             pendingRequests={threadPendingRequests[activeThread.threadId] ?? []}
-            forceWorking={streamingThreadIds?.has(activeThread.threadId) ?? false}
+            forceWorking={workingThreadIds.has(activeThread.threadId)}
             plugins={plugins}
             skills={skills}
             commands={commands}

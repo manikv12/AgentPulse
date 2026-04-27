@@ -246,19 +246,48 @@ describe('Codex App Server same-thread chat', () => {
     expect(error.message).toContain('active turn');
   });
 
-  it('does not treat completed turns as live when Codex reports a stale active status', async () => {
+  it('keeps Codex marked working when the app-server is active but the latest turn list has no in-progress turn', async () => {
     const olderTurn = { ...turn('turn-old', 'completed'), startedAt: 1_777_000_000, completedAt: 1_777_000_010 };
-    const newerStaleTurn = { ...turn('turn-new', 'completed'), startedAt: 1_777_000_500, completedAt: 1_777_000_510 };
+    const commandTurn = { ...turn('turn-command', 'completed'), startedAt: 1_777_000_500, completedAt: 1_777_000_510 };
     const transport = fakeTransport([
-      threadResponse('thread-1', 'active', [olderTurn, newerStaleTurn])
+      threadResponse('thread-1', 'active', [olderTurn, commandTurn])
     ]);
     const chat = new CodexAppServerChat(transport);
 
     const transcript = await chat.readTranscript('thread-1');
 
-    expect(transcript.activeTurnId).toBeNull();
-    expect(transcript.sendState.canSend).toBe(true);
-    expect(transcript.sendState.reason).toBe('ready');
+    expect(transcript.activeTurnId).toBe('app-server-active:thread-1');
+    expect(transcript.sendState.canSend).toBe(false);
+    expect(transcript.sendState.reason).toBe('missing_active_turn');
+    expect(transcript.sendState.label).toBe('Codex is working');
+  });
+
+  it('can read full thread history for older-message paging', async () => {
+    const turns = Array.from({ length: 14 }, (_, index) => ({
+      ...turn(`turn-${index + 1}`, 'completed'),
+      startedAt: 1_777_000_000 + index,
+      completedAt: 1_777_000_100 + index,
+      items: [
+        {
+          type: 'agentMessage',
+          id: `assistant-${index + 1}`,
+          text: `Message ${index + 1}`,
+          phase: null
+        }
+      ]
+    }));
+    const transport = fakeTransport([
+      threadResponse('thread-1', 'idle', turns)
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    const transcript = await chat.readFullTranscript('thread-1');
+
+    expect(transport.calls.map((call) => call.method)).toEqual(['thread/read']);
+    expect(transport.calls[0]?.params).toEqual({ threadId: 'thread-1', includeTurns: true });
+    expect(transcript.messages).toHaveLength(14);
+    expect(transcript.messages[0]).toMatchObject({ id: 'assistant-1', text: 'Message 1' });
+    expect(transcript.messages[13]).toMatchObject({ id: 'assistant-14', text: 'Message 14' });
   });
 });
 

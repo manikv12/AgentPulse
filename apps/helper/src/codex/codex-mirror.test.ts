@@ -139,6 +139,22 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('sends thread-follower-interrupt-turn when stopping the current Codex turn', async () => {
+    const { ipc, sendRequest, setReady } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    sendRequest.mockResolvedValueOnce({ result: { ok: true } });
+
+    await (mirror as unknown as { interruptTurn(threadId: string): Promise<void> }).interruptTurn('thread-1');
+
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-interrupt-turn', {
+      conversationId: 'thread-1'
+    });
+    mirror.dispose();
+  });
+
   it('blocks sending when ipc is not ready', async () => {
     const { ipc, setReady } = createMockIpc();
     setReady(false);

@@ -10,6 +10,7 @@ import {
   openThreadInCodex,
   pairDevice,
   sendThreadMessage,
+  stopThreadWork,
   startThread
 } from './api';
 
@@ -235,6 +236,35 @@ describe('tablet API helpers', () => {
     );
   });
 
+  it('stops Codex work through the authenticated helper route', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/threads/thread-1/stop') {
+        return {
+          ok: true,
+          json: async () => ({ ok: true })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+
+    await expect(stopThreadWork(session, 'thread-1')).resolves.toEqual({ ok: true });
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/threads/thread-1/stop',
+      expect.objectContaining({
+        method: 'POST'
+      })
+    );
+  });
+
   it('passes a transcript message limit to the helper when requested', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (url === '/threads/thread-1/transcript?limit=40') {
@@ -419,11 +449,14 @@ describe('tablet API helpers', () => {
       deviceName: 'Desk tablet'
     };
     const transcriptPromise = fetchThreadTranscript(session, 'thread-1');
+    // Swallow the rejection so vitest doesn't flag an unhandled promise while we
+    // advance the fake clock past the abort timeout.
+    transcriptPromise.catch(() => undefined);
     const expectation = expect(transcriptPromise).rejects.toThrow(
       'Conversation is taking too long to load.'
     );
 
-    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(30_000);
 
     await expectation;
   });

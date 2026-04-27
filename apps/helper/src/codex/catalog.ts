@@ -109,6 +109,10 @@ export class CatalogReader {
     return resolveIconPath(this.codexHome, qualifiedSlug);
   }
 
+  resolveSkillIconPath(slug: string): string | undefined {
+    return resolveSkillIconPath(this.codexHome, slug);
+  }
+
   async listProjectFiles(
     projectPath: string,
     query: string,
@@ -258,6 +262,7 @@ export function readSkills(codexHome: string): CatalogSkill[] {
       continue;
     }
     const frontmatter = parseFrontmatter(safeReadFile(skillFile));
+    const iconRelative = pickSkillIconRelative(skillDir, frontmatter.get('icon'));
     skills.push(
       CatalogSkillSchema.parse({
         slug: entry,
@@ -265,12 +270,54 @@ export function readSkills(codexHome: string): CatalogSkill[] {
         description: frontmatter.get('description'),
         argumentHint: frontmatter.get('argument-hint'),
         source: 'user',
-        scopePath: skillDir
+        scopePath: skillDir,
+        iconUrl: iconRelative
+          ? `/catalog/skills/${encodeURIComponent(entry)}/icon`
+          : undefined
       })
     );
   }
 
   return skills.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+const SKILL_ICON_CANDIDATES = ['icon.png', 'icon.svg', 'icon.jpg', 'icon.jpeg', 'icon.webp'];
+
+function pickSkillIconRelative(skillDir: string, frontmatterIcon?: string): string | undefined {
+  if (frontmatterIcon) {
+    const resolved = path.resolve(skillDir, frontmatterIcon);
+    if (isInside(skillDir, resolved) && existsSync(resolved)) {
+      return frontmatterIcon;
+    }
+  }
+  for (const candidate of SKILL_ICON_CANDIDATES) {
+    if (existsSync(path.join(skillDir, candidate))) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function resolveSkillIconPath(codexHome: string, slug: string): string | undefined {
+  const skillDir = path.join(codexHome, 'memories', 'skills', slug);
+  if (!existsSync(skillDir)) {
+    return undefined;
+  }
+  const skillFile = path.join(skillDir, 'SKILL.md');
+  const frontmatter = existsSync(skillFile)
+    ? parseFrontmatter(safeReadFile(skillFile))
+    : new Map<string, string>();
+  const relative = pickSkillIconRelative(skillDir, frontmatter.get('icon'));
+  if (!relative) {
+    return undefined;
+  }
+  const absolute = path.resolve(skillDir, relative);
+  return isInside(skillDir, absolute) ? absolute : undefined;
+}
+
+function isInside(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child);
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
 export function readModels(codexHome: string): CatalogModel[] {

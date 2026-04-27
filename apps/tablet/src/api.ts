@@ -13,7 +13,9 @@ import {
   ThreadCreateResponseSchema,
   ThreadMessageResponseSchema,
   ThreadModelUpdateResponseSchema,
+  ThreadStopResponseSchema,
   ThreadTranscriptSchema,
+  OlderThreadMessagesResponseSchema,
   ThreadListResponseSchema,
   type CatalogCommand,
   type CatalogModel,
@@ -26,7 +28,9 @@ import {
   type RemoteAccessSettings,
   type Thread,
   type ThreadMessageResponse,
-  type ThreadTranscript
+  type ThreadStopResponse,
+  type ThreadTranscript,
+  type OlderThreadMessagesResponse
 } from '@agent-pulse/shared';
 
 export type AgentPulseSession = {
@@ -39,6 +43,17 @@ export type AgentPulseSession = {
 export type FetchThreadTranscriptOptions = {
   messageLimit?: number;
 };
+
+// Thrown when a transcript fetch is aborted by our local timeout. Callers that already
+// have a transcript on screen (initial load done, polling refresh) can swallow this —
+// the helper has its own cache fallback, so a timeout here usually just means the
+// network or upstream Codex was briefly slow, not that the conversation is gone.
+export class TranscriptFetchTimeoutError extends Error {
+  constructor(message = 'Conversation is taking too long to load. Try again.') {
+    super(message);
+    this.name = 'TranscriptFetchTimeoutError';
+  }
+}
 
 const sessionKey = 'agent-pulse-session';
 const fingerprintKey = 'agent-pulse-fingerprint';
@@ -306,7 +321,10 @@ export async function fetchThreadTranscript(
   options: FetchThreadTranscriptOptions = {}
 ): Promise<ThreadTranscript> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  // Generous timeout: the helper itself races the upstream Codex read against a 5s
+  // timeout and falls back to a cached transcript on miss, so anything slower than ~30s
+  // here genuinely indicates the helper or tunnel is wedged, not just a slow turn.
+  const timeout = window.setTimeout(() => controller.abort(), 30_000);
   const params = new URLSearchParams();
   if (typeof options.messageLimit === 'number' && Number.isFinite(options.messageLimit)) {
     params.set('limit', `${Math.max(1, Math.trunc(options.messageLimit))}`);
@@ -326,7 +344,37 @@ export async function fetchThreadTranscript(
     return ThreadTranscriptSchema.parse(await response.json());
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('Conversation is taking too long to load. Try again.');
+      throw new TranscriptFetchTimeoutError();
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+export async function fetchOlderThreadMessages(
+  session: AgentPulseSession,
+  threadId: string,
+  beforeMessageId: string,
+  limit = 40
+): Promise<OlderThreadMessagesResponse> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  const params = new URLSearchParams({
+    before: beforeMessageId,
+    limit: `${Math.max(1, Math.trunc(limit))}`
+  });
+  const path = `/threads/${encodeURIComponent(threadId)}/transcript/older?${params.toString()}`;
+
+  try {
+    const response = await authedFetch(path, session, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(await responseErrorMessage(response, 'Could not load older messages.'));
+    }
+    return OlderThreadMessagesResponseSchema.parse(await response.json());
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('Loading older messages timed out. Try again.');
     }
     throw error;
   } finally {
@@ -349,6 +397,21 @@ export async function sendThreadMessage(
   }
 
   return ThreadMessageResponseSchema.parse(await response.json());
+}
+
+export async function stopThreadWork(
+  session: AgentPulseSession,
+  threadId: string
+): Promise<ThreadStopResponse> {
+  const response = await authedFetch(`/threads/${encodeURIComponent(threadId)}/stop`, session, {
+    method: 'POST'
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not stop Codex.'));
+  }
+
+  return ThreadStopResponseSchema.parse(await response.json());
 }
 
 export async function fetchCatalogPlugins(session: AgentPulseSession): Promise<CatalogPlugin[]> {

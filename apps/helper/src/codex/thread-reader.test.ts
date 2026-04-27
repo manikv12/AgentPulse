@@ -11,6 +11,7 @@ import {
   orderedCodexSidebarProjectRoots,
   parseCodexSidebarState,
   projectIdForPath,
+  readUsageFromRollout,
   readLastLines,
   readRolloutSignals,
   resolveThreadWorkspaceRoot,
@@ -78,6 +79,62 @@ describe('Codex thread reader', () => {
     ]);
 
     expect(signals).toEqual([]);
+  });
+
+  it('uses current turn tokens for context fullness instead of cumulative thread tokens', async () => {
+    const tempRoot = await mkdtemp(path.join(tmpdir(), 'agent-pulse-usage-'));
+    const rolloutPath = path.join(tempRoot, 'rollout.jsonl');
+
+    await writeFile(
+      rolloutPath,
+      [
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'token_count',
+            info: {
+              total_token_usage: {
+                total_tokens: 900_000
+              },
+              last_token_usage: {
+                total_tokens: 100_000
+              },
+              model_context_window: 200_000
+            },
+            rate_limits: {
+              primary: {
+                used_percent: 8,
+                window_minutes: 300
+              },
+              secondary: {
+                used_percent: 63,
+                window_minutes: 10080
+              },
+              plan_type: 'prolite'
+            }
+          }
+        })
+      ].join('\n')
+    );
+
+    try {
+      await expect(readUsageFromRollout(rolloutPath)).resolves.toMatchObject({
+        contextTokens: 100_000,
+        contextWindow: 200_000,
+        contextUsedPercent: 50,
+        primaryWindow: {
+          usedPercent: 8,
+          windowMinutes: 300
+        },
+        secondaryWindow: {
+          usedPercent: 63,
+          windowMinutes: 10080
+        },
+        planType: 'prolite'
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it('detects a latest failed command before the task completes', () => {

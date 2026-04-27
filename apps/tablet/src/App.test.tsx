@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ThreadTranscript } from '@agent-pulse/shared';
-import { App } from './App';
+import { App, extractLatestModel, extractLatestReasoningEffort } from './App';
 import { Dashboard } from './Dashboard';
 
 describe('Agent Pulse tablet UI', () => {
@@ -14,6 +14,75 @@ describe('Agent Pulse tablet UI', () => {
     window.history.replaceState(null, '', '/');
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it('extracts model changes from Codex stream-state broadcast shapes', () => {
+    expect(
+      extractLatestModel({
+        change: {
+          conversationState: {
+            latestModel: 'gpt-5.5',
+            latestReasoningEffort: 'xhigh'
+          }
+        }
+      })
+    ).toBe('gpt-5.5');
+    expect(
+      extractLatestReasoningEffort({
+        change: {
+          conversationState: {
+            latestModel: 'gpt-5.5',
+            latestReasoningEffort: 'xhigh'
+          }
+        }
+      })
+    ).toBe('xhigh');
+
+    expect(
+      extractLatestModel({
+        change: {
+          latestCollaborationMode: {
+            settings: {
+              model: 'gpt-5.4',
+              reasoning_effort: 'high'
+            }
+          }
+        }
+      })
+    ).toBe('gpt-5.4');
+    expect(
+      extractLatestReasoningEffort({
+        change: {
+          latestCollaborationMode: {
+            settings: {
+              model: 'gpt-5.4',
+              reasoning_effort: 'high'
+            }
+          }
+        }
+      })
+    ).toBe('high');
+
+    expect(
+      extractLatestModel({
+        change: {
+          settings: {
+            model: 'gpt-5.3-codex',
+            reasoningEffort: 'medium'
+          }
+        }
+      })
+    ).toBe('gpt-5.3-codex');
+    expect(
+      extractLatestReasoningEffort({
+        change: {
+          settings: {
+            model: 'gpt-5.3-codex',
+            reasoningEffort: 'medium'
+          }
+        }
+      })
+    ).toBe('medium');
   });
 
   it('turns off auto-capitalization for admin and pairing inputs', async () => {
@@ -459,6 +528,623 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close thread chat' }));
 
     await waitFor(() => expect(window.location.hash).toBe(''));
+  });
+
+  it('shows working in real time from Codex stream broadcasts even when the transcript still says ready', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const sockets: MockWebSocket[] = [];
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+
+      close(): void {}
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'thread-live',
+                  title: 'Fix Mac helper sync',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-04-27T18:10:00Z',
+                  lastTurnSummary: ''
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-live/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: []
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    expect(await screen.findByText('Ready')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/broadcast',
+            payload: {
+              method: 'thread-stream-state-changed',
+              sourceClientId: 'desktop',
+              params: {
+                conversationId: 'thread-live',
+                change: { isStreaming: true }
+              }
+            }
+          })
+        })
+      );
+    });
+
+    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    expect(screen.getByText('Working')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/broadcast',
+            payload: {
+              method: 'thread-stream-state-changed',
+              sourceClientId: 'desktop',
+              params: {
+                conversationId: 'thread-live',
+                change: { isStreaming: false }
+              }
+            }
+          })
+        })
+      );
+    });
+
+    expect(screen.getByText('Codex is working')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+  });
+
+  it('uses transcript updates to clear a stale working state when a stop broadcast is missed', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const sockets: MockWebSocket[] = [];
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+
+      close(): void {}
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'thread-live',
+                  title: 'Fix Mac helper sync',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-04-27T18:10:00Z',
+                  lastTurnSummary: ''
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-live/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: []
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    expect(await screen.findByText('Ready')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/broadcast',
+            payload: {
+              method: 'thread-stream-state-changed',
+              sourceClientId: 'desktop',
+              params: {
+                conversationId: 'thread-live',
+                change: { isStreaming: true }
+              }
+            }
+          })
+        })
+      );
+    });
+
+    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/transcript/changed',
+            payload: {
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: [
+                {
+                  id: 'assistant-1',
+                  role: 'assistant',
+                  kind: 'message',
+                  text: 'Done.',
+                  createdAt: '2026-04-27T18:11:00Z'
+                }
+              ]
+            }
+          })
+        })
+      );
+    });
+
+    expect(await screen.findByText('Done.')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
+    expect(screen.getByText('Ready')).toBeInTheDocument();
+  });
+
+  it('keeps usage badges stable when live transcript updates do not include usage', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const sockets: MockWebSocket[] = [];
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+
+      close(): void {}
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'thread-live',
+                  title: 'Fix usage bounce',
+                  workspace: 'CodexPulse',
+                  status: 'running',
+                  lastActivityAt: '2026-04-27T18:10:00Z',
+                  lastTurnSummary: ''
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-live/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: 'turn-1',
+              sendState: {
+                canSend: false,
+                reason: 'thread_changed',
+                label: 'Codex is working'
+              },
+              usage: {
+                contextUsedPercent: 72,
+                primaryWindow: {
+                  usedPercent: 14,
+                  windowMinutes: 300
+                }
+              },
+              messages: []
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix usage bounce/ }));
+    expect(await screen.findByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('72%')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/transcript/changed',
+            payload: {
+              threadId: 'thread-live',
+              activeTurnId: 'turn-1',
+              sendState: {
+                canSend: false,
+                reason: 'thread_changed',
+                label: 'Codex is working'
+              },
+              messages: [
+                {
+                  id: 'assistant-1',
+                  role: 'assistant',
+                  kind: 'message',
+                  text: 'Still working.',
+                  createdAt: '2026-04-27T18:10:01Z'
+                }
+              ]
+            }
+          })
+        })
+      );
+    });
+
+    expect(screen.getByText('Still working.')).toBeInTheDocument();
+    expect(screen.getByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('72%')).toBeInTheDocument();
+  });
+
+  it('lets the remote client stop a running Codex turn', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {}
+
+      close(): void {}
+    }
+
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/health/get') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            codexAppServer: 'connected',
+            version: '0.1.0',
+            uptimeSec: 60
+          })
+        };
+      }
+
+      if (url === '/threads/list') {
+        return {
+          ok: true,
+          json: async () => ({
+            threads: [
+              {
+                threadId: 'thread-live',
+                title: 'Fix Mac helper sync',
+                workspace: 'CodexPulse',
+                status: 'running',
+                lastActivityAt: '2026-04-27T18:10:00Z',
+                lastTurnSummary: ''
+              }
+            ]
+          })
+        };
+      }
+
+      if (url === '/projects/list') {
+        return { ok: true, json: async () => ({ projects: [] }) };
+      }
+
+      if (url === '/catalog/plugins') {
+        return { ok: true, json: async () => ({ plugins: [] }) };
+      }
+
+      if (url === '/catalog/skills') {
+        return { ok: true, json: async () => ({ skills: [] }) };
+      }
+
+      if (url === '/catalog/commands') {
+        return { ok: true, json: async () => ({ commands: [] }) };
+      }
+
+      if (url === '/catalog/models') {
+        return { ok: true, json: async () => ({ models: [] }) };
+      }
+
+      if (url === '/threads/thread-live/transcript?limit=40') {
+        return {
+          ok: true,
+          json: async () => ({
+            threadId: 'thread-live',
+            activeTurnId: 'turn-1',
+            sendState: {
+              canSend: true,
+              reason: 'ready',
+              label: 'Ready'
+            },
+            messages: []
+          })
+        };
+      }
+
+      if (url === '/threads/thread-live/stop') {
+        expect(init?.method).toBe('POST');
+        return {
+          ok: true,
+          json: async () => ({ ok: true })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop Codex' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/threads/thread-live/stop',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
+    expect(screen.getByText('Ready')).toBeInTheDocument();
+  });
+
+  it('keeps the stop button visible when the thread list says running but the transcript is stale', async () => {
+    const staleReadyTranscript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Older ready state.',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const fetchTranscript = vi.fn(async () => staleReadyTranscript);
+    const stopWork = vi.fn(async () => undefined);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'running-1',
+            title: 'Fix Mac helper sync',
+            workspace: 'CodexPulse',
+            status: 'running',
+            lastActivityAt: '2026-04-27T19:14:17.599Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        fetchTranscript={fetchTranscript}
+        stopWork={stopWork}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    expect(await screen.findByText('Older ready state.')).toBeInTheDocument();
+
+    expect(screen.getByText('Codex is working')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
   });
 
   it('restores the active chat from the URL and cached transcript before refresh requests finish', async () => {
@@ -991,7 +1677,7 @@ describe('Agent Pulse tablet UI', () => {
             threadId: 'running-1',
             title: 'Implement mobile chat',
             workspace: 'Agent Pulse',
-            status: 'running',
+            status: 'idle',
             lastActivityAt: '2026-04-25T16:18:00Z',
             lastTurnSummary: 'Working on mobile chat'
           }

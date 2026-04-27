@@ -5,6 +5,7 @@ import type {
   ThreadTranscript
 } from '@agent-pulse/shared';
 import { ThreadMessageResponseSchema } from '@agent-pulse/shared';
+import { debugLog } from '../debug';
 import { SendBlockedError } from './app-server-chat';
 import type { CodexAppServerChat } from './app-server-chat';
 import type { IpcClient } from './ipc-client';
@@ -26,6 +27,7 @@ export type CodexMirrorOptions = {
 
 export type CodexMirror = {
   sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse>;
+  interruptTurn(threadId: string): Promise<void>;
   readTranscript(threadId: string): Promise<ThreadTranscript>;
   setModelAndReasoning(
     threadId: string,
@@ -38,6 +40,7 @@ export type CodexMirror = {
     method: ApprovalMethod,
     response: ApprovalResponse
   ): Promise<void>;
+  isThreadStreaming(threadId: string): boolean;
   isThreadOwned(threadId: string): boolean;
   waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean>;
   isConnected(): boolean;
@@ -101,7 +104,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       // We now accept all hosts and key state purely on conversationId. The local hostId is still
       // used when *we* construct outgoing requests.
       void hostId;
-      console.log('[ownership] broadcast received', {
+      debugLog('[ownership] broadcast received', {
         conversationId,
         hostId: typeof params.hostId === 'string' ? params.hostId : null,
         isStreaming: Boolean(params.change?.isStreaming),
@@ -127,12 +130,12 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         if (roleValue === 'owner') {
           if (!wasOwned) {
             ownedThreads.add(conversationId);
-            console.log('[ownership] broadcast: thread is now owned', { conversationId });
+            debugLog('[ownership] broadcast: thread is now owned', { conversationId });
             notifyOwnershipWaiters(conversationId);
           }
         } else {
           if (wasOwned) {
-            console.log('[ownership] broadcast: thread is no longer owned', {
+            debugLog('[ownership] broadcast: thread is no longer owned', {
               conversationId,
               role: roleValue
             });
@@ -150,9 +153,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
 
   detachers.push(
     ipc.addAnyBroadcastHandler((event) => {
-      // Diagnostic: log every broadcast we get from Codex so we can see what (if anything)
-      // is reaching us when the user clicks a thread on the tablet.
-      console.log('[ipc-broadcast]', { method: event.method, sourceClientId: event.sourceClientId });
+      debugLog('[ipc-broadcast]', { method: event.method, sourceClientId: event.sourceClientId });
       if (event.method === 'thread-stream-state-changed') {
         return;
       }
@@ -255,6 +256,12 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     });
   }
 
+  async function interruptTurn(threadId: string): Promise<void> {
+    await sendFollowerRequest('thread-follower-interrupt-turn', {
+      conversationId: threadId
+    });
+  }
+
   async function setModelAndReasoning(
     threadId: string,
     modelSlug: string,
@@ -304,6 +311,10 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     return ownedThreads.has(threadId);
   }
 
+  function isThreadStreaming(threadId: string): boolean {
+    return streamingThreads.has(threadId);
+  }
+
   function waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean> {
     if (ownedThreads.has(threadId)) {
       return Promise.resolve(true);
@@ -333,9 +344,11 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
 
   return {
     sendMessage,
+    interruptTurn,
     readTranscript,
     setModelAndReasoning,
     respondToApproval,
+    isThreadStreaming,
     isThreadOwned,
     waitForOwnership,
     isConnected: () => ipc.isReady(),

@@ -34,7 +34,9 @@ import {
   ThreadModelUpdateResponseSchema,
   ThreadOpenRequestSchema,
   ThreadSchema,
+  ThreadStopResponseSchema,
   ThreadTranscriptSchema,
+  OlderThreadMessagesResponseSchema,
   type ChatAttachment,
   type HelperHealth,
   type LiveEvent,
@@ -54,6 +56,7 @@ import { RateLimiter, type DeviceRegistry, type PairingManager } from '../auth/p
 import { SendBlockedError } from '../codex/app-server-chat';
 import type { CatalogReader } from '../codex/catalog';
 import type { createThreadOpener } from '../codex/thread-opener';
+import { debugLog } from '../debug';
 import type { HelperSettings, HelperSettingsStore } from './settings';
 import { createTabletDevProxy, type TabletDevProxy } from './tablet-dev-proxy';
 
@@ -70,6 +73,7 @@ const GLOBAL_ADMIN_LOGIN_LIMIT_KEY = '__global_admin_login_failures__';
 export type AppServerChatBridge = {
   isConnected(): boolean;
   readTranscript(threadId: string): Promise<ThreadTranscript>;
+  readFullTranscript?(threadId: string): Promise<ThreadTranscript>;
   sendMessage(
     threadId: string,
     text: string,
@@ -81,6 +85,7 @@ export type AppServerChatBridge = {
 export type CodexMirrorBridge = {
   isConnected(): boolean;
   sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse>;
+  interruptTurn?(threadId: string): Promise<void>;
   setModelAndReasoning?(
     threadId: string,
     modelSlug: string,
@@ -95,6 +100,7 @@ export type CodexMirrorBridge = {
       | 'item/permissions/requestApproval',
     response: unknown
   ): Promise<void>;
+  isThreadStreaming?(threadId: string): boolean;
   isThreadOwned?(threadId: string): boolean;
   waitForOwnership?(threadId: string, timeoutMs: number): Promise<boolean>;
 };
@@ -206,6 +212,11 @@ function createApp(
   // path requires ownership). The override is consumed when the user sends the next
   // message — at that point we pass it directly to turn/start, no ownership needed.
   const pendingModelOverrides = new Map<string, { model: string; effort?: string }>();
+  // Last-known-good transcript per thread, updated whenever any path successfully reads
+  // one (HTTP fetch, poller broadcast). Used as a fallback when `appServer.readTranscript`
+  // is slow or upstream Codex is degraded — we'd rather return slightly stale data fast
+  // than block long enough for the cloudflared tunnel to cancel the request.
+  const transcriptCache = new Map<string, ThreadTranscript>();
   let currentSettings = options.settings;
   const remoteActivity: RemoteActivityLogEntry[] = [];
   const recordRemoteActivity = (
@@ -280,6 +291,9 @@ function createApp(
   });
 
   app.get('/health/get', (context) => {
+    return context.json(healthPayload(options, startedAt));
+  });
+  app.get('/health', (context) => {
     return context.json(healthPayload(options, startedAt));
   });
 
@@ -612,7 +626,8 @@ function createApp(
 
     const threads = await reconcileThreadStatuses(
       await options.threadProvider.listThreads(),
-      options.appServer
+      options.appServer,
+      transformTranscript
     );
     return context.json(ThreadListResponseSchema.parse({ threads }));
   });
@@ -692,22 +707,138 @@ function createApp(
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
 
+    const threadId = context.req.param('threadId');
+    const messageLimit = parseTranscriptMessageLimit(context.req.query('limit'));
+
+    // Race the live transcript read against a short timeout. When Codex's app-server is
+    // healthy this resolves in milliseconds; when it's degraded (mcp transport flapping,
+    // chatgpt.com 503ing) it can hang for tens of seconds. Rather than block long enough
+    // for cloudflared to cancel the stream, fall back to the last-known-good transcript
+    // cached either by an earlier successful fetch or the background poller.
+    const TRANSCRIPT_READ_TIMEOUT_MS = 5_000;
+    const liveResult = await settleWithin(
+      options.appServer.readTranscript(threadId).catch(() => undefined),
+      TRANSCRIPT_READ_TIMEOUT_MS
+    );
+
+    let transcript: ThreadTranscript | undefined;
+    let stale = false;
+    if (liveResult.ok && liveResult.value) {
+      transcript = liveResult.value;
+    } else {
+      transcript = transcriptCache.get(threadId);
+      stale = true;
+    }
+
+    if (!transcript) {
+      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+
     try {
-      const threadId = context.req.param('threadId');
-      const messageLimit = parseTranscriptMessageLimit(context.req.query('limit'));
-      const transcript = await options.appServer.readTranscript(threadId);
       const usage = options.usageProvider
         ? await options.usageProvider(threadId).catch(() => undefined)
         : undefined;
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+      if (stale) {
+        // Hint to the client that the body is from cache. Headers stay out of the zod
+        // schema so we don't have to thread a flag through every transcript shape.
+        context.header('X-Transcript-Stale', '1');
+      }
+      const visibleTranscript = transformTranscript(
+        limitTranscriptMessages(transcript, messageLimit),
+        threadId
+      );
       return context.json(
         ThreadTranscriptSchema.parse({
-          ...exposeLocalAttachments(
-            limitTranscriptMessages(applyMobileSendState(transcript, currentSettings), messageLimit),
-            threadId,
-            localAttachments
-          ),
+          ...visibleTranscript,
           ...(usage ? { usage } : {})
+        })
+      );
+    } catch {
+      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+  });
+
+  // Lazy-loading older history. The main GET /transcript endpoint always returns the tail
+  // of the conversation (last `limit` messages). When the user scrolls up past what's
+  // already on screen, the tablet hits this endpoint with the id of its current oldest
+  // message; we return up to `limit` messages strictly before that one, plus a `hasMore`
+  // flag so the client knows whether to keep offering more.
+  app.get('/threads/:threadId/transcript/older', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    if (!options.appServer) {
+      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+
+    const before = context.req.query('before');
+    if (!before) {
+      return context.json({ error: 'Missing required `before` query param.' }, 400);
+    }
+
+    try {
+      const threadId = context.req.param('threadId');
+      const limit = parseTranscriptMessageLimit(context.req.query('limit')) ?? 40;
+
+      // Same fallback strategy as the main transcript route — race the live read against
+      // a short timeout, fall back to cache. Older history rarely changes, so a cached
+      // transcript almost always serves the right window.
+      const TRANSCRIPT_READ_TIMEOUT_MS = 5_000;
+      const readOlderTranscript =
+        options.appServer.readFullTranscript?.bind(options.appServer) ??
+        options.appServer.readTranscript.bind(options.appServer);
+      const liveResult = await settleWithin(
+        readOlderTranscript(threadId).catch((error) => {
+          debugLog('server', 'failed to read older transcript', {
+            threadId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          return undefined;
+        }),
+        TRANSCRIPT_READ_TIMEOUT_MS
+      );
+
+      let transcript: ThreadTranscript | undefined;
+      if (liveResult.ok && liveResult.value) {
+        transcript = liveResult.value;
+        transcriptCache.set(threadId, transcript);
+      } else {
+        transcript = transcriptCache.get(threadId);
+      }
+
+      if (!transcript) {
+        return context.json({ error: 'Codex connection unavailable.' }, 503);
+      }
+
+      const beforeIndex = transcript.messages.findIndex((message) => message.id === before);
+      if (beforeIndex <= 0) {
+        // Either the cursor message wasn't found (already fell out of the buffer, or never
+        // existed) or it's already the oldest message — either way, no older history.
+        return context.json(
+          OlderThreadMessagesResponseSchema.parse({
+            threadId,
+            messages: [],
+            hasMore: false
+          })
+        );
+      }
+
+      const sliceStart = Math.max(0, beforeIndex - limit);
+      const olderSlice = transcript.messages.slice(sliceStart, beforeIndex);
+      const exposed = exposeLocalAttachments(
+        ThreadTranscriptSchema.parse({ ...transcript, messages: olderSlice }),
+        threadId,
+        localAttachments
+      );
+
+      return context.json(
+        OlderThreadMessagesResponseSchema.parse({
+          threadId,
+          messages: exposed.messages,
+          hasMore: sliceStart > 0
         })
       );
     } catch {
@@ -802,13 +933,10 @@ function createApp(
       if (override) {
         pendingModelOverrides.delete(threadId);
       }
+      const visibleTranscript = transformTranscript(result.transcript, threadId);
       const response = {
         ...result,
-        transcript: exposeLocalAttachments(
-          applyMobileSendState(result.transcript, currentSettings),
-          threadId,
-          localAttachments
-        )
+        transcript: visibleTranscript
       };
       const parsedResponse = ThreadMessageResponseSchema.parse(response);
       hub.broadcast({
@@ -817,6 +945,37 @@ function createApp(
       });
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
       return context.json(parsedResponse);
+    } catch (error) {
+      if (error instanceof SendBlockedError) {
+        return context.json({ error: error.message, reason: error.reason }, 409);
+      }
+      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+  });
+
+  app.post('/threads/:threadId/stop', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    if (!options.mirror?.isConnected() || !options.mirror.interruptTurn) {
+      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+
+    const threadId = context.req.param('threadId');
+    try {
+      await runWithFollowerOwnership(
+        () => options.mirror!.interruptTurn!(threadId),
+        options.opener,
+        threadId,
+        options.mirror
+      );
+      hub.broadcast({
+        type: 'thread/streaming-changed',
+        payload: { threadId, isStreaming: false }
+      });
+      return context.json(ThreadStopResponseSchema.parse({ ok: true }));
     } catch (error) {
       if (error instanceof SendBlockedError) {
         return context.json({ error: error.message, reason: error.reason }, 409);
@@ -867,15 +1026,33 @@ function createApp(
   });
 
   app.get('/catalog/plugins/:slug/icon', async (context) => {
-    const auth = await authenticate(context);
-    if (!auth.ok) {
-      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
-    }
     if (!options.catalog) {
       return context.notFound();
     }
     const slug = decodeURIComponent(context.req.param('slug'));
     const iconPath = options.catalog.resolvePluginIconPath(slug);
+    if (!iconPath) {
+      return context.notFound();
+    }
+    try {
+      const buffer = await readFile(iconPath);
+      return new Response(new Uint8Array(buffer), {
+        headers: {
+          'content-type': imageContentType(iconPath),
+          'cache-control': 'public, max-age=86400'
+        }
+      });
+    } catch {
+      return context.notFound();
+    }
+  });
+
+  app.get('/catalog/skills/:slug/icon', async (context) => {
+    if (!options.catalog) {
+      return context.notFound();
+    }
+    const slug = decodeURIComponent(context.req.param('slug'));
+    const iconPath = options.catalog.resolveSkillIconPath(slug);
     if (!iconPath) {
       return context.notFound();
     }
@@ -1007,7 +1184,7 @@ function createApp(
         await runWithFollowerOwnership(apply, options.opener, threadId, options.mirror);
         mode = 'live';
         pendingModelOverrides.delete(threadId);
-        console.log('[model-change] applied live via IPC', {
+        debugLog('[model-change] applied live via IPC', {
           threadId,
           modelSlug: parsed.modelSlug,
           reasoningEffort: parsed.reasoningEffort
@@ -1025,7 +1202,7 @@ function createApp(
         model: parsed.modelSlug,
         ...(parsed.reasoningEffort ? { effort: parsed.reasoningEffort } : {})
       });
-      console.log('[model-change] queued for next turn', {
+      debugLog('[model-change] queued for next turn', {
         threadId,
         modelSlug: parsed.modelSlug,
         reasoningEffort: parsed.reasoningEffort
@@ -1080,12 +1257,17 @@ function createApp(
     });
   }
 
-  const transformTranscript = (transcript: ThreadTranscript, threadId: string): ThreadTranscript =>
-    exposeLocalAttachments(
-      applyMobileSendState(transcript, currentSettings),
+  const transformTranscript = (transcript: ThreadTranscript, threadId: string): ThreadTranscript => {
+    // The poller hands us a fresh transcript on every successful reconcile — cache it so
+    // the HTTP fallback path always has a recent copy to serve when a live read times out.
+    const realtimeTranscript = applyMirrorStreamingState(transcript, threadId, options.mirror);
+    transcriptCache.set(threadId, realtimeTranscript);
+    return exposeLocalAttachments(
+      applyMobileSendState(realtimeTranscript, currentSettings),
       threadId,
       localAttachments
     );
+  };
 
   return { app, transformTranscript };
 }
@@ -1130,10 +1312,10 @@ async function runWithFollowerOwnership<T>(
   const retryDelayMs = options.retryDelayMs ?? 800;
 
   const owned = mirror?.isThreadOwned?.(threadId);
-  console.log('[ownership] enter', { threadId, owned });
+  debugLog('[ownership] enter', { threadId, owned });
 
   if (mirror?.isThreadOwned && !owned) {
-    console.log('[ownership] not owned — opening thread on Mac', { threadId });
+    debugLog('[ownership] not owned — opening thread on Mac', { threadId });
     try {
       await opener.openThread(threadId);
     } catch (openError) {
@@ -1142,7 +1324,7 @@ async function runWithFollowerOwnership<T>(
     if (mirror.waitForOwnership) {
       const before = Date.now();
       const acquired = await mirror.waitForOwnership(threadId, ownershipTimeoutMs);
-      console.log('[ownership] waitForOwnership returned', {
+      debugLog('[ownership] waitForOwnership returned', {
         threadId,
         acquired,
         elapsedMs: Date.now() - before
@@ -1151,28 +1333,28 @@ async function runWithFollowerOwnership<T>(
   }
 
   try {
-    console.log('[ownership] applying request', { threadId });
+    debugLog('[ownership] applying request', { threadId });
     const result = await apply();
-    console.log('[ownership] apply succeeded on first try', { threadId });
+    debugLog('[ownership] apply succeeded on first try', { threadId });
     return result;
   } catch (error) {
     if (
       !(error instanceof SendBlockedError) ||
       error.reason !== 'thread_unavailable'
     ) {
-      console.log('[ownership] apply failed (non-retryable)', {
+      debugLog('[ownership] apply failed (non-retryable)', {
         threadId,
         error: error instanceof Error ? error.message : String(error)
       });
       throw error;
     }
-    console.log('[ownership] apply failed with thread_unavailable — waiting and retrying', {
+    debugLog('[ownership] apply failed with thread_unavailable — waiting and retrying', {
       threadId
     });
     if (mirror?.waitForOwnership) {
       const before = Date.now();
       const acquired = await mirror.waitForOwnership(threadId, retryDelayMs);
-      console.log('[ownership] retry waitForOwnership returned', {
+      debugLog('[ownership] retry waitForOwnership returned', {
         threadId,
         acquired,
         elapsedMs: Date.now() - before
@@ -1181,7 +1363,7 @@ async function runWithFollowerOwnership<T>(
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
     const result = await apply();
-    console.log('[ownership] retry succeeded', { threadId });
+    debugLog('[ownership] retry succeeded', { threadId });
     return result;
   }
 }
@@ -1228,6 +1410,79 @@ function applyMobileSendState(transcript: ThreadTranscript, settings: HelperSett
       label: 'Mobile sending is off on the Mac.'
     }
   });
+}
+
+const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
+
+function mirrorStreamingTurnId(threadId: string): string {
+  return `${MIRROR_STREAMING_TURN_PREFIX}${threadId}`;
+}
+
+function applyMirrorStreamingState(
+  transcript: ThreadTranscript,
+  threadId: string,
+  mirror: CodexMirrorBridge | undefined
+): ThreadTranscript {
+  const syntheticTurnId = mirrorStreamingTurnId(threadId);
+  const mirrorSaysStreaming = mirror?.isThreadStreaming?.(threadId) === true;
+
+  if (mirrorSaysStreaming) {
+    if (transcript.activeTurnId) {
+      return transcript;
+    }
+
+    return ThreadTranscriptSchema.parse({
+      ...transcript,
+      activeTurnId: syntheticTurnId,
+      sendState: {
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Codex is working'
+      }
+    });
+  }
+
+  if (transcript.activeTurnId !== syntheticTurnId) {
+    return transcript;
+  }
+
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    activeTurnId: null,
+    sendState:
+      transcript.sendState.reason === 'thread_changed' ||
+      transcript.sendState.reason === 'missing_active_turn'
+        ? {
+            canSend: true,
+            reason: 'ready',
+            label: 'Ready'
+          }
+        : transcript.sendState
+  });
+}
+
+// Race a promise against a timeout. Resolves to `{ ok: true, value }` if the promise
+// settles in time, `{ ok: false }` on timeout. We don't reject on timeout so callers can
+// fall through to a cached value without unwinding through try/catch.
+async function settleWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number
+): Promise<{ ok: true; value: T } | { ok: false }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ ok: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false }), timeoutMs);
+  });
+  try {
+    const winner = await Promise.race([
+      promise.then((value) => ({ ok: true as const, value })),
+      timeout
+    ]);
+    return winner;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function parseTranscriptMessageLimit(value: string | undefined): number | undefined {
@@ -1445,9 +1700,14 @@ export class LiveEventHub {
   }
 }
 
-const POLL_INTERVAL_MS = 2_000;
+// 6s polling cadence: the WebSocket is now the primary live channel (we push transcripts
+// directly when they change). The polling loop is just a backstop, so a slower cadence is
+// fine. Lower cadence also means fewer `thread/resume` JSON-RPC calls into the spawned
+// codex app-server, which is the biggest CPU consumer in this process tree.
+const POLL_INTERVAL_MS = 6_000;
 const ACTIVE_RECENCY_MS = 10 * 60_000;
-const FULL_SWEEP_EVERY_N_TICKS = 15;
+// Was 15 ticks at 2s = 30s between full sweeps. Keep that real-world cadence at the new rate.
+const FULL_SWEEP_EVERY_N_TICKS = 5;
 
 function startThreadPolling(
   threadProvider: { listThreads(): Promise<Thread[]> },
@@ -1483,7 +1743,7 @@ function startThreadPolling(
       const fullSweep = tickCount % FULL_SWEEP_EVERY_N_TICKS === 1;
       const threads = await threadProvider.listThreads();
       const toReconcile = threads.filter((thread) => isActiveForReconcile(thread, fullSweep));
-      const reconciledActive = await reconcileThreads(toReconcile, appServer);
+      const reconciledActive = await reconcileThreads(toReconcile, appServer, transformTranscript);
 
       const reconciledById = new Map(
         reconciledActive.map((entry) => [entry.thread.threadId, entry])
@@ -1507,10 +1767,7 @@ function startThreadPolling(
         // the tablet's last-known-good state fresh — the WebSocket is the real-time channel,
         // the client-side fetch is just a backstop.
         if (transcript) {
-          const payload = transformTranscript
-            ? transformTranscript(transcript, thread.threadId)
-            : transcript;
-          hub.broadcast({ type: 'thread/transcript/changed', payload });
+          hub.broadcast({ type: 'thread/transcript/changed', payload: transcript });
         }
       }
 
@@ -1534,7 +1791,8 @@ type ReconciledThread = { thread: Thread; transcript?: ThreadTranscript };
 
 async function reconcileThreads(
   threads: Thread[],
-  appServer: AppServerChatBridge | undefined
+  appServer: AppServerChatBridge | undefined,
+  transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ): Promise<ReconciledThread[]> {
   if (!appServer) {
     return threads.map((thread) => ({ thread }));
@@ -1543,7 +1801,10 @@ async function reconcileThreads(
   return Promise.all(
     threads.map(async (thread): Promise<ReconciledThread> => {
       try {
-        const transcript = await appServer.readTranscript(thread.threadId);
+        const rawTranscript = await appServer.readTranscript(thread.threadId);
+        const transcript = transformTranscript
+          ? transformTranscript(rawTranscript, thread.threadId)
+          : rawTranscript;
         return {
           thread: ThreadSchema.parse({
             ...thread,
@@ -1560,9 +1821,10 @@ async function reconcileThreads(
 
 async function reconcileThreadStatuses(
   threads: Thread[],
-  appServer: AppServerChatBridge | undefined
+  appServer: AppServerChatBridge | undefined,
+  transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ): Promise<Thread[]> {
-  const reconciled = await reconcileThreads(threads, appServer);
+  const reconciled = await reconcileThreads(threads, appServer, transformTranscript);
   return reconciled.map(({ thread }) => thread);
 }
 

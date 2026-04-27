@@ -51,6 +51,7 @@ import {
   fetchHealth,
   fetchProjectFiles,
   fetchProjects,
+  fetchOlderThreadMessages,
   fetchThreadTranscript,
   fetchThreads,
   getFingerprint,
@@ -64,6 +65,7 @@ import {
   saveSession,
   sendThreadMessage,
   startThread,
+  stopThreadWork,
   updateRemoteAccess,
   updateThreadModel,
   type AgentPulseSession
@@ -92,6 +94,7 @@ const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
 const THREADS_CACHE_KEY_PREFIX = 'agent-pulse:threads-cache:';
 const TRANSCRIPTS_CACHE_KEY_PREFIX = 'agent-pulse:transcripts-cache:';
 const CACHED_TRANSCRIPT_MESSAGE_LIMIT = 40;
+const WORKING_STATE_GRACE_MS = 15_000;
 
 const ADMIN_FLEX_SCREENS = new Set<AppScreen>(['settings', 'admin-login', 'chooser']);
 const BACKGROUND_STABLE_SCREENS = new Set<AppScreen>(['settings', 'admin-login']);
@@ -122,6 +125,39 @@ function extractConversationId(params: unknown): string | undefined {
   }
   const value = (params as { conversationId?: unknown }).conversationId;
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function extractStreamingChange(
+  params: unknown
+): { threadId: string; isStreaming: boolean } | undefined {
+  const threadId = extractConversationId(params);
+  if (!threadId || !params || typeof params !== 'object') {
+    return undefined;
+  }
+  const change = (params as { change?: unknown }).change;
+  if (!change || typeof change !== 'object') {
+    return undefined;
+  }
+  const isStreaming = (change as { isStreaming?: unknown }).isStreaming;
+  if (typeof isStreaming !== 'boolean') {
+    return undefined;
+  }
+  return { threadId, isStreaming };
+}
+
+function transcriptAfterStop(transcript: ThreadTranscript): ThreadTranscript {
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    activeTurnId: null,
+    sendState:
+      transcript.sendState.reason === 'mobile_send_disabled'
+        ? transcript.sendState
+        : {
+            canSend: true,
+            reason: 'ready',
+            label: 'Ready'
+          }
+  });
 }
 
 export type PendingRequestSummary = {
@@ -221,7 +257,7 @@ function extractPendingRequests(params: unknown): PendingRequestSummary[] {
   return summaries;
 }
 
-function extractLatestModel(params: unknown): string | undefined {
+export function extractLatestModel(params: unknown): string | undefined {
   if (!params || typeof params !== 'object') {
     return undefined;
   }
@@ -229,23 +265,25 @@ function extractLatestModel(params: unknown): string | undefined {
   if (!change || typeof change !== 'object') {
     return undefined;
   }
-  const snapshotState = (change as { conversationState?: unknown }).conversationState;
-  if (snapshotState && typeof snapshotState === 'object') {
-    const direct = (snapshotState as { latestModel?: unknown }).latestModel;
-    if (typeof direct === 'string' && direct.trim().length > 0) {
-      return direct.trim();
+  for (const source of modelStateSources(change)) {
+    const model = stringField(source, 'latestModel') ?? stringField(source, 'model');
+    if (model) {
+      return model;
     }
-    const collab = (snapshotState as { latestCollaborationMode?: { settings?: { model?: unknown } } })
-      .latestCollaborationMode;
-    const collabModel = collab?.settings?.model;
-    if (typeof collabModel === 'string' && collabModel.trim().length > 0) {
-      return collabModel.trim();
+    const collab = objectField(source, 'latestCollaborationMode') ?? objectField(source, 'collaborationMode');
+    const collabModel = stringField(objectField(collab, 'settings'), 'model');
+    if (collabModel) {
+      return collabModel;
+    }
+    const settingsModel = stringField(objectField(source, 'settings'), 'model');
+    if (settingsModel) {
+      return settingsModel;
     }
   }
   return undefined;
 }
 
-function extractLatestReasoningEffort(params: unknown): string | undefined {
+export function extractLatestReasoningEffort(params: unknown): string | undefined {
   if (!params || typeof params !== 'object') {
     return undefined;
   }
@@ -253,21 +291,69 @@ function extractLatestReasoningEffort(params: unknown): string | undefined {
   if (!change || typeof change !== 'object') {
     return undefined;
   }
-  const snapshotState = (change as { conversationState?: unknown }).conversationState;
-  if (snapshotState && typeof snapshotState === 'object') {
-    const direct = (snapshotState as { latestReasoningEffort?: unknown }).latestReasoningEffort;
-    if (typeof direct === 'string' && direct.trim().length > 0) {
-      return direct.trim();
+  for (const source of modelStateSources(change)) {
+    const effort =
+      stringField(source, 'latestReasoningEffort') ??
+      stringField(source, 'reasoningEffort') ??
+      stringField(source, 'reasoning_effort') ??
+      stringField(source, 'effort');
+    if (effort) {
+      return effort;
     }
-    const collab = (snapshotState as {
-      latestCollaborationMode?: { settings?: { reasoning_effort?: unknown } };
-    }).latestCollaborationMode;
-    const collabEffort = collab?.settings?.reasoning_effort;
-    if (typeof collabEffort === 'string' && collabEffort.trim().length > 0) {
-      return collabEffort.trim();
+    const collab = objectField(source, 'latestCollaborationMode') ?? objectField(source, 'collaborationMode');
+    const collabSettings = objectField(collab, 'settings');
+    const collabEffort =
+      stringField(collabSettings, 'reasoning_effort') ?? stringField(collabSettings, 'reasoningEffort');
+    if (collabEffort) {
+      return collabEffort;
+    }
+    const settings = objectField(source, 'settings');
+    const settingsEffort =
+      stringField(settings, 'reasoning_effort') ?? stringField(settings, 'reasoningEffort');
+    if (settingsEffort) {
+      return settingsEffort;
     }
   }
   return undefined;
+}
+
+function modelStateSources(change: object): object[] {
+  const sources = [change];
+  const conversationState = objectField(change, 'conversationState');
+  if (conversationState) {
+    sources.unshift(conversationState);
+  }
+  const snapshot = objectField(change, 'snapshot');
+  const snapshotConversationState = objectField(snapshot, 'conversationState');
+  if (snapshotConversationState) {
+    sources.unshift(snapshotConversationState);
+  }
+  const state = objectField(change, 'state');
+  const stateConversationState = objectField(state, 'conversationState');
+  if (stateConversationState) {
+    sources.unshift(stateConversationState);
+  }
+  return sources;
+}
+
+function objectField(source: unknown, key: string): object | undefined {
+  if (!source || typeof source !== 'object') {
+    return undefined;
+  }
+  const value = (source as Record<string, unknown>)[key];
+  return value && typeof value === 'object' ? value : undefined;
+}
+
+function stringField(source: unknown, key: string): string | undefined {
+  if (!source || typeof source !== 'object') {
+    return undefined;
+  }
+  const value = (source as Record<string, unknown>)[key];
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function screenFromLocation(): AppScreen {
@@ -430,9 +516,15 @@ function upsertTranscriptCache(
   current: Record<string, ThreadTranscript>,
   transcript: ThreadTranscript
 ): Record<string, ThreadTranscript> {
+  const previous = current[transcript.threadId];
+  const stableTranscript =
+    !transcript.usage && previous?.usage
+      ? { ...transcript, usage: previous.usage }
+      : transcript;
+
   return {
     ...current,
-    [transcript.threadId]: cacheableTranscript(transcript)
+    [transcript.threadId]: cacheableTranscript(stableTranscript)
   };
 }
 
@@ -447,6 +539,11 @@ function removeTranscriptCache(
   const next = { ...current };
   delete next[threadId];
   return next;
+}
+
+function transcriptLooksFinished(transcript: ThreadTranscript): boolean {
+  const lastMessage = [...transcript.messages].reverse().find((message) => message.text.trim().length > 0);
+  return lastMessage?.role === 'assistant' && lastMessage.kind === 'message';
 }
 
 export function App() {
@@ -526,6 +623,80 @@ export function App() {
     []
   );
 
+  const [streamingThreadIds, setStreamingThreadIds] = useState<Set<string>>(() => new Set());
+  const workingClearTimersRef = useRef<Map<string, number>>(new Map());
+
+  const cancelWorkingClear = useCallback((threadId: string) => {
+    const timer = workingClearTimersRef.current.get(threadId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      workingClearTimersRef.current.delete(threadId);
+    }
+  }, []);
+
+  const markThreadWorking = useCallback(
+    (threadId: string) => {
+      cancelWorkingClear(threadId);
+      setStreamingThreadIds((current) => {
+        if (current.has(threadId)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.add(threadId);
+        return next;
+      });
+    },
+    [cancelWorkingClear]
+  );
+
+  const markThreadReady = useCallback(
+    (threadId: string, options: { delay?: boolean } = {}) => {
+      if (!options.delay) {
+        cancelWorkingClear(threadId);
+        setStreamingThreadIds((current) => {
+          if (!current.has(threadId)) {
+            return current;
+          }
+          const next = new Set(current);
+          next.delete(threadId);
+          return next;
+        });
+        return;
+      }
+
+      setStreamingThreadIds((current) => {
+        if (!current.has(threadId) || workingClearTimersRef.current.has(threadId)) {
+          return current;
+        }
+        const timer = window.setTimeout(() => {
+          workingClearTimersRef.current.delete(threadId);
+          setStreamingThreadIds((latest) => {
+            if (!latest.has(threadId)) {
+              return latest;
+            }
+            const next = new Set(latest);
+            next.delete(threadId);
+            return next;
+          });
+        }, WORKING_STATE_GRACE_MS);
+        workingClearTimersRef.current.set(threadId, timer);
+        return current;
+      });
+    },
+    [cancelWorkingClear]
+  );
+
+  const syncStreamingStateFromTranscript = useCallback(
+    (transcript: ThreadTranscript) => {
+      if (transcript.activeTurnId) {
+        markThreadWorking(transcript.threadId);
+        return;
+      }
+      markThreadReady(transcript.threadId, { delay: !transcriptLooksFinished(transcript) });
+    },
+    [markThreadReady, markThreadWorking]
+  );
+
   // Coalesced + debounced transcript refetch.
   //
   // Codex emits many `thread-stream-state-changed` patch broadcasts per turn (one per token
@@ -564,6 +735,7 @@ export function App() {
         try {
           const transcript = await fetchThreadTranscript(currentSession, threadId);
           setTranscripts((current) => upsertTranscriptCache(current, transcript));
+          syncStreamingStateFromTranscript(transcript);
           applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
         } catch {
           // ignore — broadcast or polling will retry
@@ -590,9 +762,8 @@ export function App() {
         }
       })();
     },
-    [session, applyTranscriptModel]
+    [session, applyTranscriptModel, syncStreamingStateFromTranscript]
   );
-  const [streamingThreadIds, setStreamingThreadIds] = useState<Set<string>>(() => new Set());
   const [plugins, setPlugins] = useState<CatalogPlugin[]>([]);
   const [skills, setSkills] = useState<CatalogSkill[]>([]);
   const [commands, setCommands] = useState<CatalogCommand[]>([]);
@@ -607,6 +778,15 @@ export function App() {
     const id = window.setTimeout(() => setMessage(''), 2500);
     return () => window.clearTimeout(id);
   }, [message]);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of workingClearTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      workingClearTimersRef.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -766,6 +946,7 @@ export function App() {
 
         if (liveEvent.type === 'thread/transcript/changed') {
           setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
+          syncStreamingStateFromTranscript(liveEvent.payload);
           applyTranscriptModel(
             liveEvent.payload.threadId,
             liveEvent.payload.model,
@@ -775,15 +956,11 @@ export function App() {
 
         if (liveEvent.type === 'thread/streaming-changed') {
           const { threadId, isStreaming } = liveEvent.payload;
-          setStreamingThreadIds((current) => {
-            const next = new Set(current);
-            if (isStreaming) {
-              next.add(threadId);
-            } else {
-              next.delete(threadId);
-            }
-            return next;
-          });
+          if (isStreaming) {
+            markThreadWorking(threadId);
+          } else {
+            markThreadReady(threadId, { delay: true });
+          }
         }
 
         if (liveEvent.type === 'catalog/changed') {
@@ -805,6 +982,17 @@ export function App() {
           const conversationId = extractConversationId(params);
           if (!conversationId) {
             return;
+          }
+
+          if (method === 'thread-stream-state-changed') {
+            const streamingChange = extractStreamingChange(params);
+            if (streamingChange) {
+              if (streamingChange.isStreaming) {
+                markThreadWorking(streamingChange.threadId);
+              } else {
+                markThreadReady(streamingChange.threadId, { delay: true });
+              }
+            }
           }
 
           applyTranscriptModel(
@@ -852,7 +1040,14 @@ export function App() {
       }
       socket?.close();
     };
-  }, [session, applyTranscriptModel, requestTranscriptRefresh]);
+  }, [
+    session,
+    applyTranscriptModel,
+    markThreadReady,
+    markThreadWorking,
+    requestTranscriptRefresh,
+    syncStreamingStateFromTranscript
+  ]);
 
   const handlePair = async (input: PairingSubmission) => {
     const fingerprint = getFingerprint();
@@ -928,10 +1123,21 @@ export function App() {
 
       const transcript = await fetchThreadTranscript(session, threadId, options);
       setTranscripts((current) => upsertTranscriptCache(current, transcript));
+      syncStreamingStateFromTranscript(transcript);
       applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
       return transcript;
     },
-    [session, applyTranscriptModel]
+    [session, applyTranscriptModel, syncStreamingStateFromTranscript]
+  );
+
+  const handleFetchOlderMessages = useCallback(
+    async (threadId: string, beforeMessageId: string, limit?: number) => {
+      if (!session) {
+        return Promise.reject(new Error('Not connected.'));
+      }
+      return fetchOlderThreadMessages(session, threadId, beforeMessageId, limit);
+    },
+    [session]
   );
 
   const handleSendMessage = useCallback(
@@ -942,10 +1148,40 @@ export function App() {
 
       const result = await sendThreadMessage(session, threadId, text);
       setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
+      syncStreamingStateFromTranscript(result.transcript);
       applyTranscriptModel(threadId, result.transcript.model, result.transcript.reasoningEffort);
       return result;
     },
-    [session, applyTranscriptModel]
+    [session, applyTranscriptModel, syncStreamingStateFromTranscript]
+  );
+
+  const markThreadStopped = useCallback((threadId: string) => {
+    markThreadReady(threadId);
+    setThreads((current) =>
+      current.map((thread) =>
+        thread.threadId === threadId ? { ...thread, status: 'idle' as const } : thread
+      )
+    );
+    setTranscripts((current) => {
+      const transcript = current[threadId];
+      if (!transcript) {
+        return current;
+      }
+      return upsertTranscriptCache(current, transcriptAfterStop(transcript));
+    });
+  }, [markThreadReady]);
+
+  const handleStopWork = useCallback(
+    async (threadId: string) => {
+      if (!session) {
+        return Promise.reject(new Error('Not connected.'));
+      }
+
+      await stopThreadWork(session, threadId);
+      markThreadStopped(threadId);
+      requestTranscriptRefresh(threadId);
+    },
+    [session, markThreadStopped, requestTranscriptRefresh]
   );
 
   const handleOpenThreadInCodex = useCallback(
@@ -1036,6 +1272,8 @@ export function App() {
           onOpenSettings={handleOpenAdmin}
           fetchTranscript={handleFetchTranscript}
           sendMessage={handleSendMessage}
+          stopWork={handleStopWork}
+          fetchOlderMessages={handleFetchOlderMessages}
           transcriptUpdates={transcripts}
           threadModels={threadModels}
           threadReasoningEfforts={threadReasoningEfforts}
@@ -1118,6 +1356,7 @@ export function App() {
     handleOpenAdmin,
     handlePair,
     handleSendMessage,
+    handleStopWork,
     handleOpenThreadInCodex,
     health,
     message,
@@ -1128,8 +1367,10 @@ export function App() {
     screen,
     session,
     skills,
+    streamingThreadIds,
     threadModels,
     threadPendingRequests,
+    threadReasoningEfforts,
     threads,
     threadsLoaded,
     transcripts

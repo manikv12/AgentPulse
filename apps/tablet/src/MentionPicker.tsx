@@ -18,6 +18,7 @@ export type MentionItem =
       id: string;
       label: string;
       description?: string;
+      iconUrl?: string;
       insertText: string;
     }
   | {
@@ -152,6 +153,9 @@ function renderIcon(item: MentionItem): ReactElement {
     return <Workflow size={16} />;
   }
   if (item.kind === 'skill') {
+    if (item.iconUrl) {
+      return <img className="codex-mention-plugin-icon" src={item.iconUrl} alt="" />;
+    }
     return <Sparkles size={16} />;
   }
   if (item.kind === 'command') {
@@ -218,6 +222,7 @@ function buildItems(
       id: `skill:${skill.slug}`,
       label: skill.name,
       description: skill.description,
+      iconUrl: skill.iconUrl,
       insertText: `@${skill.slug} `
     });
   }

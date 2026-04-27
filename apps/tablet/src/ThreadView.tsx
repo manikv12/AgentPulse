@@ -5,6 +5,7 @@ import type {
   CatalogSkill,
   ChatAttachment,
   ChatMessage,
+  OlderThreadMessagesResponse,
   Thread,
   ThreadMessageResponse,
   ThreadTranscript,
@@ -21,19 +22,29 @@ import {
   ListChecks,
   Menu,
   Plus,
+  Square,
   Terminal,
   Wrench,
   X
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { FetchThreadTranscriptOptions } from './api';
+import { TranscriptFetchTimeoutError, type FetchThreadTranscriptOptions } from './api';
 import { CodexMark } from './CodexMark';
 import { MentionPicker, type MentionItem, type MentionTrigger } from './MentionPicker';
 
 const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 40;
+const OLDER_MESSAGES_PAGE_SIZE = 40;
+// Trigger an older-messages fetch when the user scrolls within this many pixels of the
+// top of the messages container. A small buffer makes the load feel preemptive instead
+// of stuttering once they've fully bottomed out at scrollTop=0.
+const OLDER_MESSAGES_TRIGGER_PX = 80;
+// Once the user is within this many pixels of the bottom we consider them "pinned" to
+// the latest message and resume auto-scrolling on new updates. Any further than that and
+// we leave their scroll position alone — typically because they've scrolled up to read.
+const NEAR_BOTTOM_PX = 60;
 
 export type ThreadPendingRequest = {
   id: string;
@@ -59,6 +70,11 @@ export type ThreadViewProps = {
     options?: FetchThreadTranscriptOptions
   ) => Promise<ThreadTranscript>;
   sendMessage?: (threadId: string, text: string) => Promise<ThreadMessageResponse>;
+  stopWork?: (threadId: string) => Promise<void>;
+  fetchOlderMessages?: (
+    beforeMessageId: string,
+    limit?: number
+  ) => Promise<OlderThreadMessagesResponse>;
   openThreadInCodex?: (threadId: string) => Promise<void>;
   liveTranscript?: ThreadTranscript;
   modelName?: string;
@@ -496,6 +512,8 @@ export function ThreadView({
   onOpenSidebar,
   fetchTranscript,
   sendMessage,
+  stopWork,
+  fetchOlderMessages,
   openThreadInCodex,
   liveTranscript,
   modelName,
@@ -515,6 +533,7 @@ export function ThreadView({
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(Boolean(fetchTranscript));
   const [sending, setSending] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [openingCodex, setOpeningCodex] = useState(false);
   const [error, setError] = useState('');
   const [mention, setMention] = useState<{ trigger: MentionTrigger; query: string; start: number; end: number } | undefined>();
@@ -528,14 +547,26 @@ export function ThreadView({
   // An entry is dropped as soon as a message with the same trimmed text appears in the
   // server transcript.
   const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([]);
+  // Older history loaded by scroll-up. The polling/live transcript only carries the tail
+  // (last ~40 messages), so we keep paged-in history in a separate bucket and prepend it
+  // at render time. Reset whenever the active thread changes.
+  const [olderMessages, setOlderMessages] = useState<ChatMessage[]>([]);
+  const [hasMoreOlder, setHasMoreOlder] = useState(true);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState('');
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRequestsInFlight = useRef(0);
+  // Tracks whether the user is "pinned" to the bottom of the conversation. When true we
+  // auto-scroll on new messages; when false (because they scrolled up to read history)
+  // we leave their position alone so a newly streamed token doesn't yank them down.
+  const pinnedToBottomRef = useRef(true);
+  const loadingOlderRef = useRef(false);
 
   const trimmedDraft = draft.trim();
   const canSend = Boolean(transcript?.sendState.canSend && trimmedDraft && sendMessage && !sending);
   const isAgentWorking =
-    forceWorking || Boolean(transcript?.activeTurnId) || thread.status === 'running';
+    forceWorking || Boolean(transcript?.activeTurnId) || (!transcript && thread.status === 'running');
   const effectiveModelName = modelName || thread.model;
 
   // Status bar text logic:
@@ -551,23 +582,28 @@ export function ThreadView({
     ? 'Sending to Codex...'
     : sendBlockedLabel
       ? sendBlockedLabel
-      : transcript?.activeTurnId
+      : forceWorking || transcript?.activeTurnId
         ? 'Codex is working'
         : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
 
   const renderable = useMemo(() => {
-    const real =
-      transcript?.messages.filter(
-        (message) => message.role !== 'activity' || message.text.trim().length > 0
-      ) ?? [];
+    const tail = transcript?.messages ?? [];
+    // De-dupe the older bucket against the current tail by id so a poll/live update that
+    // happens to overlap with our last paged-in window doesn't render the same message
+    // twice.
+    const tailIds = new Set(tail.map((m) => m.id));
+    const olderUnique = olderMessages.filter((m) => !tailIds.has(m.id));
+    const merged = [...olderUnique, ...tail].filter(
+      (message) => message.role !== 'activity' || message.text.trim().length > 0
+    );
     // Drop pending entries whose text already shows up in the real transcript, then append
     // any remaining ones at the end so the user sees their just-sent message immediately.
     const realUserTexts = new Set(
-      real.filter((m) => m.role === 'user').map((m) => m.text.trim())
+      merged.filter((m) => m.role === 'user').map((m) => m.text.trim())
     );
     const stillPending = pendingMessages.filter((m) => !realUserTexts.has(m.text.trim()));
-    return buildRenderableEntries([...real, ...stillPending]);
-  }, [transcript?.messages, pendingMessages]);
+    return buildRenderableEntries([...merged, ...stillPending]);
+  }, [transcript?.messages, olderMessages, pendingMessages]);
 
   // Reconcile pendingMessages whenever the transcript changes — once the server confirms a
   // pending message, drop it from local state so duplicates don't pile up.
@@ -587,15 +623,25 @@ export function ThreadView({
   // Clear pending state when switching threads — they're per-thread.
   useEffect(() => {
     setPendingMessages([]);
+    setOlderMessages([]);
+    setHasMoreOlder(true);
+    setLoadingOlder(false);
+    loadingOlderRef.current = false;
+    setOlderError('');
+    pinnedToBottomRef.current = true;
   }, [thread.threadId]);
 
-  // Auto-scroll to bottom when messages change
+  // Auto-scroll to bottom when new messages arrive — but only when the user is already
+  // pinned at the bottom. If they've scrolled up to read older history we leave them
+  // alone so the next streamed token doesn't yank them back down.
   useEffect(() => {
     const node = messagesRef.current;
     if (!node) {
       return;
     }
-    node.scrollTop = node.scrollHeight;
+    if (pinnedToBottomRef.current) {
+      node.scrollTop = node.scrollHeight;
+    }
   }, [transcript?.messages.length, transcript?.activeTurnId, loading]);
 
   // Apply live transcript updates immediately (WebSocket path)
@@ -639,6 +685,16 @@ export function ThreadView({
         }
         const haveLive = liveTranscript?.threadId === thread.threadId;
         if (haveLive) {
+          return;
+        }
+        // Soft-swallow timeouts when something is already on screen — the helper has its
+        // own cache fallback, and surfacing a red banner over a working conversation just
+        // confuses the user. Only show the timeout error on a true cold load (no live
+        // transcript and no prior state for this thread).
+        if (
+          loadError instanceof TranscriptFetchTimeoutError &&
+          transcript?.threadId === thread.threadId
+        ) {
           return;
         }
         setError(loadError instanceof Error ? loadError.message : 'Could not load this thread.');
@@ -768,6 +824,78 @@ export function ThreadView({
     }
   };
 
+  // Determine the oldest message id we currently have rendered. The "before" cursor for
+  // the next older-page fetch is whichever id appears first when olderMessages and the
+  // transcript tail are stitched together — `olderMessages[0]` if we've paged any in,
+  // otherwise the first message of the live transcript.
+  const oldestMessageId =
+    olderMessages.length > 0
+      ? olderMessages[0]!.id
+      : transcript?.messages.length
+        ? transcript.messages[0]!.id
+        : undefined;
+
+  const loadOlderMessages = async () => {
+    if (!fetchOlderMessages || loadingOlderRef.current || !hasMoreOlder || !oldestMessageId) {
+      return;
+    }
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    setOlderError('');
+
+    const node = messagesRef.current;
+    // Anchor the user's scroll position by remembering how far they were from the bottom.
+    // After the prepend we restore that distance so the content they were reading stays
+    // put visually.
+    const distanceFromBottom = node ? node.scrollHeight - node.scrollTop : 0;
+
+    try {
+      const response = await fetchOlderMessages(oldestMessageId, OLDER_MESSAGES_PAGE_SIZE);
+      if (response.messages.length > 0) {
+        setOlderMessages((current) => {
+          const seen = new Set(current.map((m) => m.id));
+          const additions = response.messages.filter((m) => !seen.has(m.id));
+          return [...additions, ...current];
+        });
+      }
+      setHasMoreOlder(response.hasMore);
+
+      // Restore scroll position after the DOM grows. requestAnimationFrame fires after
+      // React commits but before the browser paints, which is when the new scrollHeight
+      // is observable.
+      requestAnimationFrame(() => {
+        const current = messagesRef.current;
+        if (current) {
+          current.scrollTop = current.scrollHeight - distanceFromBottom;
+        }
+      });
+    } catch (loadError) {
+      setOlderError(
+        loadError instanceof Error ? loadError.message : 'Could not load older messages.'
+      );
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  };
+
+  const handleMessagesScroll = (event: UIEvent<HTMLDivElement>) => {
+    const node = event.currentTarget;
+    // Track whether the user is near the bottom so the auto-scroll-on-new-message effect
+    // knows whether to re-pin or stay put.
+    pinnedToBottomRef.current =
+      node.scrollHeight - node.scrollTop - node.clientHeight <= NEAR_BOTTOM_PX;
+
+    if (
+      node.scrollTop <= OLDER_MESSAGES_TRIGGER_PX &&
+      hasMoreOlder &&
+      !loadingOlderRef.current &&
+      fetchOlderMessages
+    ) {
+      void loadOlderMessages();
+    }
+  };
+
   const handleOpenInCodex = async () => {
     if (!openThreadInCodex || openingCodex) {
       return;
@@ -783,6 +911,38 @@ export function ThreadView({
       );
     } finally {
       setOpeningCodex(false);
+    }
+  };
+
+  const handleStopWork = async () => {
+    if (!stopWork || !isAgentWorking || stopping) {
+      return;
+    }
+
+    setStopping(true);
+    setError('');
+    try {
+      await stopWork(thread.threadId);
+      setTranscript((current) =>
+        current
+          ? {
+              ...current,
+              activeTurnId: null,
+              sendState:
+                current.sendState.reason === 'mobile_send_disabled'
+                  ? current.sendState
+                  : {
+                      canSend: true,
+                      reason: 'ready',
+                      label: 'Ready'
+                    }
+            }
+          : current
+      );
+    } catch (stopError) {
+      setError(stopError instanceof Error ? stopError.message : 'Could not stop Codex.');
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -820,6 +980,18 @@ export function ThreadView({
         ) : null}
 
         <div className="codex-thread-actions">
+          {stopWork && isAgentWorking ? (
+            <button
+              className="codex-thread-stop"
+              type="button"
+              onClick={() => void handleStopWork()}
+              disabled={stopping}
+              aria-label="Stop Codex"
+            >
+              <Square size={13} />
+              <span>{stopping ? 'Stopping' : 'Stop'}</span>
+            </button>
+          ) : null}
           {openThreadInCodex ? (
             <button
               className="codex-thread-open"
@@ -852,7 +1024,18 @@ export function ThreadView({
         ) : null}
       </div>
 
-      <div className="codex-thread-messages" ref={messagesRef}>
+      <div
+        className="codex-thread-messages"
+        ref={messagesRef}
+        onScroll={handleMessagesScroll}
+      >
+        {loadingOlder ? (
+          <p className="codex-thread-older-status">Loading older messages...</p>
+        ) : null}
+        {olderError ? <p className="codex-thread-older-error">{olderError}</p> : null}
+        {!loadingOlder && !hasMoreOlder && olderMessages.length > 0 ? (
+          <p className="codex-thread-older-status">Beginning of conversation.</p>
+        ) : null}
         {loading ? <p className="codex-thread-placeholder">Loading conversation...</p> : null}
         {!loading && !transcript && !error ? (
           <p className="codex-thread-placeholder">Transcript is unavailable.</p>
