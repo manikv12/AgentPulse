@@ -735,46 +735,70 @@ function createApp(
       const threadId = context.req.param('threadId');
       const override = pendingModelOverrides.get(threadId);
       // Send routing:
-      //   - If a Codex window has the thread focused, the IPC mirror is the right path: it goes
-      //     through `thread-follower-start-turn` so the desktop session shows the same turn live.
-      //   - If not, fall back to the spawned app-server subprocess. That subprocess talks JSON-RPC
-      //     directly to Codex backend with no ownership requirement, and accepts `model`/`effort`
-      //     on turn/start so queued model overrides are applied here.
-      const mirrorOwns =
-        options.mirror?.isConnected() === true && options.mirror.isThreadOwned?.(threadId) === true;
-      let sender: AppServerChatBridge | CodexMirrorBridge | undefined;
-      let viaAppServer = false;
-      if (mirrorOwns && options.mirror) {
-        sender = options.mirror;
-      } else if (options.appServer && options.appServer.isConnected()) {
-        sender = options.appServer;
-        viaAppServer = true;
-      } else if (options.mirror && options.mirror.isConnected()) {
-        sender = options.mirror;
-      } else {
-        sender = options.appServer ?? options.mirror;
-      }
-      if (!sender) {
+      //   1. Always prefer the IPC mirror when it's connected. That path goes through
+      //      `thread-follower-start-turn`, so the message appears live in the Codex desktop
+      //      window — exactly like a message sent from the VS Code extension. We pair it with
+      //      `runWithFollowerOwnership`, which auto-opens the thread on the Mac and waits for
+      //      the ownership broadcast before sending. (Codex follower discovery requires
+      //      `getThreadRole === 'owner'`; without that the IPC returns
+      //      `client-cannot-handle-request`.)
+      //   2. Only fall back to the spawned app-server subprocess when (a) the mirror isn't
+      //      connected at all, or (b) the IPC path fails with `thread_unavailable` (Codex
+      //      isn't running, or the user dismissed the focus prompt). The fallback is what
+      //      delivers any queued model override, which app-server's `turn/start` accepts via
+      //      `{model, effort}` directly.
+      const mirrorReady = options.mirror?.isConnected() === true;
+      const appServerReady = options.appServer?.isConnected() === true;
+      if (!mirrorReady && !appServerReady) {
         return context.json({ error: 'Codex connection unavailable.' }, 503);
       }
-      const sendOptions = viaAppServer && override
-        ? { model: override.model, ...(override.effort ? { effort: override.effort } : {}) }
-        : undefined;
-      // Only the mirror path needs ownership wrangling. App-server talks JSON-RPC directly to
-      // a Codex backend (no ownership concept), so skip the 4-second opener/wait — sending must
-      // feel instant when the thread isn't focused on the Mac.
-      const result = ThreadMessageResponseSchema.parse(
-        viaAppServer
-          ? await options.appServer!.sendMessage(threadId, parsed.text, sendOptions)
-          : await runWithFollowerOwnership(
-              () => (sender as CodexMirrorBridge).sendMessage(threadId, parsed.text),
+
+      const sendViaAppServer = async () => {
+        if (!options.appServer) {
+          throw new SendBlockedError('thread_unavailable', 'Codex app-server is not running.');
+        }
+        const sendOptions = override
+          ? { model: override.model, ...(override.effort ? { effort: override.effort } : {}) }
+          : undefined;
+        return options.appServer.sendMessage(threadId, parsed.text, sendOptions);
+      };
+
+      let result: ThreadMessageResponse;
+      if (mirrorReady && options.mirror) {
+        try {
+          result = ThreadMessageResponseSchema.parse(
+            await runWithFollowerOwnership(
+              () => options.mirror!.sendMessage(threadId, parsed.text),
               options.opener,
               threadId,
               options.mirror
             )
-      );
-      // Once the override has been delivered (either as part of an app-server turn/start, or via
-      // a successful mirror send through an owning window), drop it.
+          );
+        } catch (error) {
+          // The mirror couldn't deliver — fall back to the spawned app-server subprocess so
+          // the user's send doesn't fail outright.
+          if (
+            error instanceof SendBlockedError &&
+            error.reason === 'thread_unavailable' &&
+            appServerReady
+          ) {
+            console.warn('[send] mirror failed; falling back to app-server', {
+              threadId,
+              error: error.message
+            });
+            result = ThreadMessageResponseSchema.parse(await sendViaAppServer());
+          } else {
+            throw error;
+          }
+        }
+      } else if (appServerReady) {
+        result = ThreadMessageResponseSchema.parse(await sendViaAppServer());
+      } else {
+        // Should be unreachable due to the early-return above, but guard for type narrowing.
+        return context.json({ error: 'Codex connection unavailable.' }, 503);
+      }
+
+      // Once the message is on the wire, the override has effectively been delivered.
       if (override) {
         pendingModelOverrides.delete(threadId);
       }
@@ -985,7 +1009,8 @@ function createApp(
         pendingModelOverrides.delete(threadId);
         console.log('[model-change] applied live via IPC', {
           threadId,
-          modelSlug: parsed.modelSlug
+          modelSlug: parsed.modelSlug,
+          reasoningEffort: parsed.reasoningEffort
         });
       } catch (error) {
         console.warn('[model-change] live IPC path failed; queueing instead', {
@@ -1311,36 +1336,79 @@ function attachWebSocketEvents(
 ): void {
   const wss = new WebSocketServer({ noServer: true });
 
-  server.on('upgrade', async (request, socket, head) => {
-    const url = new URL(request.url ?? '/', 'http://localhost');
-    if (url.pathname !== '/events') {
-      if (tabletDevProxy) {
-        tabletDevProxy.proxyUpgrade(request, socket, head);
-        return;
+  server.on('upgrade', (request, socket, head) => {
+    // Wrap the async work so that any thrown error is logged and the socket is
+    // closed cleanly. Without this, a rejection from registry.validate (e.g. the
+    // macOS Keychain command failing) becomes an unhandled rejection — fatal on
+    // Node 22+ — and the helper exits, after which cloudflared sees
+    // "connection refused" on every retry until the helper is restarted.
+    void (async () => {
+      const url = new URL(request.url ?? '/', 'http://localhost');
+      const remoteAddress = request.socket.remoteAddress ?? 'unknown';
+      const origin = request.headers.origin ?? '(none)';
+
+      try {
+        if (url.pathname !== '/events') {
+          if (tabletDevProxy) {
+            tabletDevProxy.proxyUpgrade(request, socket, head);
+            return;
+          }
+          console.warn('[ws-upgrade] rejected: unknown path', {
+            path: url.pathname,
+            remoteAddress,
+            origin
+          });
+          socket.destroy();
+          return;
+        }
+
+        if (!isAllowedOriginHeaders(nodeHeaderGetter(request), currentSettings())) {
+          console.warn('[ws-upgrade] rejected: origin not allowed', {
+            origin,
+            host: request.headers.host ?? '(none)',
+            remoteAddress
+          });
+          socket.destroy();
+          return;
+        }
+
+        const deviceId = url.searchParams.get('deviceId') ?? undefined;
+        const auth = await registry.validate(
+          url.searchParams.get('token') ?? undefined,
+          deviceId,
+          url.searchParams.get('fingerprint') ?? undefined
+        );
+
+        if (!auth.ok) {
+          console.warn('[ws-upgrade] rejected: auth failed', {
+            reason: auth.reason,
+            deviceId: deviceId ?? '(none)',
+            hasToken: url.searchParams.has('token'),
+            hasFingerprint: url.searchParams.has('fingerprint'),
+            remoteAddress,
+            origin
+          });
+          socket.destroy();
+          return;
+        }
+
+        wss.handleUpgrade(request, socket, head, (websocket) => {
+          hub.add(websocket, auth.device.deviceId);
+        });
+      } catch (error) {
+        console.error('[ws-upgrade] handler threw', {
+          path: url.pathname,
+          remoteAddress,
+          origin,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        try {
+          socket.destroy();
+        } catch {
+          // socket may already be closed
+        }
       }
-      socket.destroy();
-      return;
-    }
-
-    if (!isAllowedOriginHeaders(nodeHeaderGetter(request), currentSettings())) {
-      socket.destroy();
-      return;
-    }
-
-    const auth = await registry.validate(
-      url.searchParams.get('token') ?? undefined,
-      url.searchParams.get('deviceId') ?? undefined,
-      url.searchParams.get('fingerprint') ?? undefined
-    );
-
-    if (!auth.ok) {
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(request, socket, head, (websocket) => {
-      hub.add(websocket, auth.device.deviceId);
-    });
+    })();
   });
 }
 
@@ -1432,7 +1500,13 @@ function startThreadPolling(
         if (previous.get(thread.threadId) !== next.get(thread.threadId)) {
           hub.broadcast({ type: 'thread/upsert', payload: thread });
         }
-        if (thread.status === 'running' && transcript) {
+        // Push transcripts for any thread we successfully reconciled. Previously we gated this
+        // on `status === 'running'`, but the desktop's app-server can be slow to flip status
+        // back to running after the user's send (it stays `idle` for a beat while the turn is
+        // booting), and we'd miss the first push. Pushing whenever we have a transcript keeps
+        // the tablet's last-known-good state fresh — the WebSocket is the real-time channel,
+        // the client-side fetch is just a backstop.
+        if (transcript) {
           const payload = transformTranscript
             ? transformTranscript(transcript, thread.threadId)
             : transcript;

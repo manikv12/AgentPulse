@@ -522,6 +522,12 @@ export function ThreadView({
   const [filesLoading, setFilesLoading] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelUpdating, setModelUpdating] = useState(false);
+  // Optimistic local copies of just-sent user messages. These get merged into `renderable`
+  // immediately on send so the chat shows the bubble without waiting for the round-trip
+  // transcript fetch (which can lag several seconds while Codex is streaming the reply).
+  // An entry is dropped as soon as a message with the same trimmed text appears in the
+  // server transcript.
+  const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([]);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRequestsInFlight = useRef(0);
@@ -549,15 +555,39 @@ export function ThreadView({
         ? 'Codex is working'
         : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
 
-  const renderable = useMemo(
-    () =>
-      buildRenderableEntries(
-        transcript?.messages.filter(
-          (message) => message.role !== 'activity' || message.text.trim().length > 0
-        ) ?? []
-      ),
-    [transcript?.messages]
-  );
+  const renderable = useMemo(() => {
+    const real =
+      transcript?.messages.filter(
+        (message) => message.role !== 'activity' || message.text.trim().length > 0
+      ) ?? [];
+    // Drop pending entries whose text already shows up in the real transcript, then append
+    // any remaining ones at the end so the user sees their just-sent message immediately.
+    const realUserTexts = new Set(
+      real.filter((m) => m.role === 'user').map((m) => m.text.trim())
+    );
+    const stillPending = pendingMessages.filter((m) => !realUserTexts.has(m.text.trim()));
+    return buildRenderableEntries([...real, ...stillPending]);
+  }, [transcript?.messages, pendingMessages]);
+
+  // Reconcile pendingMessages whenever the transcript changes — once the server confirms a
+  // pending message, drop it from local state so duplicates don't pile up.
+  useEffect(() => {
+    if (pendingMessages.length === 0) return;
+    const realUserTexts = new Set(
+      (transcript?.messages ?? [])
+        .filter((m) => m.role === 'user')
+        .map((m) => m.text.trim())
+    );
+    setPendingMessages((current) => {
+      const next = current.filter((m) => !realUserTexts.has(m.text.trim()));
+      return next.length === current.length ? current : next;
+    });
+  }, [transcript?.messages, pendingMessages.length]);
+
+  // Clear pending state when switching threads — they're per-thread.
+  useEffect(() => {
+    setPendingMessages([]);
+  }, [thread.threadId]);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -710,13 +740,28 @@ export function ThreadView({
       return;
     }
 
+    const textToSend = trimmedDraft;
+    // Optimistic UI: clear the textarea and append the user's bubble to the chat right away.
+    // The full transcript round-trip can take several seconds while Codex is streaming a
+    // reply, so we don't want the message to appear "stuck" in the input.
+    const optimistic: ChatMessage = {
+      id: `pending-${Date.now()}`,
+      role: 'user',
+      kind: 'message',
+      text: textToSend,
+      createdAt: new Date().toISOString()
+    };
+    setPendingMessages((current) => [...current, optimistic]);
+    setDraft('');
     setSending(true);
     setError('');
     try {
-      const result = await sendMessage(thread.threadId, trimmedDraft);
+      const result = await sendMessage(thread.threadId, textToSend);
       setTranscript(result.transcript);
-      setDraft('');
     } catch (sendError) {
+      // Roll back the optimistic bubble and restore the draft so the user can retry.
+      setPendingMessages((current) => current.filter((m) => m.id !== optimistic.id));
+      setDraft(textToSend);
       setError(sendError instanceof Error ? sendError.message : 'Could not send this message.');
     } finally {
       setSending(false);

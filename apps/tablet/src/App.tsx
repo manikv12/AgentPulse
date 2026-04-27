@@ -34,7 +34,7 @@ import {
   Trash2
 } from 'lucide-react';
 import QRCode from 'qrcode';
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   adminChangePasscode,
   adminFetch,
@@ -245,6 +245,31 @@ function extractLatestModel(params: unknown): string | undefined {
   return undefined;
 }
 
+function extractLatestReasoningEffort(params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') {
+    return undefined;
+  }
+  const change = (params as { change?: unknown }).change;
+  if (!change || typeof change !== 'object') {
+    return undefined;
+  }
+  const snapshotState = (change as { conversationState?: unknown }).conversationState;
+  if (snapshotState && typeof snapshotState === 'object') {
+    const direct = (snapshotState as { latestReasoningEffort?: unknown }).latestReasoningEffort;
+    if (typeof direct === 'string' && direct.trim().length > 0) {
+      return direct.trim();
+    }
+    const collab = (snapshotState as {
+      latestCollaborationMode?: { settings?: { reasoning_effort?: unknown } };
+    }).latestCollaborationMode;
+    const collabEffort = collab?.settings?.reasoning_effort;
+    if (typeof collabEffort === 'string' && collabEffort.trim().length > 0) {
+      return collabEffort.trim();
+    }
+  }
+  return undefined;
+}
+
 function screenFromLocation(): AppScreen {
   if (window.location.hash === '#/settings') {
     return loadAdminToken() ? 'settings' : 'admin-login';
@@ -439,6 +464,134 @@ export function App() {
     readCachedTranscripts(loadSession())
   );
   const [threadModels, setThreadModels] = useState<Record<string, string>>({});
+  const [threadReasoningEfforts, setThreadReasoningEfforts] = useState<Record<string, string>>({});
+  // Tracks user-initiated picks per thread (model + effort + timestamp). Codex's persisted thread
+  // record lags the live IPC change — `thread/resume` keeps reporting the old slug/effort until a
+  // turn starts with the new one. We hold onto the user's pick for a short window so transcript
+  // polls don't visibly flip the chip back to the previous selection.
+  const userModelPicksRef = useRef<
+    Map<string, { modelSlug: string; reasoningEffort?: string; pickedAt: number }>
+  >(new Map());
+  const USER_MODEL_PICK_TTL_MS = 30_000;
+
+  // Coalesce transcript refetches per thread. Codex emits many `thread-stream-state-changed`
+  // broadcasts per turn — without this we'd start a new HTTP request on every patch and end
+  // up with dozens of in-flight transcript fetches racing each other through Cloudflare,
+  // each canceling the previous one. Now: at most one in-flight per thread, with a debounced
+  // trailing fetch armed when broadcasts arrive while one is in flight.
+  const transcriptFetchStateRef = useRef<
+    Map<string, { inFlight: boolean; pending: boolean; trailingTimer: number | undefined }>
+  >(new Map());
+
+  // Apply a transcript-derived model/effort, but only when:
+  //   - the user has not just made a different pick in the last TTL window, OR
+  //   - the transcript values match the pick (desktop caught up — drop override).
+  const applyTranscriptModel = useCallback(
+    (threadId: string, modelSlug: string | undefined, reasoningEffort: string | undefined) => {
+      if (!modelSlug) {
+        return;
+      }
+      const pick = userModelPicksRef.current.get(threadId);
+      let allow = true;
+      if (pick) {
+        const expired = Date.now() - pick.pickedAt > USER_MODEL_PICK_TTL_MS;
+        const slugMatches = pick.modelSlug === modelSlug;
+        const effortMatches =
+          (pick.reasoningEffort ?? undefined) === (reasoningEffort ?? undefined);
+        if (expired || (slugMatches && effortMatches)) {
+          userModelPicksRef.current.delete(threadId);
+        } else {
+          allow = false; // user pick is fresher and different — keep the chip on it
+        }
+      }
+      if (!allow) return;
+      setThreadModels((current) =>
+        current[threadId] === modelSlug ? current : { ...current, [threadId]: modelSlug }
+      );
+      if (reasoningEffort) {
+        setThreadReasoningEfforts((current) =>
+          current[threadId] === reasoningEffort
+            ? current
+            : { ...current, [threadId]: reasoningEffort }
+        );
+      } else {
+        setThreadReasoningEfforts((current) => {
+          if (!(threadId in current)) return current;
+          const next = { ...current };
+          delete next[threadId];
+          return next;
+        });
+      }
+    },
+    []
+  );
+
+  // Coalesced + debounced transcript refetch.
+  //
+  // Codex emits many `thread-stream-state-changed` patch broadcasts per turn (one per token
+  // chunk on long responses). Two problems we have to avoid:
+  //   1. Spawning a fetch per broadcast floods Cloudflare with HTTP/2 streams that race each
+  //      other and cancel out — none ever completes, so the UI looks frozen until we refresh.
+  //   2. Even with a leading fetch, the *trailing* fetch starting at the very moment the next
+  //      broadcast arrives gets canceled too.
+  // Strategy: at most one in-flight per thread. While in-flight, mark a `pending` flag and
+  // ignore further broadcasts. After the in-flight resolves, debounce ~600ms of quiet before
+  // running the trailing fetch — that's enough for the broadcast storm to subside, so the
+  // trailing fetch isn't immediately canceled by the next one. WebSocket pushes from the
+  // helper's polling loop are the real-time channel; the client-side fetch is just a backstop
+  // that fills in the final state after Codex finishes streaming.
+  const requestTranscriptRefresh = useCallback(
+    (threadId: string) => {
+      const currentSession = session;
+      if (!currentSession) return;
+      const states = transcriptFetchStateRef.current;
+      const state =
+        states.get(threadId) ?? { inFlight: false, pending: false, trailingTimer: undefined };
+      if (state.inFlight) {
+        state.pending = true;
+        states.set(threadId, state);
+        return;
+      }
+      // If a trailing-debounce timer is already armed, just keep it — another broadcast just
+      // arrived but we don't need to start a new fetch yet.
+      if (state.trailingTimer !== undefined) {
+        return;
+      }
+      state.inFlight = true;
+      state.pending = false;
+      states.set(threadId, state);
+      void (async () => {
+        try {
+          const transcript = await fetchThreadTranscript(currentSession, threadId);
+          setTranscripts((current) => upsertTranscriptCache(current, transcript));
+          applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
+        } catch {
+          // ignore — broadcast or polling will retry
+        } finally {
+          const next = states.get(threadId);
+          if (!next) return;
+          next.inFlight = false;
+          const trailing = next.pending;
+          next.pending = false;
+          states.set(threadId, next);
+          if (trailing) {
+            // Debounce: wait for the broadcast storm to quiet down before fetching once more.
+            const timer = window.setTimeout(() => {
+              const after = states.get(threadId);
+              if (after) {
+                after.trailingTimer = undefined;
+                states.set(threadId, after);
+              }
+              requestTranscriptRefresh(threadId);
+            }, 600);
+            next.trailingTimer = timer;
+            states.set(threadId, next);
+          }
+        }
+      })();
+    },
+    [session, applyTranscriptModel]
+  );
   const [streamingThreadIds, setStreamingThreadIds] = useState<Set<string>>(() => new Set());
   const [plugins, setPlugins] = useState<CatalogPlugin[]>([]);
   const [skills, setSkills] = useState<CatalogSkill[]>([]);
@@ -613,17 +766,11 @@ export function App() {
 
         if (liveEvent.type === 'thread/transcript/changed') {
           setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
-          // Also hydrate the model state from the transcript — Codex doesn't always emit a
-          // standalone model-changed event, so this keeps the chip in sync regardless.
-          if (liveEvent.payload.model) {
-            const transcriptModel = liveEvent.payload.model;
-            const transcriptThreadId = liveEvent.payload.threadId;
-            setThreadModels((current) =>
-              current[transcriptThreadId] === transcriptModel
-                ? current
-                : { ...current, [transcriptThreadId]: transcriptModel }
-            );
-          }
+          applyTranscriptModel(
+            liveEvent.payload.threadId,
+            liveEvent.payload.model,
+            liveEvent.payload.reasoningEffort
+          );
         }
 
         if (liveEvent.type === 'thread/streaming-changed') {
@@ -660,14 +807,11 @@ export function App() {
             return;
           }
 
-          const liveModel = extractLatestModel(params);
-          if (liveModel) {
-            setThreadModels((current) =>
-              current[conversationId] === liveModel
-                ? current
-                : { ...current, [conversationId]: liveModel }
-            );
-          }
+          applyTranscriptModel(
+            conversationId,
+            extractLatestModel(params),
+            extractLatestReasoningEffort(params)
+          );
 
           const pending = extractPendingRequests(params);
           if (method === 'thread-stream-state-changed') {
@@ -684,22 +828,7 @@ export function App() {
             method === 'thread-unarchived' ||
             method === 'query-cache-invalidate'
           ) {
-            void (async () => {
-              try {
-                const transcript = await fetchThreadTranscript(session, conversationId);
-                setTranscripts((current) => upsertTranscriptCache(current, transcript));
-                if (transcript.model) {
-                  const refetchedModel = transcript.model;
-                  setThreadModels((current) =>
-                    current[conversationId] === refetchedModel
-                      ? current
-                      : { ...current, [conversationId]: refetchedModel }
-                  );
-                }
-              } catch {
-                // ignore — the next polling refresh or broadcast will retry
-              }
-            })();
+            requestTranscriptRefresh(conversationId);
           }
         }
       };
@@ -723,7 +852,7 @@ export function App() {
       }
       socket?.close();
     };
-  }, [session]);
+  }, [session, applyTranscriptModel, requestTranscriptRefresh]);
 
   const handlePair = async (input: PairingSubmission) => {
     const fingerprint = getFingerprint();
@@ -799,17 +928,10 @@ export function App() {
 
       const transcript = await fetchThreadTranscript(session, threadId, options);
       setTranscripts((current) => upsertTranscriptCache(current, transcript));
-      if (transcript.model) {
-        const fetchedModel = transcript.model;
-        setThreadModels((current) =>
-          current[threadId] === fetchedModel
-            ? current
-            : { ...current, [threadId]: fetchedModel }
-        );
-      }
+      applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
       return transcript;
     },
-    [session]
+    [session, applyTranscriptModel]
   );
 
   const handleSendMessage = useCallback(
@@ -820,15 +942,10 @@ export function App() {
 
       const result = await sendThreadMessage(session, threadId, text);
       setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
-      if (result.transcript.model) {
-        const sentModel = result.transcript.model;
-        setThreadModels((current) =>
-          current[threadId] === sentModel ? current : { ...current, [threadId]: sentModel }
-        );
-      }
+      applyTranscriptModel(threadId, result.transcript.model, result.transcript.reasoningEffort);
       return result;
     },
-    [session]
+    [session, applyTranscriptModel]
   );
 
   const handleOpenThreadInCodex = useCallback(
@@ -921,6 +1038,7 @@ export function App() {
           sendMessage={handleSendMessage}
           transcriptUpdates={transcripts}
           threadModels={threadModels}
+          threadReasoningEfforts={threadReasoningEfforts}
           threadPendingRequests={threadPendingRequests}
           streamingThreadIds={streamingThreadIds}
           plugins={plugins}
@@ -945,11 +1063,28 @@ export function App() {
           onChangeThreadModel={
             session
               ? async (threadId: string, modelSlug: string, reasoningEffort?: string) => {
+                  // Record the pick BEFORE the network call so any transcript broadcast that
+                  // races back doesn't briefly flip the chip back to the old selection.
+                  userModelPicksRef.current.set(threadId, {
+                    modelSlug,
+                    reasoningEffort,
+                    pickedAt: Date.now()
+                  });
+                  setThreadModels((current) => ({ ...current, [threadId]: modelSlug }));
+                  if (reasoningEffort) {
+                    setThreadReasoningEfforts((current) => ({
+                      ...current,
+                      [threadId]: reasoningEffort
+                    }));
+                  } else {
+                    setThreadReasoningEfforts((current) => {
+                      if (!(threadId in current)) return current;
+                      const next = { ...current };
+                      delete next[threadId];
+                      return next;
+                    });
+                  }
                   await updateThreadModel(session, threadId, modelSlug, reasoningEffort);
-                  setThreadModels((current) => ({
-                    ...current,
-                    [threadId]: modelSlug
-                  }));
                 }
               : undefined
           }

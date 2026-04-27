@@ -122,6 +122,13 @@ if (settings.remoteAccess.enabled && process.env.AGENT_PULSE_SKIP_MANAGED_TUNNEL
 console.log(`Agent Pulse helper running at ${server.url}`);
 console.log(`Open settings at ${server.url}/#/settings`);
 
+process.on('uncaughtException', (error) => {
+  console.error('[helper] uncaughtException', error);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[helper] unhandledRejection', reason);
+});
+
 process.on('SIGINT', async () => {
   await server.stop();
   await remoteSupervisor.stop();

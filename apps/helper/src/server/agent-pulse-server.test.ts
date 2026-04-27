@@ -6,6 +6,7 @@ import type { RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-puls
 import { WebSocket } from 'ws';
 import { AdminAuth } from '../auth/admin';
 import { DeviceRegistry, MemoryDeviceStore, PairingManager } from '../auth/pairing';
+import { SendBlockedError } from '../codex/app-server-chat';
 import { createThreadOpener } from '../codex/thread-opener';
 import { startAgentPulseServer } from './agent-pulse-server';
 import { pickFreeHighPort, type HelperSettingsStore } from './settings';
@@ -1229,12 +1230,10 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('prefers the local app-server send over the Codex mirror when both are connected', async () => {
-    // Behavior change: the IPC mirror's start-turn path requires a Codex window to currently
-    // own the thread (`getThreadRole === 'owner'`), which fails when the user hasn't focused
-    // the conversation on the Mac. The app-server subprocess talks directly to a Codex backend
-    // and accepts model + effort on turn/start with no ownership requirement, so we route
-    // sends through it whenever it's connected.
+  it('prefers the IPC mirror over the local app-server when both are connected', async () => {
+    // Sending must land in the user's Codex desktop window (visible there, addressable from
+    // the same UI), so we route through `thread-follower-start-turn` whenever the IPC mirror
+    // is connected. App-server is only the fallback for when IPC can't deliver.
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -1246,18 +1245,20 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
-      sendMessage: vi.fn(async () => ({
-        ok: true as const,
-        mode: 'start' as const,
-        turnId: 'app-server-turn-1',
-        transcript
-      }))
+      sendMessage: vi.fn(async () => {
+        throw new Error('appServer.sendMessage should not be called when mirror is connected');
+      })
     };
     const mirror = {
       isConnected: () => true,
-      sendMessage: vi.fn(async () => {
-        throw new Error('mirror.sendMessage should not be called when app-server is connected');
-      })
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'mirror-turn-1',
+        transcript
+      })),
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const settings = {
       port: await pickFreeHighPort(),
@@ -1300,8 +1301,8 @@ describe('Agent Pulse helper API', () => {
       });
 
       expect(sendResponse.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
-      expect(mirror.sendMessage).not.toHaveBeenCalled();
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.');
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -1328,9 +1329,12 @@ describe('Agent Pulse helper API', () => {
     };
     const mirror = {
       isConnected: () => true,
-      sendMessage: vi.fn(),
-      // Simulate "no Codex window currently owns the conversation": setModelAndReasoning would
-      // throw in this state, so the model endpoint must queue instead of trying to push live.
+      // Simulate "no Codex window currently owns the conversation": both setModelAndReasoning
+      // and sendMessage must throw `thread_unavailable` so the helper falls back to its
+      // app-server subprocess (which is what consumes the queued model override on turn/start).
+      sendMessage: vi.fn(async () => {
+        throw new SendBlockedError('thread_unavailable', 'no owner');
+      }),
       setModelAndReasoning: vi.fn(async () => {
         throw new Error('should not be called when thread is not owned');
       }),

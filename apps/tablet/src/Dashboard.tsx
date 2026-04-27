@@ -36,6 +36,7 @@ export type DashboardProps = {
   sendMessage?: (threadId: string, text: string) => Promise<ThreadMessageResponse>;
   transcriptUpdates?: Record<string, ThreadTranscript>;
   threadModels?: Record<string, string>;
+  threadReasoningEfforts?: Record<string, string>;
   threadPendingRequests?: Record<string, PendingRequest[]>;
   streamingThreadIds?: Set<string>;
   plugins?: CatalogPlugin[];
@@ -85,6 +86,7 @@ export function Dashboard({
   sendMessage,
   transcriptUpdates = {},
   threadModels = {},
+  threadReasoningEfforts = {},
   threadPendingRequests = {},
   streamingThreadIds,
   plugins = [],
@@ -257,6 +259,8 @@ export function Dashboard({
             openThreadInCodex={onOpenThreadInCodex}
             liveTranscript={transcriptUpdates[activeThread.threadId]}
             modelName={threadModels[activeThread.threadId]}
+            selectedModelSlug={threadModels[activeThread.threadId]}
+            selectedReasoningEffort={threadReasoningEfforts[activeThread.threadId]}
             pendingRequests={threadPendingRequests[activeThread.threadId] ?? []}
             forceWorking={streamingThreadIds?.has(activeThread.threadId) ?? false}
             plugins={plugins}

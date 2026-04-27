@@ -231,9 +231,12 @@ fi
 log "Helper is ready at $helper_url."
 
 eval "$(read_health "$helper_url")"
-tunnel_origin="$helper_url"
+# cloudflared resolves "localhost" via getaddrinfo and may pick AAAA (::1) before A (127.0.0.1).
+# Our helper binds to 0.0.0.0 (IPv4 only), so an IPv6 connect attempt fails with
+# "dial tcp [::1]:55110: connect: connection refused". Pin the origin to 127.0.0.1.
+tunnel_origin="${helper_url//localhost/127.0.0.1}"
 if [[ "$tunnel_target" == "vite" ]]; then
-  tunnel_origin="$vite_origin"
+  tunnel_origin="${vite_origin//localhost/127.0.0.1}"
 fi
 
 if [[ "$remote_enabled" != "true" || "$remote_provider" != "cloudflare" ]]; then
