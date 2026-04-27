@@ -1221,7 +1221,7 @@ describe('Agent Pulse helper API', () => {
         transcript
       });
       expect(sendResponse.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.');
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
       expect(opener.refreshDesktop).not.toHaveBeenCalled();
       expect(opener.openThread).not.toHaveBeenCalled();
     } finally {
@@ -1229,7 +1229,12 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('routes sends through the Codex mirror when it is connected', async () => {
+  it('prefers the local app-server send over the Codex mirror when both are connected', async () => {
+    // Behavior change: the IPC mirror's start-turn path requires a Codex window to currently
+    // own the thread (`getThreadRole === 'owner'`), which fails when the user hasn't focused
+    // the conversation on the Mac. The app-server subprocess talks directly to a Codex backend
+    // and accepts model + effort on turn/start with no ownership requirement, so we route
+    // sends through it whenever it's connected.
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -1241,18 +1246,18 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
-      sendMessage: vi.fn(async () => {
-        throw new Error('appServer.sendMessage should not be called when mirror is connected');
-      })
-    };
-    const mirror = {
-      isConnected: () => true,
       sendMessage: vi.fn(async () => ({
         ok: true as const,
         mode: 'start' as const,
-        turnId: 'mirror-turn-1',
+        turnId: 'app-server-turn-1',
         transcript
       }))
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(async () => {
+        throw new Error('mirror.sendMessage should not be called when app-server is connected');
+      })
     };
     const settings = {
       port: await pickFreeHighPort(),
@@ -1295,8 +1300,116 @@ describe('Agent Pulse helper API', () => {
       });
 
       expect(sendResponse.status).toBe(200);
-      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.');
-      expect(appServer.sendMessage).not.toHaveBeenCalled();
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
+      expect(mirror.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('applies a queued model override on the next send and clears it after success', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'turn-1',
+        transcript
+      }))
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      // Simulate "no Codex window currently owns the conversation": setModelAndReasoning would
+      // throw in this state, so the model endpoint must queue instead of trying to push live.
+      setModelAndReasoning: vi.fn(async () => {
+        throw new Error('should not be called when thread is not owned');
+      }),
+      isThreadOwned: () => false,
+      waitForOwnership: async () => false
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+
+      // 1. Queue a model change without IPC ownership.
+      const modelResponse = await fetch(`${server.url}/threads/thread-1/model`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ modelSlug: 'gpt-5.4', reasoningEffort: 'high' })
+      });
+      expect(modelResponse.status).toBe(200);
+      // The endpoint optimistically tries the IPC follower path once; when it throws (because
+      // no Codex window currently owns the thread) the change is queued for the next send.
+      expect(mirror.setModelAndReasoning).toHaveBeenCalledWith('thread-1', 'gpt-5.4', 'high');
+
+      // 2. Next message should pass the queued model + effort to turn/start.
+      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Now use the new model' })
+      });
+      expect(sendResponse.status).toBe(200);
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Now use the new model', {
+        model: 'gpt-5.4',
+        effort: 'high'
+      });
+
+      // 3. The override is consumed — a follow-up message uses default model.
+      appServer.sendMessage.mockClear();
+      const secondSend = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Follow up' })
+      });
+      expect(secondSend.status).toBe(200);
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Follow up', undefined);
     } finally {
       await server.stop();
     }
@@ -1367,7 +1480,7 @@ describe('Agent Pulse helper API', () => {
 
       expect(sendResponse.status).toBe(200);
       expect(mirror.sendMessage).not.toHaveBeenCalled();
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hi.');
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hi.', undefined);
     } finally {
       await server.stop();
     }

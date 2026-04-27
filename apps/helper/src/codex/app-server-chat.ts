@@ -129,7 +129,11 @@ export class CodexAppServerChat {
     return mapThreadToTranscript(thread);
   }
 
-  async sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse> {
+  async sendMessage(
+    threadId: string,
+    text: string,
+    options: { model?: string; effort?: string } = {}
+  ): Promise<ThreadMessageResponse> {
     const trimmed = text.trim();
     const thread = await this.loadExistingThread(threadId);
     const transcript = mapThreadToTranscript(thread);
@@ -139,9 +143,14 @@ export class CodexAppServerChat {
       return this.steerActiveTurn(threadId, trimmed, transcript.activeTurnId);
     }
 
+    // turn/start accepts `model` and `effort` directly. We pass the user's queued overrides
+    // here so the model picker on the tablet can change models even when no Codex window is
+    // currently the conversation owner (the IPC follower path requires ownership; this doesn't).
     const response = await this.transport.request<{ turn: { id: string } }>('turn/start', {
       threadId,
-      input: userTextInput(trimmed)
+      input: userTextInput(trimmed),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {})
     });
     const updatedTranscript = await this.readTranscript(threadId);
     return ThreadMessageResponseSchema.parse({

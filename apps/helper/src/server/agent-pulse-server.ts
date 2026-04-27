@@ -70,7 +70,11 @@ const GLOBAL_ADMIN_LOGIN_LIMIT_KEY = '__global_admin_login_failures__';
 export type AppServerChatBridge = {
   isConnected(): boolean;
   readTranscript(threadId: string): Promise<ThreadTranscript>;
-  sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse>;
+  sendMessage(
+    threadId: string,
+    text: string,
+    options?: { model?: string; effort?: string }
+  ): Promise<ThreadMessageResponse>;
   startThread?(cwd: string): Promise<Thread>;
 };
 
@@ -197,6 +201,11 @@ function createApp(
   const app = new Hono();
   const startedAt = Date.now();
   const localAttachments = new Map<string, LocalAttachment>();
+  // Pending model/effort overrides applied on the next turn/start for that thread.
+  // Used by /threads/:id/model when no Codex window owns the thread (the IPC follower
+  // path requires ownership). The override is consumed when the user sends the next
+  // message — at that point we pass it directly to turn/start, no ownership needed.
+  const pendingModelOverrides = new Map<string, { model: string; effort?: string }>();
   let currentSettings = options.settings;
   const remoteActivity: RemoteActivityLogEntry[] = [];
   const recordRemoteActivity = (
@@ -724,21 +733,45 @@ function createApp(
 
     try {
       const threadId = context.req.param('threadId');
-      const sender =
-        options.mirror && options.mirror.isConnected()
-          ? options.mirror
-          : options.appServer;
+      const override = pendingModelOverrides.get(threadId);
+      // Send routing:
+      //   - If a Codex window has the thread focused, the IPC mirror is the right path: it goes
+      //     through `thread-follower-start-turn` so the desktop session shows the same turn live.
+      //   - If not, fall back to the spawned app-server subprocess. That subprocess talks JSON-RPC
+      //     directly to Codex backend with no ownership requirement, and accepts `model`/`effort`
+      //     on turn/start so queued model overrides are applied here.
+      const mirrorOwns =
+        options.mirror?.isConnected() === true && options.mirror.isThreadOwned?.(threadId) === true;
+      let sender: AppServerChatBridge | CodexMirrorBridge | undefined;
+      let viaAppServer = false;
+      if (mirrorOwns && options.mirror) {
+        sender = options.mirror;
+      } else if (options.appServer && options.appServer.isConnected()) {
+        sender = options.appServer;
+        viaAppServer = true;
+      } else if (options.mirror && options.mirror.isConnected()) {
+        sender = options.mirror;
+      } else {
+        sender = options.appServer ?? options.mirror;
+      }
       if (!sender) {
         return context.json({ error: 'Codex connection unavailable.' }, 503);
       }
+      const sendOptions = viaAppServer && override
+        ? { model: override.model, ...(override.effort ? { effort: override.effort } : {}) }
+        : undefined;
+      const sendCall = () =>
+        viaAppServer
+          ? options.appServer!.sendMessage(threadId, parsed.text, sendOptions)
+          : (sender as CodexMirrorBridge).sendMessage(threadId, parsed.text);
       const result = ThreadMessageResponseSchema.parse(
-        await runWithFollowerOwnership(
-          () => sender.sendMessage(threadId, parsed.text),
-          options.opener,
-          threadId,
-          options.mirror
-        )
+        await runWithFollowerOwnership(sendCall, options.opener, threadId, options.mirror)
       );
+      // Once the override has been delivered (either as part of an app-server turn/start, or via
+      // a successful mirror send through an owning window), drop it.
+      if (override) {
+        pendingModelOverrides.delete(threadId);
+      }
       const response = {
         ...result,
         transcript: exposeLocalAttachments(
@@ -916,57 +949,65 @@ function createApp(
 
   app.post('/threads/:threadId/model', async (context) => {
     const threadId = context.req.param('threadId');
-    console.log('[model-change] request received', { threadId });
     const auth = await authenticate(context);
     if (!auth.ok) {
-      console.log('[model-change] auth failed', { reason: auth.reason });
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
-    if (!options.mirror?.setModelAndReasoning || !options.mirror.isConnected()) {
-      console.log('[model-change] mirror unavailable', {
-        hasMirror: Boolean(options.mirror),
-        hasMethod: Boolean(options.mirror?.setModelAndReasoning),
-        connected: options.mirror?.isConnected()
-      });
-      return context.json(
-        { error: 'Open Codex on this Mac to change the model.' },
-        503
-      );
-    }
     const parsed = ThreadModelUpdateRequestSchema.parse(await context.req.json());
-    console.log('[model-change] parsed', {
-      threadId,
-      modelSlug: parsed.modelSlug,
-      reasoningEffort: parsed.reasoningEffort,
-      currentlyOwned: options.mirror.isThreadOwned?.(threadId)
-    });
-    const apply = () =>
-      options.mirror!.setModelAndReasoning!(
-        threadId,
-        parsed.modelSlug,
-        parsed.reasoningEffort
-      );
-    try {
-      await runWithFollowerOwnership(apply, options.opener, threadId, options.mirror);
-      console.log('[model-change] success', { threadId, modelSlug: parsed.modelSlug });
-      return context.json(
-        ThreadModelUpdateResponseSchema.parse({
-          ok: true,
-          modelSlug: parsed.modelSlug,
-          ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
-        })
-      );
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      const status = error instanceof SendBlockedError ? 409 : 503;
-      console.error('[model-change] failed', {
+
+    // Strategy:
+    //   1. Try to push the change live via the IPC follower path — runWithFollowerOwnership
+    //      will open the thread on the Mac if it isn't already owned, and wait for the
+    //      ownership broadcast before sending. This is the path that worked previously and
+    //      gives the user the same "GPT-5.5 -> {selected model}" desktop transition.
+    //   2. If the IPC path fails (no Codex window will accept the request — e.g. Codex isn't
+    //      running, or the user dismissed the focus prompt), queue the override locally so the
+    //      next message we send via the app-server subprocess passes `model`/`effort` directly
+    //      to turn/start. The override is durable until consumed.
+    // Either way the response is "ok" so the tablet UI updates its model chip optimistically.
+    let mode: 'live' | 'queued' = 'queued';
+    if (options.mirror?.setModelAndReasoning && options.mirror.isConnected()) {
+      const apply = () =>
+        options.mirror!.setModelAndReasoning!(
+          threadId,
+          parsed.modelSlug,
+          parsed.reasoningEffort
+        );
+      try {
+        await runWithFollowerOwnership(apply, options.opener, threadId, options.mirror);
+        mode = 'live';
+        pendingModelOverrides.delete(threadId);
+        console.log('[model-change] applied live via IPC', {
+          threadId,
+          modelSlug: parsed.modelSlug
+        });
+      } catch (error) {
+        console.warn('[model-change] live IPC path failed; queueing instead', {
+          threadId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
+    if (mode === 'queued') {
+      pendingModelOverrides.set(threadId, {
+        model: parsed.modelSlug,
+        ...(parsed.reasoningEffort ? { effort: parsed.reasoningEffort } : {})
+      });
+      console.log('[model-change] queued for next turn', {
         threadId,
         modelSlug: parsed.modelSlug,
-        detail,
-        status
+        reasoningEffort: parsed.reasoningEffort
       });
-      return context.json({ error: `Could not update model: ${detail}` }, status);
     }
+
+    return context.json(
+      ThreadModelUpdateResponseSchema.parse({
+        ok: true,
+        modelSlug: parsed.modelSlug,
+        ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+      })
+    );
   });
 
   if (tabletDevProxy) {
