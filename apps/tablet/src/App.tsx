@@ -97,6 +97,7 @@ const CACHED_TRANSCRIPT_MESSAGE_LIMIT = 40;
 const TRANSCRIPT_REFRESH_DEBOUNCE_MS = 250;
 const SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS = [750, 1_500];
 const ACTIVE_CODEX_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
+const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
 
 const ADMIN_FLEX_SCREENS = new Set<AppScreen>(['settings', 'admin-login', 'chooser']);
 const BACKGROUND_STABLE_SCREENS = new Set<AppScreen>(['settings', 'admin-login']);
@@ -125,8 +126,27 @@ function extractConversationId(params: unknown): string | undefined {
   if (!params || typeof params !== 'object') {
     return undefined;
   }
-  const value = (params as { conversationId?: unknown }).conversationId;
+  const value =
+    (params as { conversationId?: unknown }).conversationId ??
+    (params as { threadId?: unknown }).threadId;
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function transcriptShowsLiveActive(transcript: ThreadTranscript): boolean {
+  if (transcript.sendState.reason === 'waiting_on_approval') {
+    return true;
+  }
+  if (transcript.sendState.reason === 'compacting_context') {
+    return true;
+  }
+  if (
+    transcript.activeTurnId?.startsWith(MIRROR_STREAMING_TURN_PREFIX) ||
+    (transcript.sendState.reason === 'thread_changed' &&
+      transcript.sendState.label === 'Codex is working')
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function extractStreamingChange(
@@ -228,94 +248,411 @@ export type PendingRequestSummary = {
   body?: string;
   itemId?: string;
   turnId?: string;
+  permissions?: Record<string, unknown>;
   kind?: 'question' | 'plan' | 'commandApproval' | 'fileApproval' | 'permissionsApproval';
 };
 
-function extractPendingRequests(params: unknown): PendingRequestSummary[] {
+export function extractPendingRequests(
+  params: unknown,
+  previous: PendingRequestSummary[] = []
+): PendingRequestSummary[] {
+  return extractPendingRequestsFromParams(params, previous) ?? [];
+}
+
+function extractPendingRequestsFromParams(
+  params: unknown,
+  previous: PendingRequestSummary[] = []
+): PendingRequestSummary[] | null {
   if (!params || typeof params !== 'object') {
-    return [];
+    return null;
   }
   const change = (params as { change?: unknown }).change;
   if (!change || typeof change !== 'object') {
-    return [];
+    return null;
   }
-  const conversationState = (change as { conversationState?: unknown }).conversationState;
-  if (!conversationState || typeof conversationState !== 'object') {
-    return [];
+
+  const stateRequests = summarizePendingRequestsFromState(change);
+  if (stateRequests) {
+    return stateRequests;
   }
-  const requests = (conversationState as { requests?: unknown }).requests;
-  if (!Array.isArray(requests)) {
-    return [];
+
+  if (stringField(change, 'type') === 'patches') {
+    return applyPendingRequestPatches(previous, arrayField(change, 'patches'));
   }
+
+  return null;
+}
+
+function summarizePendingRequestsFromState(change: object): PendingRequestSummary[] | undefined {
+  const summaries = new Map<string, PendingRequestSummary>();
+  let foundRequestState = false;
+
+  for (const source of requestStateSources(change)) {
+    const requests = getArrayField(source, 'requests');
+    if (requests) {
+      foundRequestState = true;
+      for (const summary of summarizePendingRequests(requests)) {
+        summaries.set(summary.id, summary);
+      }
+    }
+
+    const turns = getArrayField(source, 'turns');
+    if (turns) {
+      const permissionItems = summarizePermissionRequestItemsFromTurns(turns);
+      if (permissionItems.length > 0) {
+        foundRequestState = true;
+        for (const summary of permissionItems) {
+          summaries.set(summary.id, summary);
+        }
+      }
+    }
+  }
+
+  return foundRequestState ? [...summaries.values()] : undefined;
+}
+
+function requestStateSources(change: object): object[] {
+  const sources = [change];
+  const conversationState = objectField(change, 'conversationState');
+  if (conversationState) {
+    sources.unshift(conversationState);
+  }
+  const snapshot = objectField(change, 'snapshot');
+  const snapshotConversationState = objectField(snapshot, 'conversationState');
+  if (snapshotConversationState) {
+    sources.unshift(snapshotConversationState);
+  }
+  const state = objectField(change, 'state');
+  const stateConversationState = objectField(state, 'conversationState');
+  if (stateConversationState) {
+    sources.unshift(stateConversationState);
+  }
+  return sources;
+}
+
+function summarizePendingRequests(requests: unknown[]): PendingRequestSummary[] {
   const summaries: PendingRequestSummary[] = [];
   for (const raw of requests) {
-    if (!raw || typeof raw !== 'object') {
-      continue;
-    }
-    const req = raw as {
-      id?: unknown;
-      method?: unknown;
-      params?: unknown;
-      isCompleted?: unknown;
-    };
-    if (req.isCompleted) {
-      continue;
-    }
-    const method = typeof req.method === 'string' ? req.method : '';
-    const id = typeof req.id === 'string' ? req.id : '';
-    if (!method || !id) {
-      continue;
-    }
-    if (method === 'item/tool/requestUserInput') {
-      const params = (req.params ?? {}) as { questions?: unknown; turnId?: unknown };
-      const questions = Array.isArray(params.questions) ? params.questions : [];
-      const first = questions[0] as { header?: string; question?: string } | undefined;
-      summaries.push({
-        id,
-        method,
-        kind: 'question',
-        title: first?.header ?? 'Codex needs more information',
-        body: first?.question,
-        turnId: typeof params.turnId === 'string' ? params.turnId : undefined
-      });
-    } else if (method === 'item/plan/requestImplementation') {
-      const params = (req.params ?? {}) as { planContent?: unknown; turnId?: unknown };
-      const planContent = typeof params.planContent === 'string' ? params.planContent : undefined;
-      summaries.push({
-        id,
-        method,
-        kind: 'plan',
-        title: 'Implement this plan?',
-        body: planContent,
-        turnId: typeof params.turnId === 'string' ? params.turnId : undefined
-      });
-    } else if (
-      method === 'item/commandExecution/requestApproval' ||
-      method === 'item/fileChange/requestApproval' ||
-      method === 'item/permissions/requestApproval'
-    ) {
-      const params = (req.params ?? {}) as { itemId?: unknown; turnId?: unknown };
-      summaries.push({
-        id,
-        method,
-        kind:
-          method === 'item/commandExecution/requestApproval'
-            ? 'commandApproval'
-            : method === 'item/fileChange/requestApproval'
-              ? 'fileApproval'
-              : 'permissionsApproval',
-        title:
-          method === 'item/commandExecution/requestApproval'
-            ? 'Approve command?'
-            : method === 'item/fileChange/requestApproval'
-              ? 'Approve file changes?'
-              : 'Approve permissions?',
-        itemId: typeof params.itemId === 'string' ? params.itemId : undefined,
-        turnId: typeof params.turnId === 'string' ? params.turnId : undefined
-      });
+    const summary = summarizePendingRequest(raw);
+    if (summary) {
+      summaries.push(summary);
     }
   }
   return summaries;
+}
+
+function summarizePermissionRequestItemsFromTurns(turns: unknown[]): PendingRequestSummary[] {
+  const summaries: PendingRequestSummary[] = [];
+  for (const rawTurn of turns) {
+    for (const item of arrayField(rawTurn, 'items')) {
+      const summary = summarizePermissionRequestItem(item);
+      if (summary) {
+        summaries.push(summary);
+      }
+    }
+  }
+  return summaries;
+}
+
+function summarizePermissionRequestItem(raw: unknown): PendingRequestSummary | null {
+  const item = objectFromUnknown(raw);
+  if (!item) {
+    return null;
+  }
+  const type = stringField(item, 'type') ?? stringField(item, 'action');
+  if (type !== 'permissionRequest' && type !== 'permission-request') {
+    return null;
+  }
+  if ((item as { completed?: unknown }).completed === true) {
+    return null;
+  }
+  const id = stringField(item, 'requestId') ?? stringField(item, 'id');
+  if (!id) {
+    return null;
+  }
+  const permissions = recordFromUnknown((item as { permissions?: unknown }).permissions);
+  const reason = stringField(item, 'reason');
+  return {
+    id,
+    method: 'item/permissions/requestApproval',
+    kind: 'permissionsApproval',
+    title: reason ?? 'Approve permissions?',
+    body: describePermissions(permissions),
+    permissions,
+    turnId: stringField(item, 'turnId')
+  };
+}
+
+function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const req = raw as {
+    id?: unknown;
+    method?: unknown;
+    params?: unknown;
+    isCompleted?: unknown;
+    completed?: unknown;
+  };
+  if (req.isCompleted || req.completed) {
+    return null;
+  }
+  const method = typeof req.method === 'string' ? req.method : '';
+  const id = typeof req.id === 'string' ? req.id : '';
+  if (!method || !id) {
+    return null;
+  }
+  if (method === 'item/tool/requestUserInput') {
+    const params = (req.params ?? {}) as { questions?: unknown; turnId?: unknown };
+    const questions = Array.isArray(params.questions) ? params.questions : [];
+    const first = questions[0] as { header?: string; question?: string } | undefined;
+    return {
+      id,
+      method,
+      kind: 'question',
+      title: first?.header ?? 'Codex needs more information',
+      body: first?.question,
+      turnId: typeof params.turnId === 'string' ? params.turnId : undefined
+    };
+  }
+  if (method === 'item/plan/requestImplementation') {
+    const params = (req.params ?? {}) as { planContent?: unknown; turnId?: unknown };
+    const planContent = typeof params.planContent === 'string' ? params.planContent : undefined;
+    return {
+      id,
+      method,
+      kind: 'plan',
+      title: 'Implement this plan?',
+      body: planContent,
+      turnId: typeof params.turnId === 'string' ? params.turnId : undefined
+    };
+  }
+  if (
+    method === 'item/commandExecution/requestApproval' ||
+    method === 'item/fileChange/requestApproval' ||
+    method === 'item/permissions/requestApproval'
+  ) {
+    const params = (req.params ?? {}) as {
+      itemId?: unknown;
+      turnId?: unknown;
+      reason?: unknown;
+      permissions?: unknown;
+    };
+    const permissions = recordFromUnknown(params.permissions);
+    const isPermissionsApproval = method === 'item/permissions/requestApproval';
+    return {
+      id,
+      method,
+      kind:
+        method === 'item/commandExecution/requestApproval'
+          ? 'commandApproval'
+          : method === 'item/fileChange/requestApproval'
+            ? 'fileApproval'
+            : 'permissionsApproval',
+      title:
+        method === 'item/commandExecution/requestApproval'
+          ? 'Approve command?'
+          : method === 'item/fileChange/requestApproval'
+            ? 'Approve file changes?'
+            : typeof params.reason === 'string' && params.reason.trim().length > 0
+              ? params.reason.trim()
+              : 'Approve permissions?',
+      body: isPermissionsApproval ? describePermissions(permissions) : undefined,
+      permissions,
+      itemId: typeof params.itemId === 'string' ? params.itemId : undefined,
+      turnId: typeof params.turnId === 'string' ? params.turnId : undefined
+    };
+  }
+  return null;
+}
+
+function applyPendingRequestPatches(
+  previous: PendingRequestSummary[],
+  patches: unknown[]
+): PendingRequestSummary[] | null {
+  let next = previous;
+  let touched = false;
+
+  for (const rawPatch of patches) {
+    const patch = objectFromUnknown(rawPatch);
+    if (!patch) {
+      continue;
+    }
+    const rawPath = normalizedPatchPath((patch as { path?: unknown }).path);
+    const path = conversationStatePatchPath(rawPath);
+    const value = (patch as { value?: unknown }).value;
+
+    if (path.length === 0) {
+      const stateRequests = objectFromUnknown(value)
+        ? summarizePendingRequestsFromState(value as object)
+        : undefined;
+      if (stateRequests) {
+        next = stateRequests;
+        touched = true;
+      }
+      continue;
+    }
+
+    if (path[0] !== 'requests') {
+      const itemSummary = summarizePermissionRequestItem(value);
+      if (
+        itemSummary &&
+        path[0] === 'turns' &&
+        path.includes('items') &&
+        stringField(patch, 'op') !== 'remove'
+      ) {
+        if (!touched) {
+          next = [...previous];
+          touched = true;
+        }
+        next = upsertPatchedRequest(next, itemSummary, null, stringField(patch, 'op'));
+      }
+      continue;
+    }
+
+    if (!touched) {
+      next = [...previous];
+      touched = true;
+    }
+
+    const op = stringField(patch, 'op');
+
+    if (path.length === 1) {
+      if (Array.isArray(value)) {
+        next = summarizePendingRequests(value);
+      } else if (op === 'remove') {
+        next = [];
+      }
+      continue;
+    }
+
+    const index = numericPathPart(path[1]);
+    if (path.length === 2) {
+      if (op === 'remove') {
+        if (index != null) {
+          next.splice(index, 1);
+        }
+        continue;
+      }
+      const summary = summarizePendingRequest(value);
+      if (summary) {
+        next = upsertPatchedRequest(next, summary, index, op);
+      } else if (index != null) {
+        next.splice(index, 1);
+      }
+      continue;
+    }
+
+    if (index == null || !next[index]) {
+      continue;
+    }
+
+    if ((path[2] === 'isCompleted' || path[2] === 'completed') && value === true) {
+      next.splice(index, 1);
+      continue;
+    }
+
+    const current = next[index];
+    if (path[2] === 'params' && path[3] === 'reason' && typeof value === 'string') {
+      next[index] = { ...current, title: value.trim() || current.title };
+      continue;
+    }
+
+    if (path[2] === 'params' && path[3] === 'permissions') {
+      const permissions = recordFromUnknown(value);
+      next[index] = {
+        ...current,
+        permissions,
+        body: current.kind === 'permissionsApproval' ? describePermissions(permissions) : current.body
+      };
+    }
+  }
+
+  return touched ? next : null;
+}
+
+function upsertPatchedRequest(
+  requests: PendingRequestSummary[],
+  summary: PendingRequestSummary,
+  index: number | null,
+  op: string | undefined
+): PendingRequestSummary[] {
+  const existingIndex = requests.findIndex((request) => request.id === summary.id);
+  if (existingIndex >= 0) {
+    const next = [...requests];
+    next[existingIndex] = summary;
+    return next;
+  }
+  const next = [...requests];
+  if (index == null || index >= next.length) {
+    next.push(summary);
+  } else if (op === 'add') {
+    next.splice(index, 0, summary);
+  } else {
+    next[index] = summary;
+  }
+  return next;
+}
+
+function normalizedPatchPath(rawPath: unknown): unknown[] {
+  if (Array.isArray(rawPath)) {
+    return rawPath;
+  }
+  if (typeof rawPath !== 'string') {
+    return [];
+  }
+  return rawPath
+    .split('/')
+    .filter(Boolean)
+    .map((part) => part.replace(/~1/g, '/').replace(/~0/g, '~'));
+}
+
+function conversationStatePatchPath(path: unknown[]): unknown[] {
+  if (path[0] === 'conversationState') {
+    return path.slice(1);
+  }
+  if (path[0] === 'snapshot' && path[1] === 'conversationState') {
+    return path.slice(2);
+  }
+  if (path[0] === 'state' && path[1] === 'conversationState') {
+    return path.slice(2);
+  }
+  return path;
+}
+
+function numericPathPart(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    return Number(value);
+  }
+  return null;
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function describePermissions(permissions: Record<string, unknown> | undefined): string | undefined {
+  if (!permissions) {
+    return undefined;
+  }
+  const labels: string[] = [];
+  if (permissions.network) {
+    labels.push('network access');
+  }
+  if (permissions.fileSystem) {
+    labels.push('file access');
+  }
+  const otherKeys = Object.keys(permissions).filter(
+    (key) => key !== 'network' && key !== 'fileSystem'
+  );
+  labels.push(...otherKeys.map((key) => key.replace(/([A-Z])/g, ' $1').toLowerCase()));
+  return labels.length > 0 ? `Requested: ${labels.join(', ')}.` : undefined;
 }
 
 export function extractLatestModel(params: unknown): string | undefined {
@@ -406,11 +743,15 @@ function objectField(source: unknown, key: string): object | undefined {
 }
 
 function arrayField(source: unknown, key: string): unknown[] {
+  return getArrayField(source, key) ?? [];
+}
+
+function getArrayField(source: unknown, key: string): unknown[] | undefined {
   if (!source || typeof source !== 'object') {
-    return [];
+    return undefined;
   }
   const value = (source as Record<string, unknown>)[key];
-  return Array.isArray(value) ? value : [];
+  return Array.isArray(value) ? value : undefined;
 }
 
 function objectFromUnknown(source: unknown): object | undefined {
@@ -970,6 +1311,19 @@ export function App() {
             liveEvent.payload,
             ...current.filter((thread) => thread.threadId !== liveEvent.payload.threadId)
           ]);
+          if (
+            liveEvent.payload.status === 'idle' ||
+            liveEvent.payload.status === 'error' ||
+            liveEvent.payload.status === 'connection' ||
+            liveEvent.payload.status === 'unknown'
+          ) {
+            markThreadReady(liveEvent.payload.threadId);
+          } else if (
+            liveEvent.payload.status === 'waiting_approval' ||
+            liveEvent.payload.status === 'compacting'
+          ) {
+            markThreadWorking(liveEvent.payload.threadId);
+          }
         }
 
         if (liveEvent.type === 'thread/remove') {
@@ -981,6 +1335,9 @@ export function App() {
 
         if (liveEvent.type === 'thread/transcript/changed') {
           setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
+          if (transcriptShowsLiveActive(liveEvent.payload)) {
+            markThreadWorking(liveEvent.payload.threadId);
+          }
           applyTranscriptModel(
             liveEvent.payload.threadId,
             liveEvent.payload.model,
@@ -1037,16 +1394,21 @@ export function App() {
             extractLatestReasoningEffort(params)
           );
 
-          const pending = extractPendingRequests(params);
-          if (method === 'thread-stream-state-changed') {
-            setThreadPendingRequests((current) => ({
+          setThreadPendingRequests((current) => {
+            const pending = extractPendingRequestsFromParams(params, current[conversationId] ?? []);
+            if (!pending) {
+              return current;
+            }
+            return {
               ...current,
               [conversationId]: pending
-            }));
-          }
+            };
+          });
 
           if (
             method === 'thread-stream-state-changed' ||
+            method === 'thread/status/changed' ||
+            method === 'thread/compacted' ||
             method === 'thread-queued-followups-changed' ||
             method === 'thread-archived' ||
             method === 'thread-unarchived' ||

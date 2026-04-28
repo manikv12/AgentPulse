@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ThreadTranscript } from '@agent-pulse/shared';
-import { App, extractLatestModel, extractLatestReasoningEffort } from './App';
+import { App, extractLatestModel, extractLatestReasoningEffort, extractPendingRequests } from './App';
 import { Dashboard } from './Dashboard';
 import { ThreadView } from './ThreadView';
 
@@ -84,6 +84,64 @@ describe('Agent Pulse tablet UI', () => {
         }
       })
     ).toBe('medium');
+  });
+
+  it('extracts pending permission requests from Codex patch broadcasts', () => {
+    const permissions = {
+      network: { enabled: true },
+      fileSystem: { read: ['/tmp'] }
+    };
+
+    expect(
+      extractPendingRequests({
+        change: {
+          type: 'patches',
+          patches: [
+            {
+              op: 'add',
+              path: ['conversationState', 'requests', 0],
+              value: {
+                id: 'permission-request-1',
+                method: 'item/permissions/requestApproval',
+                params: {
+                  turnId: 'turn-1',
+                  reason: 'Allow Codex to use Microsoft Teams?',
+                  permissions
+                }
+              }
+            },
+            {
+              op: 'add',
+              path: '/conversationState/turns/0/items/0',
+              value: {
+                type: 'permissionRequest',
+                requestId: 'permission-request-from-item',
+                turnId: 'turn-1',
+                reason: 'Allow Codex to use Slack?',
+                permissions
+              }
+            }
+          ]
+        }
+      })
+    ).toEqual([
+      expect.objectContaining({
+        id: 'permission-request-1',
+        method: 'item/permissions/requestApproval',
+        kind: 'permissionsApproval',
+        title: 'Allow Codex to use Microsoft Teams?',
+        turnId: 'turn-1',
+        permissions
+      }),
+      expect.objectContaining({
+        id: 'permission-request-from-item',
+        method: 'item/permissions/requestApproval',
+        kind: 'permissionsApproval',
+        title: 'Allow Codex to use Slack?',
+        turnId: 'turn-1',
+        permissions
+      })
+    ]);
   });
 
   it('turns off auto-capitalization for admin and pairing inputs', async () => {
@@ -688,6 +746,166 @@ describe('Agent Pulse tablet UI', () => {
 
     await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
+  });
+
+  it('shows Codex permission requests from live patches and sends the permission response shape', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const sockets: MockWebSocket[] = [];
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+
+      close(): void {}
+    }
+
+    let approvalBody: unknown;
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'thread-live',
+                  title: 'Check Teams',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-04-28T13:10:00Z',
+                  lastTurnSummary: ''
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-live/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: []
+            })
+          };
+        }
+
+        if (url === '/threads/thread-live/approvals/permission-request-1') {
+          approvalBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+          return { ok: true, json: async () => ({ ok: true }) };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Check Teams/ }));
+    expect(await screen.findByText('Ready')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/broadcast',
+            payload: {
+              method: 'thread-stream-state-changed',
+              sourceClientId: 'desktop',
+              params: {
+                conversationId: 'thread-live',
+                change: {
+                  type: 'patches',
+                  patches: [
+                    {
+                      op: 'add',
+                      path: ['conversationState', 'requests', 0],
+                      value: {
+                        id: 'permission-request-1',
+                        method: 'item/permissions/requestApproval',
+                        params: {
+                          turnId: 'turn-1',
+                          reason: 'Allow Codex to use Microsoft Teams?',
+                          permissions: { network: { enabled: true } }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          })
+        })
+      );
+    });
+
+    expect(await screen.findByText('Allow Codex to use Microsoft Teams?')).toBeInTheDocument();
+    expect(screen.getByText('Codex needs permission')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Allow once' }));
+
+    await waitFor(() =>
+      expect(approvalBody).toEqual({
+        method: 'item/permissions/requestApproval',
+        decision: {
+          permissions: { network: { enabled: true } },
+          scope: 'turn'
+        }
+      })
+    );
   });
 
   it('keeps working state on the Codex stream source instead of transcript updates', async () => {
@@ -1305,6 +1523,157 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.getByText('Ready')).toBeInTheDocument();
   });
 
+  it('shows fresh ready transcript messages before the live stream sends its done signal', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const sockets: MockWebSocket[] = [];
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+
+      close(): void {}
+    }
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'thread-live',
+                  title: 'Fix Mac helper sync',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-04-27T18:10:00Z',
+                  lastTurnSummary: ''
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-live/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+              messages: []
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/streaming-changed',
+            payload: { threadId: 'thread-live', isStreaming: true }
+          })
+        })
+      );
+    });
+    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/transcript/changed',
+            payload: {
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+              messages: [
+                {
+                  id: 'assistant-done',
+                  role: 'assistant',
+                  kind: 'message',
+                  text: 'Done now.',
+                  createdAt: '2026-04-28T15:17:00Z'
+                }
+              ]
+            }
+          })
+        })
+      );
+    });
+
+    expect(await screen.findByText('Done now.')).toBeInTheDocument();
+    expect(screen.getByText('Codex is working')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/streaming-changed',
+            payload: { threadId: 'thread-live', isStreaming: false }
+          })
+        })
+      );
+    });
+
+    await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
+    expect(screen.getByText('Ready')).toBeInTheDocument();
+  });
+
   it('keeps the stop button visible when the Codex stream source says working and the transcript is stale', async () => {
     const staleReadyTranscript: ThreadTranscript = {
       threadId: 'running-1',
@@ -1410,6 +1779,46 @@ describe('Agent Pulse tablet UI', () => {
     expect(await screen.findByText('Codex is working')).toBeInTheDocument();
     const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
     expect(stopButton.closest('.codex-composer')).not.toBeNull();
+  });
+
+  it('shows compaction as its own active state', async () => {
+    const compactingTranscript = {
+      threadId: 'running-1',
+      activeTurnId: 'mirror-streaming:running-1',
+      sendState: {
+        canSend: false,
+        reason: 'compacting_context',
+        label: 'Automatically compacting context'
+      },
+      messages: [
+        {
+          id: 'status-1',
+          role: 'activity',
+          kind: 'status',
+          text: 'Automatically compacting context',
+          createdAt: '2026-04-28T15:17:00Z'
+        }
+      ]
+    } as ThreadTranscript;
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Fix Mac helper sync',
+          workspace: 'CodexPulse',
+          status: 'compacting' as never,
+          lastActivityAt: '2026-04-28T15:17:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={compactingTranscript}
+        stopWork={vi.fn(async () => undefined)}
+      />
+    );
+
+    expect(screen.getByText('Compacting')).toBeInTheDocument();
+    expect(screen.getAllByText('Automatically compacting context').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
   });
 
   it('does not show the stop button from app-server-only working state', async () => {
@@ -1716,9 +2125,44 @@ describe('Agent Pulse tablet UI', () => {
     expect(
       within(sidebar).getByRole('button', { name: 'Open chat for Review permission request' })
     ).toBeInTheDocument();
+    expect(within(sidebar).getByText('Awaiting approval')).toBeInTheDocument();
     expect(
       within(sidebar).getByRole('button', { name: 'Open chat for Write docs' })
     ).toBeInTheDocument();
+  });
+
+  it('shows waiting approval instead of working when the thread status is approval-blocked', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'waiting-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    }));
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'waiting-1',
+          title: 'Review permission request',
+          workspace: 'OpenAssist',
+          status: 'waiting_approval',
+          lastActivityAt: '2026-04-25T16:14:00Z',
+          lastTurnSummary: 'Needs approval before continuing'
+        }}
+        fetchTranscript={fetchTranscript}
+        sendMessage={vi.fn()}
+        stopWork={vi.fn()}
+      />
+    );
+
+    expect(await screen.findAllByText('Codex is waiting for approval')).toHaveLength(2);
+    expect(screen.getByText('Approval')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Ask Codex anything')).toBeDisabled();
+    expect(screen.queryByText('Working')).not.toBeInTheDocument();
   });
 
   it('opens a chat drawer, disables send when mobile sending is off, and sends when ready', async () => {
@@ -2104,9 +2548,9 @@ describe('Agent Pulse tablet UI', () => {
             threadId: 'attention-1',
             title: 'Implement mobile chat',
             workspace: 'Agent Pulse',
-            status: 'waiting_approval',
+            status: 'error',
             lastActivityAt: '2026-04-25T16:18:00Z',
-            lastTurnSummary: 'Approval needed'
+            lastTurnSummary: 'Needs attention'
           }
         ]}
         projects={[

@@ -15,6 +15,7 @@ describe('resolveThreadStatus', () => {
       'error',
       'connection',
       'waiting_approval',
+      'compacting',
       'running',
       'idle',
       'unknown'

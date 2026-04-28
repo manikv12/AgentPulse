@@ -77,6 +77,10 @@ export type PendingRequest = {
   method: string;
   title: string;
   body?: string;
+  itemId?: string;
+  turnId?: string;
+  permissions?: Record<string, unknown>;
+  kind?: 'question' | 'plan' | 'commandApproval' | 'fileApproval' | 'permissionsApproval';
 };
 
 export type NewThreadTarget = { projectId: string } | { cwd: string };
@@ -123,7 +127,7 @@ export function Dashboard({
       ? (controlledActiveThreadId ?? undefined)
       : internalActiveThreadId;
 
-  const visibleThreads = useMemo(
+  const baseVisibleThreads = useMemo(
     () => [
       ...createdThreads,
       ...threads.filter(
@@ -131,6 +135,17 @@ export function Dashboard({
       )
     ],
     [createdThreads, threads]
+  );
+
+  const visibleThreads = useMemo(
+    () =>
+      baseVisibleThreads.map((thread) =>
+        (threadPendingRequests[thread.threadId] ?? []).length > 0 &&
+        thread.status !== 'waiting_approval'
+          ? { ...thread, status: 'waiting_approval' as const }
+          : thread
+      ),
+    [baseVisibleThreads, threadPendingRequests]
   );
 
   const activeThread = useMemo(

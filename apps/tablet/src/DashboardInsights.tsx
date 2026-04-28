@@ -20,6 +20,7 @@ const TONE_COLOR: Record<string, string> = {
 
 const STATUS_ORDER: ThreadStatus[] = [
   'running',
+  'compacting',
   'waiting_approval',
   'error',
   'connection',
@@ -37,7 +38,10 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
   }, [threads]);
 
   const totalThreads = threads.length;
-  const activeThreads = (statusCounts.running ?? 0) + (statusCounts.waiting_approval ?? 0);
+  const activeThreads =
+    (statusCounts.running ?? 0) +
+    (statusCounts.compacting ?? 0) +
+    (statusCounts.waiting_approval ?? 0);
 
   const statusSegments = STATUS_ORDER
     .map((status) => ({

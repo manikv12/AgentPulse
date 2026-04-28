@@ -32,6 +32,53 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
+  it('starts the first turn on a draft thread before Codex has materialized history', async () => {
+    const calls: RequestCall[] = [];
+    const transport: CodexAppServerTransport = {
+      isConnected: () => true,
+      request: async <T = unknown>(method: string, params: unknown): Promise<T> => {
+        calls.push({ method, params });
+        if (method === 'thread/resume') {
+          throw new Error('no rollout found for thread id thread-draft');
+        }
+        if (method === 'thread/turns/list') {
+          throw new Error('thread thread-draft is not materialized yet; thread/turns/list is unavailable before first user message');
+        }
+        if (method === 'thread/read') {
+          throw new Error('thread thread-draft is not materialized yet; includeTurns is unavailable before first user message');
+        }
+        if (method === 'turn/start') {
+          return { turn: { id: 'turn-first' } } as T;
+        }
+        throw new Error(`Unexpected method ${method}`);
+      }
+    };
+    const chat = new CodexAppServerChat(transport);
+
+    const result = await chat.sendMessage('thread-draft', 'First prompt in this project.');
+
+    expect(result.mode).toBe('start');
+    expect(result.turnId).toBe('turn-first');
+    expect(calls.map((call) => call.method)).toContain('turn/start');
+    expect(calls.find((call) => call.method === 'turn/start')?.params).toMatchObject({
+      threadId: 'thread-draft',
+      input: [{ type: 'text', text: 'First prompt in this project.', text_elements: [] }]
+    });
+    expect(result.transcript.activeTurnId).toBe('turn-first');
+    expect(result.transcript.sendState).toMatchObject({
+      canSend: false,
+      reason: 'missing_active_turn',
+      label: 'Codex is working'
+    });
+    expect(result.transcript.messages).toEqual([
+      expect.objectContaining({
+        role: 'user',
+        kind: 'message',
+        text: 'First prompt in this project.'
+      })
+    ]);
+  });
+
   it('starts a new thread with Codex desktop-style project config', async () => {
     const cwd = '/Users/me/projects/CodexPulse';
     const config = {
@@ -125,6 +172,27 @@ describe('Codex App Server same-thread chat', () => {
       sandbox: 'workspace-write',
       config: {}
     });
+  });
+
+  it('retries project thread creation once when the spawned app-server exits during start', async () => {
+    const cwd = '/Users/me/projects/CodexPulse';
+    const transport = fakeTransport([
+      { config: { model: 'gpt-5.5' } },
+      new Error('Codex App Server disconnected (code=null, signal=SIGTERM)'),
+      { config: { model: 'gpt-5.5' } },
+      threadResponse('thread-new', 'idle', [], [], cwd)
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    const result = await chat.startThread(cwd);
+
+    expect(result.threadId).toBe('thread-new');
+    expect(transport.calls.map((call) => call.method)).toEqual([
+      'config/read',
+      'thread/start',
+      'config/read',
+      'thread/start'
+    ]);
   });
 
   it('steers the active turn when the existing thread is already running', async () => {

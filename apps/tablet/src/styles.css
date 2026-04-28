@@ -2496,7 +2496,7 @@ dd {
 .codex-sidebar-thread {
   position: relative;
   display: grid;
-  grid-template-columns: 12px minmax(0, 1fr) auto;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: center;
   width: 100%;
@@ -2561,6 +2561,28 @@ dd {
   color: var(--text-subtle);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+.codex-sidebar-thread-state {
+  display: inline-flex;
+  align-items: center;
+  max-width: 120px;
+  min-width: 0;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--tone-yellow-bg);
+  color: var(--tone-yellow);
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.codex-sidebar-thread-state.is-compacting {
+  background: var(--tone-blue-bg);
+  color: var(--tone-blue);
 }
 
 .codex-sidebar-empty-project {
@@ -3077,6 +3099,11 @@ dd {
   flex: none;
   align-self: center;
   white-space: nowrap;
+}
+
+.codex-thread-working-badge.is-attention {
+  background: var(--tone-yellow-bg);
+  color: var(--tone-yellow);
 }
 
 .codex-thread-working-dots {

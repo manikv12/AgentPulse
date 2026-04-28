@@ -394,8 +394,12 @@ export function Sidebar({
                 {group.threads.map((thread) => {
                 const active = thread.threadId === activeThreadId;
                 const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
+                const isWaitingApproval = thread.status === 'waiting_approval';
+                const isCompacting = thread.status === 'compacting';
                 const showDot =
                   isWorking ||
+                  isWaitingApproval ||
+                  isCompacting ||
                   (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
 
                 return (
@@ -414,6 +418,11 @@ export function Sidebar({
                         ) : null}
                       </span>
                       <span className="codex-sidebar-thread-title">{thread.title}</span>
+                      {isWaitingApproval ? (
+                        <span className="codex-sidebar-thread-state">Awaiting approval</span>
+                      ) : isCompacting ? (
+                        <span className="codex-sidebar-thread-state is-compacting">Compacting</span>
+                      ) : null}
                       <span className="codex-sidebar-thread-time">
                         {relativeTime(thread.lastActivityAt)}
                       </span>
@@ -456,4 +465,3 @@ function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, nu
   const activityAt = Date.parse(thread.lastActivityAt);
   return Number.isFinite(activityAt) && activityAt > seenAt;
 }
-

@@ -241,6 +241,61 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('tracks waiting approval from Codex desktop request patches', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onStreamingChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onStreamingChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-approval',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['conversationState', 'requests', 0],
+            value: {
+              id: 'permission-request-1',
+              method: 'item/permissions/requestApproval',
+              params: {
+                reason: 'Allow Codex to use Microsoft Teams?'
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadWaitingForApproval('thread-approval')).toBe(true);
+    expect(mirror.isThreadStreaming('thread-approval')).toBe(true);
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-approval',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'replace',
+            path: ['conversationState', 'requests', 0, 'isCompleted'],
+            value: true
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadWaitingForApproval('thread-approval')).toBe(false);
+    expect(mirror.isThreadStreaming('thread-approval')).toBe(false);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-approval',
+      isStreaming: false
+    });
+    mirror.dispose();
+  });
+
   it('does not mark ready when a command completes but the latest turn is still active', async () => {
     const { ipc, setReady, emitBroadcast } = createMockIpc();
     setReady(true);
@@ -295,6 +350,103 @@ describe('codex mirror', () => {
     expect(mirror.isThreadStreaming('thread-active-turn')).toBe(false);
     expect(onStreamingChange).toHaveBeenLastCalledWith({
       threadId: 'thread-active-turn',
+      isStreaming: false
+    });
+    mirror.dispose();
+  });
+
+  it('expires stale unowned streaming when Codex desktop stops broadcasting updates', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    let now = 1_000;
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onStreamingChange = vi.fn();
+    const mirror = createCodexMirror({
+      ipc,
+      reader,
+      onStreamingChange,
+      now: () => now,
+      unownedStreamingStaleMs: 10_000
+    } as Parameters<typeof createCodexMirror>[0] & {
+      now: () => number;
+      unownedStreamingStaleMs: number;
+    });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'desktop-host',
+      conversationId: 'thread-stale',
+      change: { isStreaming: true, streamRole: { role: 'follower' } }
+    });
+
+    expect(mirror.isThreadStreaming('thread-stale')).toBe(true);
+
+    now += 10_001;
+
+    expect(mirror.isThreadStreaming('thread-stale')).toBe(false);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-stale',
+      isStreaming: false
+    });
+    mirror.dispose();
+  });
+
+  it('keeps owned streaming alive even when the last broadcast is older than the stale window', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    let now = 1_000;
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({
+      ipc,
+      reader,
+      now: () => now,
+      unownedStreamingStaleMs: 10_000
+    } as Parameters<typeof createCodexMirror>[0] & {
+      now: () => number;
+      unownedStreamingStaleMs: number;
+    });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'desktop-host',
+      conversationId: 'thread-owned',
+      change: { isStreaming: true, streamRole: { role: 'owner' } }
+    });
+
+    now += 30_000;
+
+    expect(mirror.isThreadStreaming('thread-owned')).toBe(true);
+    mirror.dispose();
+  });
+
+  it('tracks Codex desktop compaction as an active thread state', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onStreamingChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onStreamingChange });
+    const mirrorWithCompaction = mirror as typeof mirror & {
+      isThreadCompacting(threadId: string): boolean;
+    };
+
+    emitBroadcast('thread/status/changed', {
+      threadId: 'thread-compact',
+      status: { type: 'compacting', label: 'Automatically compacting context' }
+    });
+
+    expect(mirrorWithCompaction.isThreadCompacting('thread-compact')).toBe(true);
+    expect(mirror.isThreadStreaming('thread-compact')).toBe(true);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-compact',
+      isStreaming: true
+    });
+
+    emitBroadcast('thread/compacted', {
+      threadId: 'thread-compact'
+    });
+
+    expect(mirrorWithCompaction.isThreadCompacting('thread-compact')).toBe(false);
+    expect(mirror.isThreadStreaming('thread-compact')).toBe(false);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-compact',
       isStreaming: false
     });
     mirror.dispose();

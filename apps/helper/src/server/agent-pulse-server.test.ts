@@ -850,16 +850,16 @@ describe('Agent Pulse helper API', () => {
         messages: [
           {
             id: 'message-1',
-            role: 'assistant',
+            role: 'user',
             kind: 'message',
-            text: 'First',
+            text: 'First user',
             createdAt: '2026-04-25T16:14:00Z'
           },
           {
             id: 'message-2',
-            role: 'assistant',
+            role: 'user',
             kind: 'message',
-            text: 'Second',
+            text: 'Second user',
             createdAt: '2026-04-25T16:15:00Z'
           },
           {
@@ -901,6 +901,9 @@ describe('Agent Pulse helper API', () => {
         headers: authHeaders(token, deviceId)
       });
 
+      // The raw tail at limit=2 is [message-2, message-3] — only one user message. The
+      // limiter walks back to include message-1 so the response carries at least two
+      // user messages, giving the dashboard the conversational context it needs.
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({
         threadId: 'thread-1',
@@ -912,10 +915,17 @@ describe('Agent Pulse helper API', () => {
         },
         messages: [
           {
-            id: 'message-2',
-            role: 'assistant',
+            id: 'message-1',
+            role: 'user',
             kind: 'message',
-            text: 'Second',
+            text: 'First user',
+            createdAt: '2026-04-25T16:14:00Z'
+          },
+          {
+            id: 'message-2',
+            role: 'user',
+            kind: 'message',
+            text: 'Second user',
             createdAt: '2026-04-25T16:15:00Z'
           },
           {
@@ -1365,6 +1375,194 @@ describe('Agent Pulse helper API', () => {
           {
             threadId: 'thread-1',
             status: 'running'
+          }
+        ]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('uses the IPC mirror approval state when Codex is waiting for permission', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-approval',
+      title: 'Check Teams',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-28T13:10:00Z',
+      lastTurnSummary: ''
+    };
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-approval',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn()
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      isThreadStreaming: (threadId: string) => threadId === 'thread-approval',
+      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval'
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const transcriptResponse = await fetch(`${server.url}/threads/thread-approval/transcript`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(transcriptResponse.status).toBe(200);
+      await expect(transcriptResponse.json()).resolves.toMatchObject({
+        threadId: 'thread-approval',
+        activeTurnId: 'mirror-streaming:thread-approval',
+        sendState: {
+          canSend: false,
+          reason: 'waiting_on_approval',
+          label: 'Codex is waiting for approval'
+        }
+      });
+
+      const listResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(listResponse.status).toBe(200);
+      await expect(listResponse.json()).resolves.toMatchObject({
+        threads: [
+          {
+            threadId: 'thread-approval',
+            status: 'waiting_approval'
+          }
+        ]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('uses the IPC mirror compaction state when Codex is compacting context', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-compact',
+      title: 'Fix Mac helper sync',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-28T13:10:00Z',
+      lastTurnSummary: ''
+    };
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-compact',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn()
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      isThreadStreaming: (threadId: string) => threadId === 'thread-compact',
+      isThreadCompacting: (threadId: string) => threadId === 'thread-compact'
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const transcriptResponse = await fetch(`${server.url}/threads/thread-compact/transcript`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(transcriptResponse.status).toBe(200);
+      await expect(transcriptResponse.json()).resolves.toMatchObject({
+        threadId: 'thread-compact',
+        activeTurnId: 'mirror-streaming:thread-compact',
+        sendState: {
+          canSend: false,
+          reason: 'compacting_context',
+          label: 'Automatically compacting context'
+        }
+      });
+
+      const listResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(listResponse.status).toBe(200);
+      await expect(listResponse.json()).resolves.toMatchObject({
+        threads: [
+          {
+            threadId: 'thread-compact',
+            status: 'compacting'
           }
         ]
       });
@@ -1936,6 +2134,133 @@ describe('Agent Pulse helper API', () => {
       await expect(createResponse.json()).resolves.toEqual({ thread: createdThread });
       expect(appServer.startThread).toHaveBeenCalledWith(projectPath);
       expect(opener.openThread).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('keeps a new project thread visible while Codex still treats it as a draft', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const projectPath = mkdtempSync(path.join(tmpdir(), 'agent-pulse-project-'));
+    const draftThread: Thread = {
+      threadId: 'thread-draft',
+      title: 'New thread',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-26T10:00:00Z',
+      lastTurnSummary: ''
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => {
+        throw new Error('thread thread-draft is not materialized yet; includeTurns is unavailable before first user message');
+      }),
+      sendMessage: vi.fn(async (_threadId: string, text: string): Promise<import('@agent-pulse/shared').ThreadMessageResponse> => ({
+        ok: true,
+        mode: 'start',
+        turnId: 'turn-first',
+        transcript: {
+          threadId: 'thread-draft',
+          activeTurnId: 'turn-first',
+          sendState: {
+            canSend: false,
+            reason: 'missing_active_turn',
+            label: 'Codex is working'
+          },
+          messages: [
+            {
+              id: 'user-first',
+              role: 'user',
+              kind: 'message',
+              text,
+              createdAt: '2026-04-26T10:00:01Z'
+            }
+          ]
+        }
+      })),
+      startThread: vi.fn(async () => draftThread)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [],
+        listProjects: async () => [
+          {
+            projectId: 'project-codexpulse',
+            name: 'CodexPulse',
+            path: projectPath
+          }
+        ]
+      },
+      opener,
+      appServer,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const createResponse = await fetch(`${server.url}/threads/new`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ projectId: 'project-codexpulse' })
+      });
+      expect(createResponse.status).toBe(200);
+
+      const listResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(listResponse.status).toBe(200);
+      await expect(listResponse.json()).resolves.toEqual({ threads: [draftThread] });
+
+      const transcriptResponse = await fetch(`${server.url}/threads/thread-draft/transcript`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(transcriptResponse.status).toBe(200);
+      await expect(transcriptResponse.json()).resolves.toEqual({
+        threadId: 'thread-draft',
+        activeTurnId: null,
+        sendState: {
+          canSend: true,
+          reason: 'ready',
+          label: 'Ready'
+        },
+        messages: []
+      });
+
+      const messageResponse = await fetch(`${server.url}/threads/thread-draft/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Start inside this project.' })
+      });
+      expect(messageResponse.status).toBe(200);
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-draft', 'Start inside this project.', undefined);
     } finally {
       await server.stop();
     }

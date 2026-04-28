@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const THREAD_STATUSES = [
   'idle',
   'running',
+  'compacting',
   'waiting_approval',
   'error',
   'connection',
@@ -15,6 +16,7 @@ export const THREAD_STATUS_PRIORITY = [
   'error',
   'connection',
   'waiting_approval',
+  'compacting',
   'running',
   'idle',
   'unknown'
@@ -221,6 +223,7 @@ export const THREAD_SEND_REASONS = [
   'app_server_disconnected',
   'waiting_on_approval',
   'waiting_on_user_input',
+  'compacting_context',
   'missing_active_turn',
   'thread_unavailable',
   'thread_changed'

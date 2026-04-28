@@ -65,6 +65,7 @@ export type ThreadPendingRequest = {
   body?: string;
   itemId?: string;
   turnId?: string;
+  permissions?: Record<string, unknown>;
   kind?: 'question' | 'plan' | 'commandApproval' | 'fileApproval' | 'permissionsApproval';
 };
 
@@ -501,14 +502,40 @@ function WorkGroup({
   messages,
   startedAt,
   endedAt,
-  plugins = []
+  plugins = [],
+  isLatest = false,
+  isAgentWorking = false
 }: {
   messages: ChatMessage[];
   startedAt?: string;
   endedAt?: string;
   plugins?: CatalogPlugin[];
+  isLatest?: boolean;
+  isAgentWorking?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // Auto-expand the latest work group while the agent is actively working so the user
+  // can watch progress without having to click. Once the turn finishes (or this stops
+  // being the latest group because a new turn started), auto-collapse it.
+  //
+  // Manual-override sticky: once the user clicks the toggle, their choice wins for the
+  // rest of this component's lifetime. Without this, the auto-expand effect would slam
+  // the group back open each render if the user collapsed it mid-turn.
+  const autoExpand = isLatest && isAgentWorking;
+  const [expanded, setExpanded] = useState(autoExpand);
+  const userToggledRef = useRef(false);
+
+  useEffect(() => {
+    if (userToggledRef.current) {
+      return;
+    }
+    setExpanded(autoExpand);
+  }, [autoExpand]);
+
+  const handleToggle = () => {
+    userToggledRef.current = true;
+    setExpanded((previous) => !previous);
+  };
+
   const label = useMemo(() => formatWorkLabel(messages, startedAt, endedAt), [
     endedAt,
     messages,
@@ -521,7 +548,7 @@ function WorkGroup({
       <button
         type="button"
         className="codex-work-toggle"
-        onClick={() => setExpanded((previous) => !previous)}
+        onClick={handleToggle}
         aria-expanded={expanded}
       >
         <span>{label}</span>
@@ -637,7 +664,24 @@ export function ThreadView({
     sendBlockReason === 'mobile_send_disabled' ||
     sendBlockReason === 'waiting_on_approval' ||
     sendBlockReason === 'waiting_on_user_input' ||
+    sendBlockReason === 'compacting_context' ||
     sendBlockReason === 'thread_unavailable';
+  const hasPendingRequest = pendingRequests.length > 0;
+  const hasPendingPermissionRequest = pendingRequests.some(
+    (request) => request.kind === 'permissionsApproval'
+  );
+  const threadSaysWaitingApproval =
+    thread.status === 'waiting_approval' || sendBlockReason === 'waiting_on_approval';
+  const isCompacting =
+    thread.status === 'compacting' || sendBlockReason === 'compacting_context';
+  const isWaitingForApproval = hasPendingRequest || threadSaysWaitingApproval;
+  const pendingRequestStatus = hasPendingRequest
+    ? hasPendingPermissionRequest
+      ? 'Codex needs permission'
+      : pendingRequests.some((request) => request.kind === 'question')
+        ? 'Codex needs an answer'
+        : 'Codex needs approval'
+    : null;
   const transcriptSaysMirrorWorking = Boolean(
     transcript &&
       !isHardSendBlock &&
@@ -645,9 +689,19 @@ export function ThreadView({
         (transcript.sendState.reason === 'thread_changed' &&
           transcript.sendState.label === 'Codex is working'))
   );
-  const isAgentWorking = forceWorking || transcriptSaysMirrorWorking;
+  const waitingApprovalStatus = pendingRequestStatus
+    ? pendingRequestStatus
+    : threadSaysWaitingApproval
+      ? 'Codex is waiting for approval'
+      : null;
+  const isCodexActive =
+    forceWorking || transcriptSaysMirrorWorking || threadSaysWaitingApproval || isCompacting;
+  const isAgentWorking = isCodexActive && !isWaitingForApproval;
   const canUseComposer = Boolean(
-    sendMessage && !sending && (transcript?.sendState.canSend || (isAgentWorking && !isHardSendBlock))
+    sendMessage &&
+      !sending &&
+      !isWaitingForApproval &&
+      (transcript?.sendState.canSend || (isCodexActive && !isHardSendBlock))
   );
   const canSend = Boolean(canUseComposer && trimmedDraft);
   const effectiveModelName = modelName || thread.model;
@@ -665,13 +719,19 @@ export function ThreadView({
       : null;
   const statusText = sending
     ? 'Sending to Codex...'
-    : sendBlockedLabel
-      ? sendBlockedLabel
-      : isAgentWorking
-        ? 'Codex is working'
-        : transcript?.sendState.label === 'Codex is working'
-          ? 'Ready'
-          : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
+    : waitingApprovalStatus
+      ? waitingApprovalStatus
+      : isCompacting
+        ? (transcript?.sendState.reason === 'compacting_context'
+            ? transcript.sendState.label
+            : 'Automatically compacting context')
+      : sendBlockedLabel
+        ? sendBlockedLabel
+        : isAgentWorking
+          ? 'Codex is working'
+          : transcript?.sendState.label === 'Codex is working'
+            ? 'Ready'
+            : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
 
   const renderable = useMemo(() => {
     const tail = transcript?.messages ?? [];
@@ -691,6 +751,18 @@ export function ThreadView({
     const stillPending = pendingMessages.filter((m) => !realUserTexts.has(m.text.trim()));
     return buildRenderableEntries([...merged, ...stillPending]);
   }, [transcript?.messages, olderMessages, pendingMessages]);
+  // Identify the most recent work group so we can auto-expand it while the agent is
+  // working. Only the latest one — older work groups stay collapsed even when a new
+  // turn fires.
+  const latestWorkGroupId = useMemo(() => {
+    for (let i = renderable.length - 1; i >= 0; i -= 1) {
+      const entry = renderable[i]!;
+      if (entry.type === 'work') {
+        return entry.id;
+      }
+    }
+    return undefined;
+  }, [renderable]);
   const transcriptMessageIds = useMemo(
     () => transcript?.messages.map((message) => message.id).join('|') ?? '',
     [transcript?.messages]
@@ -1076,7 +1148,30 @@ export function ThreadView({
           <h2 className="codex-thread-title">{thread.title}</h2>
           <span className="codex-thread-workspace">{thread.workspace}</span>
         </div>
-        {isAgentWorking ? (
+        {waitingApprovalStatus ? (
+          <span
+            className="codex-thread-working-badge is-attention"
+            role="status"
+            aria-live="polite"
+            aria-label="Codex needs approval"
+          >
+            <span>{hasPendingPermissionRequest ? 'Permission' : 'Approval'}</span>
+          </span>
+        ) : isCompacting ? (
+          <span
+            className="codex-thread-working-badge is-compacting"
+            role="status"
+            aria-live="polite"
+            aria-label="Codex is compacting context"
+          >
+            <span className="codex-thread-working-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <span>Compacting</span>
+          </span>
+        ) : isAgentWorking ? (
           <span
             className="codex-thread-working-badge"
             role="status"
@@ -1163,6 +1258,8 @@ export function ThreadView({
                 startedAt={entry.startedAt}
                 endedAt={entry.endedAt}
                 plugins={plugins}
+                isLatest={entry.id === latestWorkGroupId}
+                isAgentWorking={isAgentWorking}
               />
             );
           }
@@ -1218,6 +1315,16 @@ export function ThreadView({
               onApprovalDecision={onApprovalDecision}
             />
           ))}
+        </div>
+      ) : threadSaysWaitingApproval ? (
+        <div className="codex-pending-requests" role="region" aria-label="Codex needs approval">
+          <article className="codex-pending-request">
+            <header className="codex-pending-request-title">Codex is waiting for approval</header>
+            <p className="codex-pending-request-hint">
+              Waiting for the live approval details. Open Codex on your Mac if the buttons do not
+              appear.
+            </p>
+          </article>
         </div>
       ) : null}
 
@@ -1317,7 +1424,7 @@ export function ThreadView({
               />
             </div>
             <div className="codex-composer-actions">
-              {stopWork && isAgentWorking ? (
+              {stopWork && isCodexActive ? (
                 <button
                   className="codex-composer-stop"
                   type="button"
@@ -1532,6 +1639,30 @@ function PendingRequestRow({
     }
   };
 
+  const submitPermissions = async (label: string, scope: 'turn' | 'session') => {
+    await submit(label, {
+      permissions: request.permissions ?? {},
+      scope
+    });
+  };
+
+  const denyPermissions = async () => {
+    await submit('deny', {
+      permissions: {},
+      scope: 'turn'
+    });
+  };
+
+  const primaryApprovalLabel = request.kind === 'permissionsApproval' ? 'Allow once' : 'Approve';
+  const primarySubmittingLabel =
+    request.kind === 'permissionsApproval' ? 'Allowing...' : 'Approving...';
+  const sessionApprovalLabel =
+    request.kind === 'permissionsApproval' ? 'Allow for session' : 'Approve for session';
+  const sessionSubmittingLabel =
+    request.kind === 'permissionsApproval' ? 'Allowing...' : 'Approving...';
+  const denyLabel = request.kind === 'permissionsApproval' ? 'Deny' : 'Decline';
+  const denySubmittingLabel = request.kind === 'permissionsApproval' ? 'Denying...' : 'Declining...';
+
   return (
     <article className="codex-pending-request">
       <header className="codex-pending-request-title">{request.title}</header>
@@ -1550,43 +1681,55 @@ function PendingRequestRow({
           <button
             type="button"
             className="codex-pending-request-action is-primary"
-            onClick={() => void submit('accept', 'accept')}
+            onClick={() =>
+              void (request.kind === 'permissionsApproval'
+                ? submitPermissions('accept', 'turn')
+                : submit('accept', 'accept'))
+            }
             disabled={Boolean(submitting)}
           >
             {submitting === 'accept' ? (
               <>
-                <Spinner size={14} /> Approving…
+                <Spinner size={14} /> {primarySubmittingLabel}
               </>
             ) : (
-              'Approve'
+              primaryApprovalLabel
             )}
           </button>
           <button
             type="button"
             className="codex-pending-request-action"
-            onClick={() => void submit('acceptForSession', 'acceptForSession')}
+            onClick={() =>
+              void (request.kind === 'permissionsApproval'
+                ? submitPermissions('acceptForSession', 'session')
+                : submit('acceptForSession', 'acceptForSession'))
+            }
             disabled={Boolean(submitting)}
           >
             {submitting === 'acceptForSession' ? (
               <>
-                <Spinner size={14} /> Approving…
+                <Spinner size={14} /> {sessionSubmittingLabel}
               </>
             ) : (
-              'Approve for session'
+              sessionApprovalLabel
             )}
           </button>
           <button
             type="button"
             className="codex-pending-request-action is-danger"
-            onClick={() => void submit('decline', 'decline')}
+            onClick={() =>
+              void (request.kind === 'permissionsApproval'
+                ? denyPermissions()
+                : submit('decline', 'decline'))
+            }
             disabled={Boolean(submitting)}
           >
-            {submitting === 'decline' ? (
+            {submitting === 'decline' || submitting === 'deny' ? (
               <>
-                <Spinner size={14} /> Declining…
+                <Spinner size={14} /> {denySubmittingLabel}
               </>
             ) : (
-              'Decline'
+              denyLabel
             )}
           </button>
         </div>

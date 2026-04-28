@@ -179,7 +179,19 @@ export class CodexAppServerChat {
     options: { model?: string; effort?: string } = {}
   ): Promise<ThreadMessageResponse> {
     const trimmed = text.trim();
-    const thread = await this.loadExistingThread(threadId);
+    let thread: AppServerThread | undefined;
+    try {
+      thread = await this.loadExistingThread(threadId);
+    } catch (error) {
+      if (!isUnmaterializedDraftError(error)) {
+        throw error;
+      }
+    }
+
+    if (!thread) {
+      return this.startTurnWithoutReadableHistory(threadId, trimmed, options);
+    }
+
     const transcript = mapThreadToTranscript(thread);
     ensureCanSend(transcript.sendState);
 
@@ -196,7 +208,12 @@ export class CodexAppServerChat {
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {})
     });
-    const updatedTranscript = await this.readTranscript(threadId);
+    const updatedTranscript = await this.readTranscript(threadId).catch((error) => {
+      if (isUnmaterializedDraftError(error)) {
+        return startedDraftTranscript(threadId, trimmed, response.turn.id);
+      }
+      throw error;
+    });
     return ThreadMessageResponseSchema.parse({
       ok: true,
       mode: 'start',
@@ -208,14 +225,16 @@ export class CodexAppServerChat {
   async startThread(cwd: string): Promise<Thread> {
     let response: AppServerThreadResponse;
     try {
-      response = await this.transport.request<AppServerThreadResponse>(
-        'thread/start',
-        await this.buildThreadStartParams(cwd)
-      );
+      response = await this.callThreadStart(cwd);
     } catch (error) {
-      const stderr = this.recentStderr();
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(stderr ? `${detail} — codex stderr: ${stderr}` : detail);
+      if (!isAppServerDisconnectedError(error)) {
+        throw this.withRecentStderr(error);
+      }
+      try {
+        response = await this.callThreadStart(cwd);
+      } catch (retryError) {
+        throw this.withRecentStderr(retryError);
+      }
     }
     if (!response || typeof response !== 'object' || !response.thread) {
       const stderr = this.recentStderr();
@@ -226,6 +245,19 @@ export class CodexAppServerChat {
       );
     }
     return mapAppServerThreadToSummary(response.thread, cwd);
+  }
+
+  private async callThreadStart(cwd: string): Promise<AppServerThreadResponse> {
+    return this.transport.request<AppServerThreadResponse>(
+      'thread/start',
+      await this.buildThreadStartParams(cwd)
+    );
+  }
+
+  private withRecentStderr(error: unknown): Error {
+    const stderr = this.recentStderr();
+    const detail = error instanceof Error ? error.message : String(error);
+    return new Error(stderr ? `${detail} — codex stderr: ${stderr}` : detail);
   }
 
   private async buildThreadStartParams(cwd: string): Promise<AppServerThreadStartParams> {
@@ -306,6 +338,31 @@ export class CodexAppServerChat {
     });
   }
 
+  private async startTurnWithoutReadableHistory(
+    threadId: string,
+    text: string,
+    options: { model?: string; effort?: string }
+  ): Promise<ThreadMessageResponse> {
+    const response = await this.transport.request<{ turn: { id: string } }>('turn/start', {
+      threadId,
+      input: userTextInput(text),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {})
+    });
+    const transcript = await this.readTranscript(threadId).catch((error) => {
+      if (isUnmaterializedDraftError(error)) {
+        return startedDraftTranscript(threadId, text, response.turn.id);
+      }
+      throw error;
+    });
+    return ThreadMessageResponseSchema.parse({
+      ok: true,
+      mode: 'start',
+      turnId: response.turn.id,
+      transcript
+    });
+  }
+
   private async loadExistingThread(threadId: string): Promise<AppServerThread> {
     try {
       const [resumeResponse, turns] = await Promise.all([
@@ -383,6 +440,40 @@ function ensureCanSend(sendState: ThreadSendState): void {
   if (!sendState.canSend) {
     throw new SendBlockedError(sendState.reason, sendState.label);
   }
+}
+
+function isUnmaterializedDraftError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('not materialized yet') ||
+    message.includes('no rollout found for thread id')
+  );
+}
+
+function isAppServerDisconnectedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('Codex App Server disconnected');
+}
+
+function startedDraftTranscript(threadId: string, text: string, turnId: string): ThreadTranscript {
+  return ThreadTranscriptSchema.parse({
+    threadId,
+    activeTurnId: turnId,
+    sendState: {
+      canSend: false,
+      reason: 'missing_active_turn',
+      label: 'Codex is working'
+    },
+    messages: [
+      {
+        id: `${turnId}:user`,
+        role: 'user',
+        kind: 'message',
+        text,
+        createdAt: new Date().toISOString()
+      }
+    ]
+  });
 }
 
 function userTextInput(text: string) {

@@ -101,6 +101,8 @@ export type CodexMirrorBridge = {
     response: unknown
   ): Promise<void>;
   isThreadStreaming?(threadId: string): boolean;
+  isThreadCompacting?(threadId: string): boolean;
+  isThreadWaitingForApproval?(threadId: string): boolean;
   isThreadOwned?(threadId: string): boolean;
   waitForOwnership?(threadId: string, timeoutMs: number): Promise<boolean>;
 };
@@ -217,6 +219,10 @@ function createApp(
   // is slow or upstream Codex is degraded — we'd rather return slightly stale data fast
   // than block long enough for the cloudflared tunnel to cancel the request.
   const transcriptCache = new Map<string, ThreadTranscript>();
+  // Codex's desktop "New chat" is a draft until the first user message. `thread/start`
+  // returns an id immediately, but the thread may not appear in the normal session list
+  // and transcript reads can say "not materialized yet" until that first turn exists.
+  const draftThreads = new Map<string, Thread>();
   let currentSettings = options.settings;
   const remoteActivity: RemoteActivityLogEntry[] = [];
   const recordRemoteActivity = (
@@ -624,10 +630,13 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    const threads = await reconcileThreadStatuses(
-      await options.threadProvider.listThreads(),
-      options.appServer,
-      transformTranscript
+    const threads = mergeDraftThreads(
+      await reconcileThreadStatuses(
+        await options.threadProvider.listThreads(),
+        options.appServer,
+        transformTranscript
+      ),
+      draftThreads
     );
     return context.json(ThreadListResponseSchema.parse({ threads }));
   });
@@ -684,6 +693,7 @@ function createApp(
 
     try {
       const thread = await options.appServer.startThread(cwd);
+      draftThreads.set(thread.threadId, thread);
       hub.broadcast({ type: 'thread/upsert', payload: thread });
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
       return context.json(ThreadCreateResponseSchema.parse({ thread }));
@@ -728,6 +738,10 @@ function createApp(
     } else {
       transcript = transcriptCache.get(threadId);
       stale = true;
+    }
+
+    if (!transcript) {
+      transcript = draftThreads.has(threadId) ? emptyDraftTranscript(threadId) : undefined;
     }
 
     if (!transcript) {
@@ -807,6 +821,10 @@ function createApp(
         transcriptCache.set(threadId, transcript);
       } else {
         transcript = transcriptCache.get(threadId);
+      }
+
+      if (!transcript) {
+        transcript = draftThreads.has(threadId) ? emptyDraftTranscript(threadId) : undefined;
       }
 
       if (!transcript) {
@@ -939,6 +957,13 @@ function createApp(
         transcript: visibleTranscript
       };
       const parsedResponse = ThreadMessageResponseSchema.parse(response);
+      transcriptCache.set(threadId, parsedResponse.transcript);
+      const draftThread = draftThreads.get(threadId);
+      if (draftThread) {
+        const nextDraftThread = updateDraftThreadFromTranscript(draftThread, parsedResponse.transcript);
+        draftThreads.set(threadId, nextDraftThread);
+        hub.broadcast({ type: 'thread/upsert', payload: nextDraftThread });
+      }
       hub.broadcast({
         type: 'thread/transcript/changed',
         payload: parsedResponse.transcript
@@ -1424,7 +1449,33 @@ function applyMirrorStreamingState(
   mirror: CodexMirrorBridge | undefined
 ): ThreadTranscript {
   const syntheticTurnId = mirrorStreamingTurnId(threadId);
+  const mirrorSaysWaitingApproval = mirror?.isThreadWaitingForApproval?.(threadId) === true;
+  const mirrorSaysCompacting = mirror?.isThreadCompacting?.(threadId) === true;
   const mirrorSaysStreaming = mirror?.isThreadStreaming?.(threadId) === true;
+
+  if (mirrorSaysWaitingApproval) {
+    return ThreadTranscriptSchema.parse({
+      ...transcript,
+      activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
+      sendState: {
+        canSend: false,
+        reason: 'waiting_on_approval',
+        label: 'Codex is waiting for approval'
+      }
+    });
+  }
+
+  if (mirrorSaysCompacting) {
+    return ThreadTranscriptSchema.parse({
+      ...transcript,
+      activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
+      sendState: {
+        canSend: false,
+        reason: 'compacting_context',
+        label: 'Automatically compacting context'
+      }
+    });
+  }
 
   if (mirrorSaysStreaming) {
     if (transcript.activeTurnId) {
@@ -1451,7 +1502,9 @@ function applyMirrorStreamingState(
     activeTurnId: null,
     sendState:
       transcript.sendState.reason === 'thread_changed' ||
-      transcript.sendState.reason === 'missing_active_turn'
+      transcript.sendState.reason === 'missing_active_turn' ||
+      transcript.sendState.reason === 'waiting_on_approval' ||
+      transcript.sendState.reason === 'compacting_context'
         ? {
             canSend: true,
             reason: 'ready',
@@ -1498,6 +1551,18 @@ function parseTranscriptMessageLimit(value: string | undefined): number | undefi
   return parsed;
 }
 
+// Minimum number of user messages we try to keep in the tail window. Slicing by raw
+// index breaks down when a long agent turn (reasoning + tool calls + file events) fills
+// the last `limit` entries — the user's prompt that started it all gets cut off and
+// the dashboard renders nothing but agent activity. Anchoring on user messages instead
+// of plain count guarantees the conversation still reads as a conversation.
+const MIN_TAIL_USER_MESSAGES = 2;
+// Safety ceiling: even if there are fewer than MIN_TAIL_USER_MESSAGES user messages in
+// recent history, never expand the tail window past this many entries. Stops the
+// "agent thought for 30 minutes with no user input" case from shipping the entire
+// transcript on every poll.
+const MAX_TAIL_EXPANSION = 200;
+
 function limitTranscriptMessages(
   transcript: ThreadTranscript,
   limit: number | undefined
@@ -1506,9 +1571,31 @@ function limitTranscriptMessages(
     return transcript;
   }
 
+  // Start from the plain tail of `limit` messages, then walk backwards until we've
+  // included at least MIN_TAIL_USER_MESSAGES user messages (or hit the start, or the
+  // hard ceiling). The result is always >= `limit` entries, never less.
+  const messages = transcript.messages;
+  let sliceStart = messages.length - limit;
+  let userCount = 0;
+  for (let i = messages.length - 1; i >= sliceStart; i -= 1) {
+    if (messages[i]!.role === 'user') {
+      userCount += 1;
+    }
+  }
+  while (
+    userCount < MIN_TAIL_USER_MESSAGES &&
+    sliceStart > 0 &&
+    messages.length - sliceStart < MAX_TAIL_EXPANSION
+  ) {
+    sliceStart -= 1;
+    if (messages[sliceStart]!.role === 'user') {
+      userCount += 1;
+    }
+  }
+
   return ThreadTranscriptSchema.parse({
     ...transcript,
-    messages: transcript.messages.slice(-limit)
+    messages: messages.slice(sliceStart)
   });
 }
 
@@ -1823,10 +1910,47 @@ async function reconcileThreadStatuses(
   return reconciled.map(({ thread }) => thread);
 }
 
+function mergeDraftThreads(threads: Thread[], drafts: Map<string, Thread>): Thread[] {
+  const materializedIds = new Set(threads.map((thread) => thread.threadId));
+  for (const threadId of materializedIds) {
+    drafts.delete(threadId);
+  }
+
+  const visibleDrafts = [...drafts.values()].sort(
+    (left, right) => Date.parse(right.lastActivityAt) - Date.parse(left.lastActivityAt)
+  );
+  return [...visibleDrafts, ...threads];
+}
+
+function emptyDraftTranscript(threadId: string): ThreadTranscript {
+  return ThreadTranscriptSchema.parse({
+    threadId,
+    activeTurnId: null,
+    sendState: {
+      canSend: true,
+      reason: 'ready',
+      label: 'Ready'
+    },
+    messages: []
+  });
+}
+
+function updateDraftThreadFromTranscript(draftThread: Thread, transcript: ThreadTranscript): Thread {
+  const latestMessage = transcript.messages.at(-1);
+  return ThreadSchema.parse({
+    ...draftThread,
+    status: statusFromTranscript(transcript),
+    lastActivityAt: latestMessage?.createdAt ?? new Date().toISOString(),
+    lastTurnSummary: latestMessage?.text ?? draftThread.lastTurnSummary
+  });
+}
+
 function statusFromTranscript(transcript: ThreadTranscript): Thread['status'] {
   switch (transcript.sendState.reason) {
     case 'waiting_on_approval':
       return 'waiting_approval';
+    case 'compacting_context':
+      return 'compacting';
     case 'thread_unavailable':
       return 'error';
     case 'app_server_disconnected':

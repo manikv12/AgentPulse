@@ -3,6 +3,7 @@ import type { ThreadStatus } from '@agent-pulse/shared';
 export const statusLabels: Record<ThreadStatus, string> = {
   idle: 'Idle',
   running: 'Running',
+  compacting: 'Compacting',
   waiting_approval: 'Approval',
   error: 'Error',
   connection: 'Connection',
@@ -12,6 +13,7 @@ export const statusLabels: Record<ThreadStatus, string> = {
 export const statusTone: Record<ThreadStatus, string> = {
   idle: 'green',
   running: 'blue',
+  compacting: 'blue',
   waiting_approval: 'yellow',
   error: 'red',
   connection: 'orange',
