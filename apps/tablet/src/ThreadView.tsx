@@ -28,7 +28,15 @@ import {
   X
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type TouchEvent,
+  type UIEvent,
+  type WheelEvent
+} from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { TranscriptFetchTimeoutError, type FetchThreadTranscriptOptions } from './api';
@@ -36,11 +44,13 @@ import { CodexMark } from './CodexMark';
 import { MentionPicker, type MentionItem, type MentionTrigger } from './MentionPicker';
 
 const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 40;
+const VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT = 2;
 const OLDER_MESSAGES_PAGE_SIZE = 40;
-// Trigger an older-messages fetch when the user scrolls within this many pixels of the
-// top of the messages container. A small buffer makes the load feel preemptive instead
-// of stuttering once they've fully bottomed out at scrollTop=0.
-const OLDER_MESSAGES_TRIGGER_PX = 80;
+// Older pages should load only after a deliberate extra pull at the top. A normal scroll
+// up should just reveal the prefetched messages already sitting above the latest tail.
+const OLDER_MESSAGES_PULL_TOP_PX = 12;
+const OLDER_MESSAGES_WHEEL_PULL_DELTA = 90;
+const OLDER_MESSAGES_TOUCH_PULL_DELTA = 70;
 // Once the user is within this many pixels of the bottom we consider them "pinned" to
 // the latest message and resume auto-scrolling on new updates. Any further than that and
 // we leave their scroll position alone — typically because they've scrolled up to read.
@@ -250,6 +260,41 @@ function findFinalResponseIndex(messages: ChatMessage[]): number {
   }
 
   return -1;
+}
+
+function splitTranscriptForScrollback(
+  transcript: ThreadTranscript
+): { visible: ThreadTranscript; scrollback: ChatMessage[] } {
+  if (transcript.messages.length <= VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT) {
+    return { visible: transcript, scrollback: [] };
+  }
+
+  const scrollback = transcript.messages.slice(0, -VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT);
+  const visibleMessages = transcript.messages.slice(-VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT);
+  return {
+    visible: {
+      ...transcript,
+      messages: visibleMessages
+    },
+    scrollback
+  };
+}
+
+function mergeMessagesById(current: ChatMessage[], additions: ChatMessage[]): ChatMessage[] {
+  if (additions.length === 0) {
+    return current;
+  }
+
+  const seen = new Set(current.map((message) => message.id));
+  const next = [...current];
+  for (const message of additions) {
+    if (seen.has(message.id)) {
+      continue;
+    }
+    seen.add(message.id);
+    next.push(message);
+  }
+  return next;
 }
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
@@ -547,9 +592,9 @@ export function ThreadView({
   // An entry is dropped as soon as a message with the same trimmed text appears in the
   // server transcript.
   const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([]);
-  // Older history loaded by scroll-up. The polling/live transcript only carries the tail
-  // (last ~40 messages), so we keep paged-in history in a separate bucket and prepend it
-  // at render time. Reset whenever the active thread changes.
+  // Older history shown above the latest tail. The helper prefetch can include more than
+  // the default latest two messages, so we keep the extra history in a separate bucket and
+  // prepend it at render time. Reset whenever the active thread changes.
   const [olderMessages, setOlderMessages] = useState<ChatMessage[]>([]);
   const [hasMoreOlder, setHasMoreOlder] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -562,27 +607,47 @@ export function ThreadView({
   // we leave their position alone so a newly streamed token doesn't yank them down.
   const pinnedToBottomRef = useRef(true);
   const loadingOlderRef = useRef(false);
+  const olderWheelPullRef = useRef(0);
+  const olderTouchStartYRef = useRef<number | null>(null);
+
+  const applyTranscriptWindow = (nextTranscript: ThreadTranscript) => {
+    const { visible, scrollback } = splitTranscriptForScrollback(nextTranscript);
+    if (scrollback.length > 0) {
+      setOlderMessages((current) => mergeMessagesById(current, scrollback));
+    }
+    setTranscript(visible);
+  };
 
   const trimmedDraft = draft.trim();
-  const canSend = Boolean(transcript?.sendState.canSend && trimmedDraft && sendMessage && !sending);
-  const isAgentWorking =
-    forceWorking || Boolean(transcript?.activeTurnId) || (!transcript && thread.status === 'running');
+  const isAgentWorking = forceWorking;
+  const sendBlockReason = transcript?.sendState.reason;
+  const isHardSendBlock =
+    sendBlockReason === 'mobile_send_disabled' ||
+    sendBlockReason === 'waiting_on_approval' ||
+    sendBlockReason === 'waiting_on_user_input' ||
+    sendBlockReason === 'thread_unavailable';
+  const canUseComposer = Boolean(
+    sendMessage && !sending && (transcript?.sendState.canSend || (isAgentWorking && !isHardSendBlock))
+  );
+  const canSend = Boolean(canUseComposer && trimmedDraft);
   const effectiveModelName = modelName || thread.model;
 
   // Status bar text logic:
   // - When sending: "Sending to Codex..."
   // - When sendState blocks sending: show the explicit reason (e.g. "Approve on Mac to continue")
-  //   even if a turn is live, so the user can see why the input is disabled.
-  // - Else when activeTurnId is set: "Codex is working"
+  //   only for hard blocks that really require the user to wait or use the Mac.
+  // - Else when Codex desktop IPC says the thread is active: "Codex is working"
   // - Otherwise: sendState.label (which may be "Ready", "Mobile sending is off on the Mac.", etc.)
   // - If loading and no transcript yet: "Loading conversation..."
   const sendBlockedLabel =
-    transcript && !transcript.sendState.canSend ? transcript.sendState.label : null;
+    transcript && !transcript.sendState.canSend && isHardSendBlock
+      ? transcript.sendState.label
+      : null;
   const statusText = sending
     ? 'Sending to Codex...'
     : sendBlockedLabel
       ? sendBlockedLabel
-      : forceWorking || transcript?.activeTurnId
+      : isAgentWorking
         ? 'Codex is working'
         : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
 
@@ -604,6 +669,10 @@ export function ThreadView({
     const stillPending = pendingMessages.filter((m) => !realUserTexts.has(m.text.trim()));
     return buildRenderableEntries([...merged, ...stillPending]);
   }, [transcript?.messages, olderMessages, pendingMessages]);
+  const transcriptMessageIds = useMemo(
+    () => transcript?.messages.map((message) => message.id).join('|') ?? '',
+    [transcript?.messages]
+  );
 
   // Reconcile pendingMessages whenever the transcript changes — once the server confirms a
   // pending message, drop it from local state so duplicates don't pile up.
@@ -627,6 +696,8 @@ export function ThreadView({
     setHasMoreOlder(true);
     setLoadingOlder(false);
     loadingOlderRef.current = false;
+    olderWheelPullRef.current = 0;
+    olderTouchStartYRef.current = null;
     setOlderError('');
     pinnedToBottomRef.current = true;
   }, [thread.threadId]);
@@ -642,12 +713,12 @@ export function ThreadView({
     if (pinnedToBottomRef.current) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [transcript?.messages.length, transcript?.activeTurnId, loading]);
+  }, [transcriptMessageIds, transcript?.activeTurnId, loading]);
 
   // Apply live transcript updates immediately (WebSocket path)
   useEffect(() => {
     if (liveTranscript) {
-      setTranscript(liveTranscript);
+      applyTranscriptWindow(liveTranscript);
     }
   }, [liveTranscript]);
 
@@ -658,7 +729,7 @@ export function ThreadView({
 
     setTranscript((current) => {
       if (liveTranscript?.threadId === thread.threadId) {
-        return liveTranscript;
+        return splitTranscriptForScrollback(liveTranscript).visible;
       }
       if (current?.threadId === thread.threadId) {
         return current;
@@ -676,7 +747,7 @@ export function ThreadView({
     fetchTranscript(thread.threadId, { messageLimit: INITIAL_TRANSCRIPT_MESSAGE_LIMIT })
       .then((nextTranscript) => {
         if (!cancelled) {
-          setTranscript(nextTranscript);
+          applyTranscriptWindow(nextTranscript);
         }
       })
       .catch((loadError: unknown) => {
@@ -708,37 +779,6 @@ export function ThreadView({
 
     return () => {
       cancelled = true;
-    };
-  }, [fetchTranscript, thread.threadId]);
-
-  // Polling every 3 seconds
-  useEffect(() => {
-    if (!fetchTranscript) {
-      return;
-    }
-
-    let cancelled = false;
-    const interval = window.setInterval(() => {
-      if (transcriptRequestsInFlight.current > 0) {
-        return;
-      }
-
-      transcriptRequestsInFlight.current += 1;
-      fetchTranscript(thread.threadId, { messageLimit: INITIAL_TRANSCRIPT_MESSAGE_LIMIT })
-        .then((nextTranscript) => {
-          if (!cancelled) {
-            setTranscript(nextTranscript);
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          transcriptRequestsInFlight.current = Math.max(0, transcriptRequestsInFlight.current - 1);
-        });
-    }, 3000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
     };
   }, [fetchTranscript, thread.threadId]);
 
@@ -813,7 +853,7 @@ export function ThreadView({
     setError('');
     try {
       const result = await sendMessage(thread.threadId, textToSend);
-      setTranscript(result.transcript);
+      applyTranscriptWindow(result.transcript);
     } catch (sendError) {
       // Roll back the optimistic bubble and restore the draft so the user can retry.
       setPendingMessages((current) => current.filter((m) => m.id !== optimistic.id));
@@ -879,21 +919,72 @@ export function ThreadView({
     }
   };
 
+  const canLoadOlderAfterPull = (node: HTMLDivElement): boolean => {
+    const scrollablePastLatest = node.scrollHeight - node.clientHeight > NEAR_BOTTOM_PX;
+    return Boolean(
+      scrollablePastLatest &&
+      node.scrollTop <= OLDER_MESSAGES_PULL_TOP_PX &&
+      hasMoreOlder &&
+      !loadingOlderRef.current &&
+      fetchOlderMessages
+    );
+  };
+
+  const triggerOlderLoadAfterPull = (node: HTMLDivElement) => {
+    if (!canLoadOlderAfterPull(node)) {
+      return;
+    }
+    olderWheelPullRef.current = 0;
+    olderTouchStartYRef.current = null;
+    void loadOlderMessages();
+  };
+
   const handleMessagesScroll = (event: UIEvent<HTMLDivElement>) => {
     const node = event.currentTarget;
     // Track whether the user is near the bottom so the auto-scroll-on-new-message effect
     // knows whether to re-pin or stay put.
-    pinnedToBottomRef.current =
-      node.scrollHeight - node.scrollTop - node.clientHeight <= NEAR_BOTTOM_PX;
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const scrollablePastLatest = node.scrollHeight - node.clientHeight > NEAR_BOTTOM_PX;
+    pinnedToBottomRef.current = !scrollablePastLatest || distanceFromBottom <= NEAR_BOTTOM_PX;
 
-    if (
-      node.scrollTop <= OLDER_MESSAGES_TRIGGER_PX &&
-      hasMoreOlder &&
-      !loadingOlderRef.current &&
-      fetchOlderMessages
-    ) {
-      void loadOlderMessages();
+    if (node.scrollTop > OLDER_MESSAGES_PULL_TOP_PX) {
+      olderWheelPullRef.current = 0;
+      olderTouchStartYRef.current = null;
     }
+  };
+
+  const handleMessagesWheel = (event: WheelEvent<HTMLDivElement>) => {
+    const node = event.currentTarget;
+    if (event.deltaY >= 0 || !canLoadOlderAfterPull(node)) {
+      olderWheelPullRef.current = 0;
+      return;
+    }
+
+    olderWheelPullRef.current += Math.abs(event.deltaY);
+    if (olderWheelPullRef.current >= OLDER_MESSAGES_WHEEL_PULL_DELTA) {
+      triggerOlderLoadAfterPull(node);
+    }
+  };
+
+  const handleMessagesTouchStart = (event: TouchEvent<HTMLDivElement>) => {
+    olderTouchStartYRef.current = event.touches[0]?.clientY ?? null;
+  };
+
+  const handleMessagesTouchMove = (event: TouchEvent<HTMLDivElement>) => {
+    const node = event.currentTarget;
+    const startY = olderTouchStartYRef.current;
+    const currentY = event.touches[0]?.clientY;
+    if (startY === null || currentY === undefined || !canLoadOlderAfterPull(node)) {
+      return;
+    }
+
+    if (currentY - startY >= OLDER_MESSAGES_TOUCH_PULL_DELTA) {
+      triggerOlderLoadAfterPull(node);
+    }
+  };
+
+  const handleMessagesTouchEnd = () => {
+    olderTouchStartYRef.current = null;
   };
 
   const handleOpenInCodex = async () => {
@@ -980,18 +1071,6 @@ export function ThreadView({
         ) : null}
 
         <div className="codex-thread-actions">
-          {stopWork && isAgentWorking ? (
-            <button
-              className="codex-thread-stop"
-              type="button"
-              onClick={() => void handleStopWork()}
-              disabled={stopping}
-              aria-label="Stop Codex"
-            >
-              <Square size={13} />
-              <span>{stopping ? 'Stopping' : 'Stop'}</span>
-            </button>
-          ) : null}
           {openThreadInCodex ? (
             <button
               className="codex-thread-open"
@@ -1019,15 +1098,17 @@ export function ThreadView({
 
       <div className="codex-thread-status">
         <span>{statusText}</span>
-        {transcript?.activeTurnId ? (
-          <span className="codex-thread-status-active">Live turn</span>
-        ) : null}
       </div>
 
       <div
         className="codex-thread-messages"
         ref={messagesRef}
         onScroll={handleMessagesScroll}
+        onWheel={handleMessagesWheel}
+        onTouchStart={handleMessagesTouchStart}
+        onTouchMove={handleMessagesTouchMove}
+        onTouchEnd={handleMessagesTouchEnd}
+        onTouchCancel={handleMessagesTouchEnd}
       >
         {loadingOlder ? (
           <p className="codex-thread-older-status">Loading older messages...</p>
@@ -1181,7 +1262,7 @@ export function ThreadView({
                 void handleSend();
               }
             }}
-            disabled={!transcript?.sendState.canSend || sending}
+            disabled={!canUseComposer}
           />
           <div className="codex-composer-row">
             <div className="codex-composer-row-left">
@@ -1206,14 +1287,28 @@ export function ThreadView({
                 setUpdating={setModelUpdating}
               />
             </div>
-            <button
-              className="codex-composer-send"
-              type="submit"
-              disabled={!canSend}
-              aria-label="Send message"
-            >
-              <ArrowUp size={16} />
-            </button>
+            <div className="codex-composer-actions">
+              {stopWork && isAgentWorking ? (
+                <button
+                  className="codex-composer-stop"
+                  type="button"
+                  onClick={() => void handleStopWork()}
+                  disabled={stopping}
+                  aria-label="Stop Codex"
+                >
+                  <Square size={13} />
+                  <span>{stopping ? 'Stopping' : 'Stop'}</span>
+                </button>
+              ) : null}
+              <button
+                className="codex-composer-send"
+                type="submit"
+                disabled={!canSend}
+                aria-label="Send message"
+              >
+                <ArrowUp size={16} />
+              </button>
+            </div>
           </div>
         </div>
       </form>

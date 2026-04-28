@@ -30,6 +30,26 @@ type AppServerThreadTurnsListResponse = {
   backwardsCursor: string | null;
 };
 
+type AppServerConfigReadResponse = {
+  config?: Record<string, unknown> | null;
+};
+
+type AppServerThreadStartParams = {
+  cwd: string;
+  model: string;
+  modelProvider: string | null;
+  approvalPolicy: unknown;
+  sandbox: 'danger-full-access' | 'read-only' | 'workspace-write';
+  config: Record<string, unknown>;
+  developerInstructions: string | null;
+  personality: string | null;
+  ephemeral: boolean;
+  dynamicTools: null;
+  experimentalRawEvents: false;
+  persistExtendedHistory: true;
+  serviceTier: string | null;
+};
+
 type AppServerThread = {
   id: string;
   status: AppServerThreadStatus;
@@ -188,11 +208,10 @@ export class CodexAppServerChat {
   async startThread(cwd: string): Promise<Thread> {
     let response: AppServerThreadResponse;
     try {
-      response = await this.transport.request<AppServerThreadResponse>('thread/start', {
-        cwd,
-        experimentalRawEvents: false,
-        persistExtendedHistory: true
-      });
+      response = await this.transport.request<AppServerThreadResponse>(
+        'thread/start',
+        await this.buildThreadStartParams(cwd)
+      );
     } catch (error) {
       const stderr = this.recentStderr();
       const detail = error instanceof Error ? error.message : String(error);
@@ -207,6 +226,38 @@ export class CodexAppServerChat {
       );
     }
     return mapAppServerThreadToSummary(response.thread, cwd);
+  }
+
+  private async buildThreadStartParams(cwd: string): Promise<AppServerThreadStartParams> {
+    const config = await this.readCodexConfig(cwd);
+    const sandbox = sandboxFromConfig(config);
+    return {
+      cwd,
+      model: stringField(config, 'model') ?? 'gpt-5.5',
+      modelProvider: stringField(config, 'model_provider') ?? null,
+      approvalPolicy: approvalPolicyFromConfig(config, sandbox),
+      sandbox,
+      config: threadStartConfigFromCodexConfig(config),
+      developerInstructions: stringField(config, 'developer_instructions') ?? null,
+      personality: stringField(config, 'personality') ?? null,
+      ephemeral: false,
+      dynamicTools: null,
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+      serviceTier: stringField(config, 'service_tier') ?? stringField(config, 'model_service_tier') ?? null
+    };
+  }
+
+  private async readCodexConfig(cwd: string): Promise<Record<string, unknown>> {
+    try {
+      const response = await this.transport.request<AppServerConfigReadResponse>('config/read', {
+        includeLayers: false,
+        cwd
+      });
+      return recordField(response, 'config') ?? {};
+    } catch {
+      return {};
+    }
   }
 
   private async steerActiveTurn(
@@ -342,6 +393,58 @@ function userTextInput(text: string) {
       text_elements: []
     }
   ];
+}
+
+function sandboxFromConfig(config: Record<string, unknown>): AppServerThreadStartParams['sandbox'] {
+  const raw = stringField(config, 'sandbox_mode');
+  switch (raw) {
+    case 'danger-full-access':
+    case 'dangerFullAccess':
+    case 'danger_full_access':
+      return 'danger-full-access';
+    case 'read-only':
+    case 'readOnly':
+    case 'read_only':
+      return 'read-only';
+    case 'workspace-write':
+    case 'workspaceWrite':
+    case 'workspace_write':
+      return 'workspace-write';
+    default:
+      return 'workspace-write';
+  }
+}
+
+function approvalPolicyFromConfig(
+  config: Record<string, unknown>,
+  sandbox: AppServerThreadStartParams['sandbox']
+): unknown {
+  const raw = config.approval_policy;
+  if (typeof raw === 'string' && raw.trim()) {
+    return raw.trim();
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw;
+  }
+  return sandbox === 'danger-full-access' ? 'never' : 'on-request';
+}
+
+function threadStartConfigFromCodexConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const threadConfig: Record<string, unknown> = {};
+  const reasoningEffort = stringField(config, 'model_reasoning_effort');
+  if (reasoningEffort) {
+    threadConfig.model_reasoning_effort = reasoningEffort;
+  }
+  const webSearch = stringField(config, 'web_search');
+  if (webSearch) {
+    threadConfig.web_search = webSearch;
+  }
+  for (const [key, value] of Object.entries(config)) {
+    if (key.startsWith('features.') && typeof value === 'boolean') {
+      threadConfig[key] = value;
+    }
+  }
+  return threadConfig;
 }
 
 type TranscriptMapOptions = {
@@ -651,6 +754,13 @@ function imageFromString(value: string | undefined, mime?: string): { url: strin
   }
 
   return undefined;
+}
+
+function recordField(record: Record<string, unknown>, field: string): Record<string, unknown> | undefined {
+  const value = record[field];
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function stringField(record: Record<string, unknown>, field: string): string | undefined {

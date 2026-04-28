@@ -226,8 +226,7 @@ export function Sidebar({
             group.threads.map((thread) => {
               const active = thread.threadId === activeThreadId;
               const tone = statusTone[thread.status];
-              const isWorking =
-                thread.status === 'running' || (workingThreadIds?.has(thread.threadId) ?? false);
+              const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
               const showDot =
                 isWorking ||
                 (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
@@ -348,8 +347,7 @@ export function Sidebar({
               <ul className="codex-sidebar-threads">
                 {group.threads.map((thread) => {
                 const active = thread.threadId === activeThreadId;
-                const isWorking =
-                  thread.status === 'running' || (workingThreadIds?.has(thread.threadId) ?? false);
+                const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
                 const showDot =
                   isWorking ||
                   (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));

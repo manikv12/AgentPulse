@@ -55,6 +55,16 @@ export type ApprovalMethod =
 export type ApprovalResponse = 'accept' | 'acceptForSession' | 'decline' | unknown;
 
 const DEFAULT_HOST_ID = 'local';
+const ACTIVE_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
+
+type AppThreadStreamState = {
+  activeItemKeys: Set<string>;
+  latestTurnIndex: number | null;
+  latestTurnStatus: string | null;
+  runtimeStatusType: string | null;
+};
+
+type JsonRecord = Record<string, unknown>;
 
 export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   const ipc = options.ipc;
@@ -62,6 +72,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   const onBroadcast = options.onBroadcast;
 
   const streamingThreads = new Set<string>();
+  const appThreadStreamStates = new Map<string, AppThreadStreamState>();
   // Threads where a Codex window currently reports streamRole.role === 'owner'.
   // Required for follower IPC methods (set-model-and-reasoning, approval decisions, etc.)
   // to pass the desktop's discovery callback `getThreadRole === 'owner'`.
@@ -82,15 +93,69 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     }
   }
 
+  function setStreamingState(conversationId: string, isStreaming: boolean): void {
+    const wasStreaming = streamingThreads.has(conversationId);
+    if (isStreaming) {
+      streamingThreads.add(conversationId);
+    } else {
+      streamingThreads.delete(conversationId);
+    }
+    if (isStreaming !== wasStreaming) {
+      try {
+        options.onStreamingChange?.({ threadId: conversationId, isStreaming });
+      } catch {
+        // ignore listener errors
+      }
+    }
+  }
+
+  function updateStreamingFromAppChange(conversationId: string, change: JsonRecord): boolean | null {
+    const explicitStreaming = change.isStreaming;
+    if (typeof explicitStreaming === 'boolean') {
+      if (!explicitStreaming) {
+        appThreadStreamStates.delete(conversationId);
+      }
+      setStreamingState(conversationId, explicitStreaming);
+      return explicitStreaming;
+    }
+
+    const changeType = typeof change.type === 'string' ? change.type : null;
+    if (changeType === 'snapshot') {
+      const conversationState = objectField(change, 'conversationState');
+      if (!conversationState) {
+        return null;
+      }
+      const state = streamStateFromConversationState(conversationState);
+      appThreadStreamStates.set(conversationId, state);
+      const isStreaming = isActiveAppThreadState(state);
+      setStreamingState(conversationId, isStreaming);
+      return isStreaming;
+    }
+
+    if (changeType === 'patches') {
+      const patches = Array.isArray(change.patches) ? change.patches : [];
+      if (patches.length === 0) {
+        return null;
+      }
+      const state = appThreadStreamStates.get(conversationId) ?? emptyAppThreadStreamState();
+      for (const patch of patches) {
+        applyStreamPatch(state, patch);
+      }
+      appThreadStreamStates.set(conversationId, state);
+      const isStreaming = isActiveAppThreadState(state);
+      setStreamingState(conversationId, isStreaming);
+      return isStreaming;
+    }
+
+    return null;
+  }
+
   detachers.push(
     ipc.addBroadcastHandler('thread-stream-state-changed', (event) => {
       const params = event.params as {
         conversationId?: unknown;
         hostId?: unknown;
-        change?: {
-          isStreaming?: unknown;
-          streamRole?: { role?: unknown } | null;
-        } | null;
+        change?: unknown;
       } | null;
       if (!params) {
         return;
@@ -104,27 +169,17 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       // We now accept all hosts and key state purely on conversationId. The local hostId is still
       // used when *we* construct outgoing requests.
       void hostId;
+      const change = objectField(params, 'change');
+      const streamRole = change ? objectField(change, 'streamRole') : null;
+      const derivedStreaming = change ? updateStreamingFromAppChange(conversationId, change) : null;
       debugLog('[ownership] broadcast received', {
         conversationId,
         hostId: typeof params.hostId === 'string' ? params.hostId : null,
-        isStreaming: Boolean(params.change?.isStreaming),
-        role: params.change?.streamRole?.role ?? null
+        changeType: change && typeof change.type === 'string' ? change.type : null,
+        isStreaming: derivedStreaming ?? streamingThreads.has(conversationId),
+        role: streamRole?.role ?? null
       });
-      const isStreaming = Boolean(params.change?.isStreaming);
-      const wasStreaming = streamingThreads.has(conversationId);
-      if (isStreaming) {
-        streamingThreads.add(conversationId);
-      } else {
-        streamingThreads.delete(conversationId);
-      }
-      if (isStreaming !== wasStreaming) {
-        try {
-          options.onStreamingChange?.({ threadId: conversationId, isStreaming });
-        } catch {
-          // ignore listener errors
-        }
-      }
-      const roleValue = params.change?.streamRole?.role;
+      const roleValue = streamRole?.role;
       if (typeof roleValue === 'string') {
         const wasOwned = ownedThreads.has(conversationId);
         if (roleValue === 'owner') {
@@ -361,10 +416,245 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         }
       }
       streamingThreads.clear();
+      appThreadStreamStates.clear();
       ownedThreads.clear();
       ownershipWaiters.clear();
     }
   };
+}
+
+function emptyAppThreadStreamState(): AppThreadStreamState {
+  return {
+    activeItemKeys: new Set(),
+    latestTurnIndex: null,
+    latestTurnStatus: null,
+    runtimeStatusType: null
+  };
+}
+
+function isActiveAppThreadState(state: AppThreadStreamState): boolean {
+  return (
+    isActiveStatus(state.runtimeStatusType) ||
+    isActiveStatus(state.latestTurnStatus) ||
+    state.activeItemKeys.size > 0
+  );
+}
+
+function isActiveStatus(status: unknown): boolean {
+  return typeof status === 'string' && ACTIVE_STATUSES.has(status);
+}
+
+function streamStateFromConversationState(conversationState: JsonRecord): AppThreadStreamState {
+  const state = emptyAppThreadStreamState();
+  const runtimeStatus = objectField(conversationState, 'threadRuntimeStatus');
+  state.runtimeStatusType = stringField(runtimeStatus, 'type');
+
+  const turns = arrayField(conversationState, 'turns');
+  state.latestTurnIndex = turns.length > 0 ? turns.length - 1 : null;
+  turns.forEach((rawTurn, turnIndex) => {
+    const turn = asObject(rawTurn);
+    if (!turn) {
+      return;
+    }
+    if (turnIndex === state.latestTurnIndex) {
+      state.latestTurnStatus = stringField(turn, 'status');
+    }
+    trackInProgressItemsForTurn(state, turn, turnIndex);
+  });
+  return state;
+}
+
+function applyStreamPatch(state: AppThreadStreamState, rawPatch: unknown): void {
+  const patch = asObject(rawPatch);
+  if (!patch) {
+    return;
+  }
+  const op = typeof patch.op === 'string' ? patch.op : null;
+  const path = Array.isArray(patch.path) ? patch.path : [];
+  if (path.length === 0) {
+    return;
+  }
+
+  if (path[0] === 'threadRuntimeStatus') {
+    applyRuntimeStatusPatch(state, path, patch.value);
+    return;
+  }
+
+  if (path[0] !== 'turns') {
+    return;
+  }
+
+  if (path.length === 1 && Array.isArray(patch.value)) {
+    const rebuilt = streamStateFromConversationState({
+      turns: patch.value,
+      threadRuntimeStatus: state.runtimeStatusType ? { type: state.runtimeStatusType } : undefined
+    });
+    state.activeItemKeys = rebuilt.activeItemKeys;
+    state.latestTurnIndex = rebuilt.latestTurnIndex;
+    state.latestTurnStatus = rebuilt.latestTurnStatus;
+    return;
+  }
+
+  const turnIndex = numericPathPart(path[1]);
+  if (turnIndex == null) {
+    return;
+  }
+
+  if (path.length === 2) {
+    if (op === 'remove') {
+      removeActiveItemKeysForTurn(state, turnIndex);
+      if (state.latestTurnIndex === turnIndex) {
+        state.latestTurnStatus = null;
+      }
+      return;
+    }
+
+    const turn = asObject(patch.value);
+    if (!turn) {
+      return;
+    }
+    rememberLatestTurnStatus(state, turnIndex, stringField(turn, 'status'));
+    removeActiveItemKeysForTurn(state, turnIndex);
+    trackInProgressItemsForTurn(state, turn, turnIndex);
+    return;
+  }
+
+  if (path[2] === 'status') {
+    rememberLatestTurnStatus(state, turnIndex, typeof patch.value === 'string' ? patch.value : null);
+    return;
+  }
+
+  if (path[2] !== 'items') {
+    return;
+  }
+
+  if (path.length === 3 && Array.isArray(patch.value)) {
+    removeActiveItemKeysForTurn(state, turnIndex);
+    patch.value.forEach((item, itemIndex) => {
+      updateActiveItemKeyFromItem(state, turnIndex, itemIndex, item);
+    });
+    return;
+  }
+
+  const itemIndex = numericPathPart(path[3]);
+  if (itemIndex == null) {
+    return;
+  }
+  const itemKey = activeItemKey(turnIndex, itemIndex);
+
+  if (path.length === 4) {
+    if (op === 'remove') {
+      state.activeItemKeys.delete(itemKey);
+      return;
+    }
+    updateActiveItemKeyFromItem(state, turnIndex, itemIndex, patch.value);
+    return;
+  }
+
+  if (path[4] === 'status') {
+    if (isActiveStatus(patch.value)) {
+      state.activeItemKeys.add(itemKey);
+    } else {
+      state.activeItemKeys.delete(itemKey);
+    }
+  }
+}
+
+function applyRuntimeStatusPatch(
+  state: AppThreadStreamState,
+  path: unknown[],
+  value: unknown
+): void {
+  if (path.length === 1) {
+    state.runtimeStatusType = stringField(asObject(value), 'type');
+    return;
+  }
+  if (path[1] === 'type') {
+    state.runtimeStatusType = typeof value === 'string' ? value : null;
+  }
+}
+
+function rememberLatestTurnStatus(
+  state: AppThreadStreamState,
+  turnIndex: number,
+  status: string | null
+): void {
+  if (state.latestTurnIndex == null || turnIndex >= state.latestTurnIndex) {
+    state.latestTurnIndex = turnIndex;
+    state.latestTurnStatus = status;
+  }
+}
+
+function trackInProgressItemsForTurn(
+  state: AppThreadStreamState,
+  turn: JsonRecord,
+  turnIndex: number
+): void {
+  const items = arrayField(turn, 'items');
+  items.forEach((item, itemIndex) => {
+    updateActiveItemKeyFromItem(state, turnIndex, itemIndex, item);
+  });
+}
+
+function updateActiveItemKeyFromItem(
+  state: AppThreadStreamState,
+  turnIndex: number,
+  itemIndex: number,
+  item: unknown
+): void {
+  const key = activeItemKey(turnIndex, itemIndex);
+  const status = stringField(asObject(item), 'status');
+  if (isActiveStatus(status)) {
+    state.activeItemKeys.add(key);
+  } else {
+    state.activeItemKeys.delete(key);
+  }
+}
+
+function removeActiveItemKeysForTurn(state: AppThreadStreamState, turnIndex: number): void {
+  const prefix = `turns.${turnIndex}.items.`;
+  for (const key of [...state.activeItemKeys]) {
+    if (key.startsWith(prefix)) {
+      state.activeItemKeys.delete(key);
+    }
+  }
+}
+
+function activeItemKey(turnIndex: number, itemIndex: number): string {
+  return `turns.${turnIndex}.items.${itemIndex}`;
+}
+
+function numericPathPart(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    return null;
+  }
+  return Number(value);
+}
+
+function objectField(value: unknown, field: string): JsonRecord | null {
+  const object = asObject(value);
+  return asObject(object?.[field]);
+}
+
+function stringField(value: unknown, field: string): string | null {
+  const object = asObject(value);
+  const fieldValue = object?.[field];
+  return typeof fieldValue === 'string' ? fieldValue : null;
+}
+
+function arrayField(value: unknown, field: string): unknown[] {
+  const object = asObject(value);
+  const fieldValue = object?.[field];
+  return Array.isArray(fieldValue) ? fieldValue : [];
+}
+
+function asObject(value: unknown): JsonRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : null;
 }
 
 function userTextInput(text: string) {

@@ -1700,10 +1700,9 @@ export class LiveEventHub {
   }
 }
 
-// 6s polling cadence: the WebSocket is now the primary live channel (we push transcripts
-// directly when they change). The polling loop is just a backstop, so a slower cadence is
-// fine. Lower cadence also means fewer `thread/resume` JSON-RPC calls into the spawned
-// codex app-server, which is the biggest CPU consumer in this process tree.
+// 6s polling cadence: Codex desktop IPC is the source of truth for live working/ready state.
+// This polling loop is only a slow backstop for thread/message list freshness, so it must not
+// turn old app-server `running` status into a live working signal.
 const POLL_INTERVAL_MS = 6_000;
 const ACTIVE_RECENCY_MS = 10 * 60_000;
 // Was 15 ticks at 2s = 30s between full sweeps. Keep that real-world cadence at the new rate.
@@ -1723,7 +1722,7 @@ function startThreadPolling(
     if (fullSweep) {
       return true;
     }
-    if (thread.status === 'running' || thread.status === 'waiting_approval') {
+    if (thread.status === 'waiting_approval') {
       return true;
     }
     const lastActivityMs = Date.parse(thread.lastActivityAt);
@@ -1760,12 +1759,8 @@ function startThreadPolling(
         if (previous.get(thread.threadId) !== next.get(thread.threadId)) {
           hub.broadcast({ type: 'thread/upsert', payload: thread });
         }
-        // Push transcripts for any thread we successfully reconciled. Previously we gated this
-        // on `status === 'running'`, but the desktop's app-server can be slow to flip status
-        // back to running after the user's send (it stays `idle` for a beat while the turn is
-        // booting), and we'd miss the first push. Pushing whenever we have a transcript keeps
-        // the tablet's last-known-good state fresh — the WebSocket is the real-time channel,
-        // the client-side fetch is just a backstop.
+        // Push transcripts for any thread we successfully reconciled. This keeps the tablet's
+        // last-known-good messages fresh without using app-server status as the live state.
         if (transcript) {
           hub.broadcast({ type: 'thread/transcript/changed', payload: transcript });
         }

@@ -138,23 +138,13 @@ export function Dashboard({
 
   const workingThreadIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const thread of visibleThreads) {
-      if (thread.status === 'running') {
-        ids.add(thread.threadId);
-      }
-    }
-    for (const [threadId, transcript] of Object.entries(transcriptUpdates)) {
-      if (transcript?.activeTurnId) {
-        ids.add(threadId);
-      }
-    }
     if (streamingThreadIds) {
       for (const id of streamingThreadIds) {
         ids.add(id);
       }
     }
     return ids;
-  }, [transcriptUpdates, streamingThreadIds, visibleThreads]);
+  }, [streamingThreadIds]);
 
   const updateActiveThreadId = (threadId: string | undefined) => {
     if (controlledActiveThreadId === undefined) {

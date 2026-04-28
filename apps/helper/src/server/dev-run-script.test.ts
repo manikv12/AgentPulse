@@ -22,6 +22,14 @@ describe('dev-run Cloudflare wiring', () => {
     expect(script).toContain('origin_url="$tunnel_origin"');
   });
 
+  it('stops any existing listener on the configured helper port before starting dev mode', async () => {
+    const script = await readFile(path.join(repoRoot, 'scripts/dev-run-all.sh'), 'utf8');
+
+    expect(script).toContain('lsof -tiTCP:"$helper_port" -sTCP:LISTEN');
+    expect(script).toContain('Stopping existing listener on port $helper_port');
+    expect(script).toContain('wait_for_pid_exit');
+  });
+
   it('allows dev-run to stop the helper-managed tunnel before starting the Vite tunnel', async () => {
     const devServer = await readFile(path.join(repoRoot, 'apps/helper/src/dev-server.ts'), 'utf8');
 

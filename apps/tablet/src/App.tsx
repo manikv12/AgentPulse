@@ -94,7 +94,8 @@ const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
 const THREADS_CACHE_KEY_PREFIX = 'agent-pulse:threads-cache:';
 const TRANSCRIPTS_CACHE_KEY_PREFIX = 'agent-pulse:transcripts-cache:';
 const CACHED_TRANSCRIPT_MESSAGE_LIMIT = 40;
-const WORKING_STATE_GRACE_MS = 15_000;
+const TRANSCRIPT_REFRESH_DEBOUNCE_MS = 250;
+const ACTIVE_CODEX_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
 
 const ADMIN_FLEX_SCREENS = new Set<AppScreen>(['settings', 'admin-login', 'chooser']);
 const BACKGROUND_STABLE_SCREENS = new Set<AppScreen>(['settings', 'admin-login']);
@@ -140,9 +141,68 @@ function extractStreamingChange(
   }
   const isStreaming = (change as { isStreaming?: unknown }).isStreaming;
   if (typeof isStreaming !== 'boolean') {
-    return undefined;
+    const derived = deriveStreamingFromCodexChange(change);
+    return typeof derived === 'boolean' ? { threadId, isStreaming: derived } : undefined;
   }
   return { threadId, isStreaming };
+}
+
+function deriveStreamingFromCodexChange(change: object): boolean | undefined {
+  const type = stringField(change, 'type');
+  if (type === 'snapshot') {
+    const conversationState = objectField(change, 'conversationState');
+    return conversationState ? conversationStateLooksStreaming(conversationState) : undefined;
+  }
+
+  if (type === 'patches') {
+    const patches = Array.isArray((change as { patches?: unknown }).patches)
+      ? ((change as { patches: unknown[] }).patches)
+      : [];
+    if (patches.some(patchLooksStreaming)) {
+      return true;
+    }
+  }
+
+  return undefined;
+}
+
+function conversationStateLooksStreaming(conversationState: object): boolean {
+  const runtimeStatus = objectField(conversationState, 'threadRuntimeStatus');
+  if (isActiveCodexStatus(stringField(runtimeStatus, 'type'))) {
+    return true;
+  }
+  const turns = arrayField(conversationState, 'turns');
+  const latestTurn = objectFromUnknown(turns.at(-1));
+  if (isActiveCodexStatus(stringField(latestTurn, 'status'))) {
+    return true;
+  }
+  return turns.some((rawTurn) =>
+    arrayField(rawTurn, 'items').some((item) =>
+      isActiveCodexStatus(stringField(objectFromUnknown(item), 'status'))
+    )
+  );
+}
+
+function patchLooksStreaming(rawPatch: unknown): boolean {
+  const patch = objectFromUnknown(rawPatch);
+  if (!patch) {
+    return false;
+  }
+  const value = (patch as { value?: unknown }).value;
+  if (isActiveCodexStatus(value)) {
+    return true;
+  }
+  if (isActiveCodexStatus(stringField(objectFromUnknown(value), 'status'))) {
+    return true;
+  }
+  const path = Array.isArray((patch as { path?: unknown }).path)
+    ? ((patch as { path: unknown[] }).path)
+    : [];
+  return path.at(-1) === 'status' && isActiveCodexStatus(value);
+}
+
+function isActiveCodexStatus(value: unknown): boolean {
+  return typeof value === 'string' && ACTIVE_CODEX_STATUSES.has(value);
 }
 
 function transcriptAfterStop(transcript: ThreadTranscript): ThreadTranscript {
@@ -344,6 +404,18 @@ function objectField(source: unknown, key: string): object | undefined {
   return value && typeof value === 'object' ? value : undefined;
 }
 
+function arrayField(source: unknown, key: string): unknown[] {
+  if (!source || typeof source !== 'object') {
+    return [];
+  }
+  const value = (source as Record<string, unknown>)[key];
+  return Array.isArray(value) ? value : [];
+}
+
+function objectFromUnknown(source: unknown): object | undefined {
+  return source && typeof source === 'object' && !Array.isArray(source) ? source : undefined;
+}
+
 function stringField(source: unknown, key: string): string | undefined {
   if (!source || typeof source !== 'object') {
     return undefined;
@@ -541,11 +613,6 @@ function removeTranscriptCache(
   return next;
 }
 
-function transcriptLooksFinished(transcript: ThreadTranscript): boolean {
-  const lastMessage = [...transcript.messages].reverse().find((message) => message.text.trim().length > 0);
-  return lastMessage?.role === 'assistant' && lastMessage.kind === 'message';
-}
-
 export function App() {
   const [session, setSession] = useState<AgentPulseSession | undefined>(() => loadSession());
   const [adminToken, setAdminToken] = useState<string | undefined>(() => loadAdminToken());
@@ -624,93 +691,31 @@ export function App() {
   );
 
   const [streamingThreadIds, setStreamingThreadIds] = useState<Set<string>>(() => new Set());
-  const workingClearTimersRef = useRef<Map<string, number>>(new Map());
 
-  const cancelWorkingClear = useCallback((threadId: string) => {
-    const timer = workingClearTimersRef.current.get(threadId);
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
-      workingClearTimersRef.current.delete(threadId);
-    }
+  const markThreadWorking = useCallback((threadId: string) => {
+    setStreamingThreadIds((current) => {
+      if (current.has(threadId)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.add(threadId);
+      return next;
+    });
   }, []);
 
-  const markThreadWorking = useCallback(
-    (threadId: string) => {
-      cancelWorkingClear(threadId);
-      setStreamingThreadIds((current) => {
-        if (current.has(threadId)) {
-          return current;
-        }
-        const next = new Set(current);
-        next.add(threadId);
-        return next;
-      });
-    },
-    [cancelWorkingClear]
-  );
-
-  const markThreadReady = useCallback(
-    (threadId: string, options: { delay?: boolean } = {}) => {
-      if (!options.delay) {
-        cancelWorkingClear(threadId);
-        setStreamingThreadIds((current) => {
-          if (!current.has(threadId)) {
-            return current;
-          }
-          const next = new Set(current);
-          next.delete(threadId);
-          return next;
-        });
-        return;
-      }
-
-      setStreamingThreadIds((current) => {
-        if (!current.has(threadId) || workingClearTimersRef.current.has(threadId)) {
-          return current;
-        }
-        const timer = window.setTimeout(() => {
-          workingClearTimersRef.current.delete(threadId);
-          setStreamingThreadIds((latest) => {
-            if (!latest.has(threadId)) {
-              return latest;
-            }
-            const next = new Set(latest);
-            next.delete(threadId);
-            return next;
-          });
-        }, WORKING_STATE_GRACE_MS);
-        workingClearTimersRef.current.set(threadId, timer);
+  const markThreadReady = useCallback((threadId: string) => {
+    setStreamingThreadIds((current) => {
+      if (!current.has(threadId)) {
         return current;
-      });
-    },
-    [cancelWorkingClear]
-  );
-
-  const syncStreamingStateFromTranscript = useCallback(
-    (transcript: ThreadTranscript) => {
-      if (transcript.activeTurnId) {
-        markThreadWorking(transcript.threadId);
-        return;
       }
-      markThreadReady(transcript.threadId, { delay: !transcriptLooksFinished(transcript) });
-    },
-    [markThreadReady, markThreadWorking]
-  );
+      const next = new Set(current);
+      next.delete(threadId);
+      return next;
+    });
+  }, []);
 
-  // Coalesced + debounced transcript refetch.
-  //
-  // Codex emits many `thread-stream-state-changed` patch broadcasts per turn (one per token
-  // chunk on long responses). Two problems we have to avoid:
-  //   1. Spawning a fetch per broadcast floods Cloudflare with HTTP/2 streams that race each
-  //      other and cancel out — none ever completes, so the UI looks frozen until we refresh.
-  //   2. Even with a leading fetch, the *trailing* fetch starting at the very moment the next
-  //      broadcast arrives gets canceled too.
-  // Strategy: at most one in-flight per thread. While in-flight, mark a `pending` flag and
-  // ignore further broadcasts. After the in-flight resolves, debounce ~600ms of quiet before
-  // running the trailing fetch — that's enough for the broadcast storm to subside, so the
-  // trailing fetch isn't immediately canceled by the next one. WebSocket pushes from the
-  // helper's polling loop are the real-time channel; the client-side fetch is just a backstop
-  // that fills in the final state after Codex finishes streaming.
+  // Coalesced + debounced transcript refetch. Codex desktop IPC is the source of truth for
+  // working/ready state; this fetch only fills in message text after a live patch arrives.
   const requestTranscriptRefresh = useCallback(
     (threadId: string) => {
       const currentSession = session;
@@ -735,10 +740,9 @@ export function App() {
         try {
           const transcript = await fetchThreadTranscript(currentSession, threadId);
           setTranscripts((current) => upsertTranscriptCache(current, transcript));
-          syncStreamingStateFromTranscript(transcript);
           applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
         } catch {
-          // ignore — broadcast or polling will retry
+          // Ignore transient refresh failures; the next live broadcast can retry.
         } finally {
           const next = states.get(threadId);
           if (!next) return;
@@ -755,14 +759,14 @@ export function App() {
                 states.set(threadId, after);
               }
               requestTranscriptRefresh(threadId);
-            }, 600);
+            }, TRANSCRIPT_REFRESH_DEBOUNCE_MS);
             next.trailingTimer = timer;
             states.set(threadId, next);
           }
         }
       })();
     },
-    [session, applyTranscriptModel, syncStreamingStateFromTranscript]
+    [session, applyTranscriptModel]
   );
   const [plugins, setPlugins] = useState<CatalogPlugin[]>([]);
   const [skills, setSkills] = useState<CatalogSkill[]>([]);
@@ -778,15 +782,6 @@ export function App() {
     const id = window.setTimeout(() => setMessage(''), 2500);
     return () => window.clearTimeout(id);
   }, [message]);
-
-  useEffect(() => {
-    return () => {
-      for (const timer of workingClearTimersRef.current.values()) {
-        window.clearTimeout(timer);
-      }
-      workingClearTimersRef.current.clear();
-    };
-  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -946,7 +941,6 @@ export function App() {
 
         if (liveEvent.type === 'thread/transcript/changed') {
           setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
-          syncStreamingStateFromTranscript(liveEvent.payload);
           applyTranscriptModel(
             liveEvent.payload.threadId,
             liveEvent.payload.model,
@@ -959,7 +953,7 @@ export function App() {
           if (isStreaming) {
             markThreadWorking(threadId);
           } else {
-            markThreadReady(threadId, { delay: true });
+            markThreadReady(threadId);
           }
         }
 
@@ -990,7 +984,7 @@ export function App() {
               if (streamingChange.isStreaming) {
                 markThreadWorking(streamingChange.threadId);
               } else {
-                markThreadReady(streamingChange.threadId, { delay: true });
+                markThreadReady(streamingChange.threadId);
               }
             }
           }
@@ -1045,8 +1039,7 @@ export function App() {
     applyTranscriptModel,
     markThreadReady,
     markThreadWorking,
-    requestTranscriptRefresh,
-    syncStreamingStateFromTranscript
+    requestTranscriptRefresh
   ]);
 
   const handlePair = async (input: PairingSubmission) => {
@@ -1123,11 +1116,10 @@ export function App() {
 
       const transcript = await fetchThreadTranscript(session, threadId, options);
       setTranscripts((current) => upsertTranscriptCache(current, transcript));
-      syncStreamingStateFromTranscript(transcript);
       applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
       return transcript;
     },
-    [session, applyTranscriptModel, syncStreamingStateFromTranscript]
+    [session, applyTranscriptModel]
   );
 
   const handleFetchOlderMessages = useCallback(
@@ -1148,11 +1140,10 @@ export function App() {
 
       const result = await sendThreadMessage(session, threadId, text);
       setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
-      syncStreamingStateFromTranscript(result.transcript);
       applyTranscriptModel(threadId, result.transcript.model, result.transcript.reasoningEffort);
       return result;
     },
-    [session, applyTranscriptModel, syncStreamingStateFromTranscript]
+    [session, applyTranscriptModel]
   );
 
   const markThreadStopped = useCallback((threadId: string) => {

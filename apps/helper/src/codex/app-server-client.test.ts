@@ -38,9 +38,19 @@ describe('Codex App Server stderr logging', () => {
     expect(codexStderrLinesForLog(noisyLine, { debug: true })).toEqual([noisyLine]);
   });
 
-  it('does not hide auth failures', () => {
+  it('keeps actionable auth failures visible', () => {
     const authFailure = 'failed request: 401 Unauthorized';
 
     expect(codexStderrLinesForLog(authFailure)).toEqual([authFailure]);
+  });
+
+  it('suppresses background ChatGPT auth retry noise', () => {
+    const authRetryNoise = [
+      '2026-04-27T20:24:35.767242Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses',
+      '{"message":"failed to warm featured plugin ids cache","error":"remote plugin sync request to https://chatgpt.com/backend-api/plugins/featured failed with status 403 Forbidden"}',
+      '{"message":"events failed with status 403 Forbidden: https://chatgpt.com/backend-api/codex/analytics-events/events"}'
+    ].join('\n');
+
+    expect(codexStderrLinesForLog(authRetryNoise)).toEqual([]);
   });
 });

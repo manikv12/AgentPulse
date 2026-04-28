@@ -32,6 +32,101 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
+  it('starts a new thread with Codex desktop-style project config', async () => {
+    const cwd = '/Users/me/projects/CodexPulse';
+    const config = {
+      model: 'gpt-5.5',
+      model_provider: 'openai',
+      sandbox_mode: 'danger-full-access',
+      approval_policy: 'never',
+      developer_instructions: 'Be concise.',
+      personality: 'friendly',
+      model_reasoning_effort: 'xhigh',
+      service_tier: 'priority',
+      marketplaces: {
+        'openai-bundled': {
+          sparse_paths: ''
+        }
+      },
+      plugins: {
+        cache: '/Users/me/.codex/plugins/cache'
+      }
+    };
+    const transport = fakeTransport([
+      { config },
+      threadResponse('thread-new', 'idle', [], [], cwd)
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    const result = await chat.startThread(cwd);
+
+    expect(result.threadId).toBe('thread-new');
+    expect(result.workspace).toBe('CodexPulse');
+    expect(transport.calls.map((call) => call.method)).toEqual(['config/read', 'thread/start']);
+    expect(transport.calls[0]?.params).toEqual({ includeLayers: false, cwd });
+    expect(transport.calls[1]?.params).toEqual({
+      cwd,
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      config: {
+        model_reasoning_effort: 'xhigh'
+      },
+      developerInstructions: 'Be concise.',
+      personality: 'friendly',
+      ephemeral: false,
+      dynamicTools: null,
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+      serviceTier: 'priority'
+    });
+  });
+
+  it('uses Codex auto defaults when project config does not pin access settings', async () => {
+    const cwd = '/Users/me/projects/CodexPulse';
+    const transport = fakeTransport([
+      {
+        config: {
+          model: 'gpt-5.5',
+          sandbox_mode: null,
+          approval_policy: null
+        }
+      },
+      threadResponse('thread-new', 'idle', [], [], cwd)
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    await chat.startThread(cwd);
+
+    expect(transport.calls[1]?.params).toMatchObject({
+      cwd,
+      model: 'gpt-5.5',
+      approvalPolicy: 'on-request',
+      sandbox: 'workspace-write'
+    });
+  });
+
+  it('still asks Codex to start the project thread if config read is unavailable', async () => {
+    const cwd = '/Users/me/projects/CodexPulse';
+    const transport = fakeTransport([
+      new Error('config/read unavailable'),
+      threadResponse('thread-new', 'idle', [], [], cwd)
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    await chat.startThread(cwd);
+
+    expect(transport.calls.map((call) => call.method)).toEqual(['config/read', 'thread/start']);
+    expect(transport.calls[1]?.params).toMatchObject({
+      cwd,
+      model: 'gpt-5.5',
+      approvalPolicy: 'on-request',
+      sandbox: 'workspace-write',
+      config: {}
+    });
+  });
+
   it('steers the active turn when the existing thread is already running', async () => {
     const transport = fakeTransport([
       threadResponse('thread-1', 'active', [turn('turn-live', 'inProgress')]),
@@ -343,7 +438,8 @@ function threadResponse(
   threadId: string,
   status: 'idle' | 'active',
   turns: Array<Record<string, unknown>>,
-  activeFlags: string[] = []
+  activeFlags: string[] = [],
+  cwd = '/tmp/project'
 ) {
   return {
     thread: {
@@ -357,7 +453,7 @@ function threadResponse(
       createdAt: 1_777_000_000,
       updatedAt: 1_777_000_100,
       path: null,
-      cwd: '/tmp/project',
+      cwd,
       cliVersion: '0.0.0',
       source: 'app-server',
       agentNickname: null,

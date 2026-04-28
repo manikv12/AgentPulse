@@ -139,6 +139,167 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('derives streaming from Codex desktop snapshot state', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onStreamingChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onStreamingChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-snapshot',
+      change: {
+        type: 'snapshot',
+        conversationState: {
+          threadRuntimeStatus: { type: 'idle' },
+          turns: [
+            { status: 'completed', items: [] },
+            { status: 'inProgress', items: [{ type: 'commandExecution', status: 'completed' }] }
+          ]
+        }
+      }
+    });
+
+    expect(mirror.isThreadStreaming('thread-snapshot')).toBe(true);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-snapshot',
+      isStreaming: true
+    });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-snapshot',
+      change: {
+        type: 'snapshot',
+        conversationState: {
+          threadRuntimeStatus: { type: 'idle' },
+          turns: [
+            { status: 'completed', items: [] },
+            { status: 'completed', items: [{ type: 'commandExecution', status: 'completed' }] }
+          ]
+        }
+      }
+    });
+
+    expect(mirror.isThreadStreaming('thread-snapshot')).toBe(false);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-snapshot',
+      isStreaming: false
+    });
+    mirror.dispose();
+  });
+
+  it('keeps a thread streaming while Codex desktop patches a command as in progress', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onStreamingChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onStreamingChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-patches',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['turns', 0, 'items', 0],
+            value: { id: 'cmd-1', type: 'commandExecution', status: 'inProgress' }
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadStreaming('thread-patches')).toBe(true);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-patches',
+      isStreaming: true
+    });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-patches',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'replace',
+            path: ['turns', 0, 'items', 0, 'status'],
+            value: 'completed'
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadStreaming('thread-patches')).toBe(false);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-patches',
+      isStreaming: false
+    });
+    mirror.dispose();
+  });
+
+  it('does not mark ready when a command completes but the latest turn is still active', async () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onStreamingChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onStreamingChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-active-turn',
+      change: {
+        type: 'snapshot',
+        conversationState: {
+          turns: [{ status: 'inProgress', items: [{ type: 'commandExecution', status: 'inProgress' }] }]
+        }
+      }
+    });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-active-turn',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'replace',
+            path: ['turns', 0, 'items', 0, 'status'],
+            value: 'completed'
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadStreaming('thread-active-turn')).toBe(true);
+    expect(onStreamingChange).toHaveBeenCalledTimes(1);
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-active-turn',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'replace',
+            path: ['turns', 0, 'status'],
+            value: 'completed'
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadStreaming('thread-active-turn')).toBe(false);
+    expect(onStreamingChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-active-turn',
+      isStreaming: false
+    });
+    mirror.dispose();
+  });
+
   it('sends thread-follower-interrupt-turn when stopping the current Codex turn', async () => {
     const { ipc, sendRequest, setReady } = createMockIpc();
     setReady(true);

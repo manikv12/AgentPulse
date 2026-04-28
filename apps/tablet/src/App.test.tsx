@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ThreadTranscript } from '@agent-pulse/shared';
 import { App, extractLatestModel, extractLatestReasoningEffort } from './App';
 import { Dashboard } from './Dashboard';
+import { ThreadView } from './ThreadView';
 
 describe('Agent Pulse tablet UI', () => {
   afterEach(() => {
@@ -643,7 +644,12 @@ describe('Agent Pulse tablet UI', () => {
               sourceClientId: 'desktop',
               params: {
                 conversationId: 'thread-live',
-                change: { isStreaming: true }
+                change: {
+                  type: 'snapshot',
+                  conversationState: {
+                    turns: [{ status: 'inProgress', items: [] }]
+                  }
+                }
               }
             }
           })
@@ -653,6 +659,9 @@ describe('Agent Pulse tablet UI', () => {
 
     expect(await screen.findByText('Codex is working')).toBeInTheDocument();
     expect(screen.getByText('Working')).toBeInTheDocument();
+    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    expect(stopButton.closest('.codex-composer')).not.toBeNull();
+    expect(stopButton.closest('.codex-thread-actions')).toBeNull();
 
     await act(async () => {
       sockets[0]?.onmessage?.(
@@ -664,7 +673,12 @@ describe('Agent Pulse tablet UI', () => {
               sourceClientId: 'desktop',
               params: {
                 conversationId: 'thread-live',
-                change: { isStreaming: false }
+                change: {
+                  type: 'snapshot',
+                  conversationState: {
+                    turns: [{ status: 'completed', items: [] }]
+                  }
+                }
               }
             }
           })
@@ -672,11 +686,11 @@ describe('Agent Pulse tablet UI', () => {
       );
     });
 
-    expect(screen.getByText('Codex is working')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
   });
 
-  it('uses transcript updates to clear a stale working state when a stop broadcast is missed', async () => {
+  it('keeps working state on the Codex stream source instead of transcript updates', async () => {
     localStorage.setItem(
       'agent-pulse-session',
       JSON.stringify({
@@ -828,6 +842,22 @@ describe('Agent Pulse tablet UI', () => {
     });
 
     expect(await screen.findByText('Done.')).toBeInTheDocument();
+    expect(screen.getByText('Codex is working')).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/streaming-changed',
+            payload: {
+              threadId: 'thread-live',
+              isStreaming: false
+            }
+          })
+        })
+      );
+    });
+
     await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
     expect(screen.getByText('Ready')).toBeInTheDocument();
   });
@@ -987,12 +1017,15 @@ describe('Agent Pulse tablet UI', () => {
       })
     );
 
+    const sockets: MockWebSocket[] = [];
     class MockWebSocket {
       onopen: ((event: Event) => void) | null = null;
       onmessage: ((event: MessageEvent) => void) | null = null;
       onclose: ((event: CloseEvent) => void) | null = null;
 
-      constructor(readonly url: string | URL) {}
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
 
       close(): void {}
     }
@@ -1081,9 +1114,25 @@ describe('Agent Pulse tablet UI', () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/streaming-changed',
+            payload: {
+              threadId: 'thread-live',
+              isStreaming: true
+            }
+          })
+        })
+      );
+    });
     expect(await screen.findByText('Codex is working')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Stop Codex' }));
+    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    expect(stopButton.closest('.codex-composer')).not.toBeNull();
+    expect(stopButton.closest('.codex-thread-actions')).toBeNull();
+    fireEvent.click(stopButton);
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -1095,7 +1144,7 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.getByText('Ready')).toBeInTheDocument();
   });
 
-  it('keeps the stop button visible when the thread list says running but the transcript is stale', async () => {
+  it('keeps the stop button visible when the Codex stream source says working and the transcript is stale', async () => {
     const staleReadyTranscript: ThreadTranscript = {
       threadId: 'running-1',
       activeTurnId: null,
@@ -1130,13 +1179,14 @@ describe('Agent Pulse tablet UI', () => {
             threadId: 'running-1',
             title: 'Fix Mac helper sync',
             workspace: 'CodexPulse',
-            status: 'running',
+            status: 'idle',
             lastActivityAt: '2026-04-27T19:14:17.599Z',
             lastTurnSummary: ''
           }
         ]}
         fetchTranscript={fetchTranscript}
         stopWork={stopWork}
+        streamingThreadIds={new Set(['running-1'])}
       />
     );
 
@@ -1144,7 +1194,61 @@ describe('Agent Pulse tablet UI', () => {
     expect(await screen.findByText('Older ready state.')).toBeInTheDocument();
 
     expect(screen.getByText('Codex is working')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    expect(stopButton).toBeInTheDocument();
+    expect(stopButton.closest('.codex-composer')).not.toBeNull();
+  });
+
+  it('does not show working from the old thread-list running status alone', async () => {
+    const readyTranscript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Older ready state.',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const fetchTranscript = vi.fn(async () => readyTranscript);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'running-1',
+            title: 'Fix Mac helper sync',
+            workspace: 'CodexPulse',
+            status: 'running',
+            lastActivityAt: '2026-04-27T19:14:17.599Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        fetchTranscript={fetchTranscript}
+      />
+    );
+
+    const row = screen.getByRole('button', { name: /Open chat for Fix Mac helper sync/ });
+    expect(row.querySelector('.codex-sidebar-thread-dot')).toBeNull();
+    fireEvent.click(row);
+    expect(await screen.findByText('Older ready state.')).toBeInTheDocument();
+    expect(screen.getByText('Ready')).toBeInTheDocument();
+    expect(screen.queryByText('Codex is working')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
   });
 
   it('restores the active chat from the URL and cached transcript before refresh requests finish', async () => {
@@ -1452,7 +1556,7 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close thread chat' }));
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Implement mobile chat/ }));
 
-    await screen.findByText('Codex is working');
+    await screen.findByText('Ready');
     expect(fetchTranscript).toHaveBeenNthCalledWith(2, 'running-1', { messageLimit: 40 });
     fireEvent.change(screen.getByLabelText('Message Codex'), {
       target: { value: 'Hello from phone.' }
@@ -1528,6 +1632,200 @@ describe('Agent Pulse tablet UI', () => {
     expect(fetchTranscript).toHaveBeenCalledWith('running-1', { messageLimit: 40 });
   });
 
+  it('keeps the latest two messages as the live tail and requires a hard top pull for more history', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Older user message',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'message-2',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Older assistant message',
+          createdAt: '2026-04-25T16:15:00Z'
+        },
+        {
+          id: 'message-3',
+          role: 'user',
+          kind: 'message',
+          text: 'Latest user message',
+          createdAt: '2026-04-25T16:16:00Z'
+        },
+        {
+          id: 'message-4',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Newest assistant message',
+          createdAt: '2026-04-25T16:17:00Z'
+        }
+      ]
+    }));
+    const fetchOlderMessages = vi.fn(async () => ({
+      threadId: 'thread-1',
+      messages: [],
+      hasMore: false
+    }));
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-1',
+          title: 'Thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:17:00Z',
+          lastTurnSummary: ''
+        }}
+        fetchTranscript={fetchTranscript}
+        fetchOlderMessages={fetchOlderMessages}
+      />
+    );
+
+    expect(await screen.findByText('Newest assistant message')).toBeInTheDocument();
+    expect(screen.getByText('Older user message')).toBeInTheDocument();
+
+    const scroller = container.querySelector('.codex-thread-messages') as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { value: 1000, configurable: true },
+      clientHeight: { value: 400, configurable: true }
+    });
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+
+    expect(fetchOlderMessages).not.toHaveBeenCalled();
+    fireEvent.wheel(scroller, { deltaY: -30 });
+    expect(fetchOlderMessages).not.toHaveBeenCalled();
+    fireEvent.wheel(scroller, { deltaY: -70 });
+
+    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
+    expect(fetchTranscript).toHaveBeenCalledWith('thread-1', { messageLimit: 40 });
+  });
+
+  it('does not auto-load older pages when the latest two messages do not fill the viewport', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'message-3',
+          role: 'user',
+          kind: 'message',
+          text: 'Latest user message',
+          createdAt: '2026-04-25T16:16:00Z'
+        },
+        {
+          id: 'message-4',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Newest assistant message',
+          createdAt: '2026-04-25T16:17:00Z'
+        }
+      ]
+    }));
+    const fetchOlderMessages = vi.fn(async () => ({
+      threadId: 'thread-1',
+      messages: [],
+      hasMore: false
+    }));
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-1',
+          title: 'Thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:17:00Z',
+          lastTurnSummary: ''
+        }}
+        fetchTranscript={fetchTranscript}
+        fetchOlderMessages={fetchOlderMessages}
+      />
+    );
+
+    expect(await screen.findByText('Newest assistant message')).toBeInTheDocument();
+
+    const scroller = container.querySelector('.codex-thread-messages') as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { value: 240, configurable: true },
+      clientHeight: { value: 640, configurable: true }
+    });
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+
+    expect(fetchOlderMessages).not.toHaveBeenCalled();
+  });
+
+  it('loads older pages from a hard touch pull at the top', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Older user message',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'message-2',
+          role: 'user',
+          kind: 'message',
+          text: 'Latest user message',
+          createdAt: '2026-04-25T16:16:00Z'
+        },
+        {
+          id: 'message-3',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Newest assistant message',
+          createdAt: '2026-04-25T16:17:00Z'
+        }
+      ]
+    }));
+    const fetchOlderMessages = vi.fn(async () => ({
+      threadId: 'thread-1',
+      messages: [],
+      hasMore: false
+    }));
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-1',
+          title: 'Thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:17:00Z',
+          lastTurnSummary: ''
+        }}
+        fetchTranscript={fetchTranscript}
+        fetchOlderMessages={fetchOlderMessages}
+      />
+    );
+
+    expect(await screen.findByText('Newest assistant message')).toBeInTheDocument();
+
+    const scroller = container.querySelector('.codex-thread-messages') as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { value: 1000, configurable: true },
+      clientHeight: { value: 400, configurable: true }
+    });
+    scroller.scrollTop = 0;
+    fireEvent.touchStart(scroller, { touches: [{ clientY: 100 }] });
+    fireEvent.touchMove(scroller, { touches: [{ clientY: 175 }] });
+
+    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
+  });
+
   it('clears the attention dot after the user opens and leaves a thread', async () => {
     render(
       <Dashboard
@@ -1571,7 +1869,7 @@ describe('Agent Pulse tablet UI', () => {
     ).toBeNull();
   });
 
-  it('keeps the working dot visible while the agent is running, even after the thread is viewed', async () => {
+  it('keeps the working dot visible while the Codex stream source says the agent is running', async () => {
     render(
       <Dashboard
         health={{
@@ -1585,7 +1883,7 @@ describe('Agent Pulse tablet UI', () => {
             threadId: 'running-1',
             title: 'Implement mobile chat',
             workspace: 'Agent Pulse',
-            status: 'running',
+            status: 'idle',
             lastActivityAt: '2026-04-25T16:18:00Z',
             lastTurnSummary: 'Working on mobile chat'
           }
@@ -1597,6 +1895,7 @@ describe('Agent Pulse tablet UI', () => {
             path: '/Users/me/projects/AgentPulse'
           }
         ]}
+        streamingThreadIds={new Set(['running-1'])}
       />
     );
 
@@ -1614,52 +1913,42 @@ describe('Agent Pulse tablet UI', () => {
     ).not.toBeNull();
   });
 
-  it('keeps refreshing the open chat after a phone send so Codex activity appears', async () => {
-    vi.useFakeTimers();
-    const readyTranscript: ThreadTranscript = {
+  it('allows a follow-up message while the Codex stream source says the agent is working', async () => {
+    const liveTranscript: ThreadTranscript = {
       threadId: 'running-1',
-      activeTurnId: null,
-      sendState: {
-        canSend: true,
-        reason: 'ready',
-        label: 'Ready'
-      },
-      messages: []
-    };
-    const afterSendTranscript: ThreadTranscript = {
-      ...readyTranscript,
       activeTurnId: 'turn-1',
+      sendState: {
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Codex is working'
+      },
       messages: [
-        {
-          id: 'user-1',
-          role: 'user',
-          kind: 'message',
-          text: 'Hello from phone.',
-          createdAt: '2026-04-25T16:15:00Z'
-        }
-      ]
-    };
-    const refreshedTranscript: ThreadTranscript = {
-      ...afterSendTranscript,
-      activeTurnId: null,
-      messages: [
-        ...afterSendTranscript.messages,
         {
           id: 'assistant-1',
           role: 'assistant',
           kind: 'message',
-          text: 'I received the phone message and started working.',
+          text: 'I am still running the command.',
           createdAt: '2026-04-25T16:15:05Z'
         }
       ]
     };
-    const fetchTranscript = vi
-      .fn()
-      .mockResolvedValueOnce(readyTranscript)
-      .mockResolvedValue(refreshedTranscript);
+    const afterSendTranscript: ThreadTranscript = {
+      ...liveTranscript,
+      messages: [
+        ...liveTranscript.messages,
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Add one more detail.',
+          createdAt: '2026-04-25T16:16:00Z'
+        }
+      ]
+    };
+    const fetchTranscript = vi.fn().mockResolvedValue(liveTranscript);
     const sendMessage = vi.fn().mockResolvedValue({
       ok: true,
-      mode: 'start',
+      mode: 'steer',
       turnId: 'turn-1',
       transcript: afterSendTranscript
     });
@@ -1684,6 +1973,7 @@ describe('Agent Pulse tablet UI', () => {
         ]}
         fetchTranscript={fetchTranscript}
         sendMessage={sendMessage}
+        streamingThreadIds={new Set(['running-1'])}
         projects={[
           {
             projectId: 'project-agent-pulse',
@@ -1695,24 +1985,15 @@ describe('Agent Pulse tablet UI', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Implement mobile chat/ }));
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(screen.getByText('Ready')).toBeInTheDocument();
+    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    expect(screen.getByText('I am still running the command.')).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('Message Codex'), {
-      target: { value: 'Hello from phone.' }
+      target: { value: 'Add one more detail.' }
     });
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(screen.getByText('Codex is working')).toBeInTheDocument();
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3000);
-    });
-
-    expect(screen.getByText('I received the phone message and started working.')).toBeInTheDocument();
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith('running-1', 'Add one more detail.'));
+    expect(await screen.findByText('Add one more detail.')).toBeInTheDocument();
   });
 
   it('groups agent work between chat messages and expands screenshots on demand', async () => {

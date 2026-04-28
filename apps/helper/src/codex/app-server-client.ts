@@ -6,14 +6,7 @@ import type { CodexAppServerTransport } from './app-server-chat';
 
 const STDERR_RING_LIMIT = 8 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-// Don't restart the subprocess more than once every 60 seconds even if the auth-failure
-// signal repeats — the WebSocket retry loop in codex_api fires those errors many times per
-// second when a token is bad, and we don't want to thrash.
-const AUTH_RESTART_COOLDOWN_MS = 60_000;
-// Lines that mean "this subprocess can't reach the backend" — usually a stale auth token
-// that the desktop has already rotated. Killing the subprocess forces it to re-read
-// ~/.codex/auth.json on the next request.
-const AUTH_FAILURE_PATTERNS = [
+const AUTH_ERROR_TEXT_PATTERNS = [
   '403 Forbidden',
   '401 Unauthorized',
   'token expired',
@@ -37,6 +30,11 @@ const NOISY_STDERR_PATTERNS = [
 ];
 const NOISY_REMOTE_CONTROL_PATTERN =
   'remote control server enrollment failed at `https://chatgpt.com/backend-api/wham/remote/control/server/enroll`: HTTP 404 Not Found';
+const NOISY_CHATGPT_AUTH_ENDPOINT_MARKERS = [
+  'backend-api/codex/responses',
+  'backend-api/plugins/featured',
+  'backend-api/codex/analytics-events/events'
+];
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -65,10 +63,8 @@ export class CodexAppServerClient implements CodexAppServerTransport {
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private stderrRing = '';
-  private lastAuthRestartAt = 0;
-  // De-duplicates concurrent `ensureStarted` calls: when the auth-failure handler kills the
-  // subprocess, several pending requests can race to respawn it. Keep a single in-flight
-  // promise so we end up with at most one subprocess.
+  // De-duplicates concurrent `ensureStarted` calls. Keep a single in-flight promise so we
+  // end up with at most one subprocess.
   private startPromise?: Promise<void>;
 
   constructor(private readonly options: CodexAppServerClientOptions = {}) {}
@@ -123,13 +119,6 @@ export class CodexAppServerClient implements CodexAppServerTransport {
         next.length > STDERR_RING_LIMIT ? next.slice(-STDERR_RING_LIMIT) : next;
       for (const line of codexStderrLinesForLog(text, { debug: debugEnabled })) {
         console.warn('[codex app-server stderr]', line);
-      }
-      // The codex_api WebSocket retries 403/401 errors *very* aggressively (multiple per
-      // second). When the rolling stderr buffer shows one of those, kill the subprocess so
-      // the next request respawns it — that forces a re-read of ~/.codex/auth.json which
-      // the desktop app keeps refreshed.
-      if (this.shouldRestartForAuthFailure(text)) {
-        this.restartForAuthFailure();
       }
     });
     child.once('exit', (code, signal) => {
@@ -214,44 +203,6 @@ export class CodexAppServerClient implements CodexAppServerTransport {
     });
   }
 
-  private shouldRestartForAuthFailure(stderrChunk: string): boolean {
-    if (!AUTH_FAILURE_PATTERNS.some((pattern) => stderrChunk.includes(pattern))) {
-      return false;
-    }
-    const now = Date.now();
-    if (now - this.lastAuthRestartAt < AUTH_RESTART_COOLDOWN_MS) {
-      return false;
-    }
-    return true;
-  }
-
-  private restartForAuthFailure(): void {
-    this.lastAuthRestartAt = Date.now();
-    const child = this.process;
-    if (!child) {
-      return;
-    }
-    console.warn(
-      '[codex app-server] auth-failure detected in stderr, killing subprocess so the next ' +
-        'request respawns it with fresh credentials.'
-    );
-    try {
-      child.kill();
-    } catch {
-      // ignore — child.once('exit') will clean up state
-    }
-    this.process = undefined;
-    this.initialized = false;
-    this.stderrRing = '';
-    // Reject any in-flight requests so callers retry against a fresh subprocess instead of
-    // hanging on the dead one.
-    for (const [id, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error('Codex App Server restarted due to auth failure.'));
-      this.pending.delete(id);
-    }
-  }
-
   private sendNotification(method: string, params: unknown): void {
     this.process?.stdin.write(`${JSON.stringify({ method, params })}\n`);
   }
@@ -299,5 +250,15 @@ function isNoisyCodexStderrLine(line: string): boolean {
   if (line.includes(NOISY_REMOTE_CONTROL_PATTERN)) {
     return true;
   }
+  if (isBackgroundChatgptAuthLine(line)) {
+    return true;
+  }
   return NOISY_STDERR_PATTERNS.some((pattern) => line.includes(pattern));
+}
+
+function isBackgroundChatgptAuthLine(line: string): boolean {
+  return (
+    NOISY_CHATGPT_AUTH_ENDPOINT_MARKERS.some((marker) => line.includes(marker)) &&
+    AUTH_ERROR_TEXT_PATTERNS.some((pattern) => line.includes(pattern))
+  );
 }

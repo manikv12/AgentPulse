@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-pulse/shared';
-import { WebSocket } from 'ws';
+import { WebSocket, type RawData } from 'ws';
 import { AdminAuth } from '../auth/admin';
 import { DeviceRegistry, MemoryDeviceStore, PairingManager } from '../auth/pairing';
 import { SendBlockedError } from '../codex/app-server-chat';
@@ -1578,6 +1578,25 @@ describe('Agent Pulse helper API', () => {
 
     try {
       const { token, deviceId } = await pairForTest(server.url, pairing);
+      const params = new URLSearchParams({
+        token,
+        deviceId,
+        fingerprint: 'fingerprint-123'
+      });
+      const websocket = new WebSocket(`${server.url.replace('http:', 'ws:')}/events?${params}`);
+      await waitForSocketOpen(websocket);
+      const streamingStopped = waitForLiveEvent(websocket, (event) => {
+        const typed = event as {
+          type?: unknown;
+          payload?: { threadId?: unknown; isStreaming?: unknown };
+        };
+        return (
+          typed.type === 'thread/streaming-changed' &&
+          typed.payload?.threadId === 'thread-1' &&
+          typed.payload?.isStreaming === false
+        );
+      });
+
       const stopResponse = await fetch(`${server.url}/threads/thread-1/stop`, {
         method: 'POST',
         headers: authHeaders(token, deviceId)
@@ -1586,8 +1605,13 @@ describe('Agent Pulse helper API', () => {
       await expect(stopResponse.json()).resolves.toEqual({ ok: true });
       expect(stopResponse.status).toBe(200);
       expect(mirror.interruptTurn).toHaveBeenCalledWith('thread-1');
+      await expect(streamingStopped).resolves.toMatchObject({
+        type: 'thread/streaming-changed',
+        payload: { threadId: 'thread-1', isStreaming: false }
+      });
       expect(appServer.sendMessage).not.toHaveBeenCalled();
       expect(opener.openThread).not.toHaveBeenCalled();
+      websocket.close();
     } finally {
       await server.stop();
     }
@@ -1974,6 +1998,37 @@ function waitForSocketRejected(websocket: WebSocket): Promise<boolean> {
       clearTimeout(timer);
       resolve(true);
     });
+  });
+}
+
+function waitForLiveEvent(
+  websocket: WebSocket,
+  predicate: (event: unknown) => boolean
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      clearTimeout(timer);
+      websocket.off('message', onMessage);
+    };
+    const onMessage = (data: RawData) => {
+      try {
+        const event = JSON.parse(data.toString());
+        if (!predicate(event)) {
+          return;
+        }
+        cleanup();
+        resolve(event);
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timed out waiting for live event.'));
+    }, 1_000);
+    websocket.on('message', onMessage);
   });
 }
 
