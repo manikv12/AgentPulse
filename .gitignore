@@ -4,8 +4,15 @@ REQUIREMENTS.md
 node_modules/
 dist/
 build/
+coverage/
+.vite/
+*.tsbuildinfo
+out/
 *.log
 .env
 .env.*
 .vscode/
 .idea/
+
+/.playwright-mcp/
+/.cloudflared/

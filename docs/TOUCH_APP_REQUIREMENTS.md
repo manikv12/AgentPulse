@@ -1,10 +1,10 @@
-# AgentPulse Touch App Requirements
+# Agent Pulse Touch App Requirements
 
 ## Summary
 
-AgentPulse v1 is a touch-controlled app for Codex.
+Agent Pulse v1 is a touch-controlled app for Codex.
 
-The first version runs as a local web app on an iPad, Android tablet, or small touch-screen browser device. The Mac runs Codex and the AgentPulse helper. The tablet is the control screen.
+The first version runs as a local web app on an iPad, Android tablet, or small touch-screen browser device. The Mac runs Codex and the Agent Pulse helper. The tablet is the control screen.
 
 ## Goal
 
@@ -23,7 +23,7 @@ The user should be able to tap a thread on the tablet and open that thread in Co
 - **Thread**: a Codex conversation as shown in Codex Desktop / VS Code, identified by a stable thread ID.
 - **Session**: a single run of Codex producing turns and tool calls for a thread.
 - **Rollout**: the on-disk JSONL file under `~/.codex/sessions/...` that records a session's events.
-- **Helper**: the local AgentPulse Mac service that reads Codex state and serves the touch app.
+- **Helper**: the local Agent Pulse Mac service that reads Codex state and serves the touch app.
 - **Tablet**: any paired browser client (iPad Safari, Android Chrome, kiosk browser).
 
 In the API and UI, "thread" is the user-visible unit. Sessions and rollouts are implementation details inside the helper.
@@ -38,6 +38,8 @@ The first product is:
 - A local-only system by default.
 
 The app does not require special hardware. A normal tablet on a good desk stand is enough.
+
+Remote internet access is a later phase and is specified separately in `docs/REMOTE_ACCESS_REQUIREMENTS.md`.
 
 ## Target Devices
 
@@ -60,7 +62,7 @@ The tablet should be able to feel like a dedicated Codex panel.
 
 For iPad:
 
-- Open the AgentPulse touch app in Safari.
+- Open the Agent Pulse touch app in Safari.
 - Add it to the Home Screen.
 - Use Guided Access to lock the iPad to that app.
 
@@ -70,20 +72,20 @@ For Android:
 - Use Fully Kiosk Browser for stronger kiosk mode.
 - Use Android Enterprise or MDM later if a managed setup is needed.
 
-AgentPulse only needs to provide a clean full-screen web app that works well in these modes.
+Agent Pulse only needs to provide a clean full-screen web app that works well in these modes.
 
 ## Thread Status Model
 
 Every thread reported by the helper has exactly one `status` value from this enum:
 
-| Status            | Color  | Meaning                                                                |
-| ----------------- | ------ | ---------------------------------------------------------------------- |
-| `idle`            | green  | Thread exists and is healthy, no active turn.                          |
-| `running`         | blue   | A turn is in progress or activity was seen in the last few seconds.    |
-| `waiting_approval`| yellow | Codex is waiting for the user to approve a permission or tool call.    |
-| `error`           | red    | The last turn failed, or Codex reported an error for this thread.      |
-| `connection`      | orange | Helper or Codex `app-server` connection is degraded for this thread.   |
-| `unknown`         | gray   | Thread is archived, stale, or status cannot currently be determined.   |
+| Status             | Color  | Meaning                                                              |
+| ------------------ | ------ | -------------------------------------------------------------------- |
+| `idle`             | green  | Thread exists and is healthy, no active turn.                        |
+| `running`          | blue   | A turn is in progress or activity was seen in the last few seconds.  |
+| `waiting_approval` | yellow | Codex is waiting for the user to approve a permission or tool call.  |
+| `error`            | red    | The last turn failed, or Codex reported an error for this thread.    |
+| `connection`       | orange | Helper or Codex `app-server` connection is degraded for this thread. |
+| `unknown`          | gray   | Thread is archived, stale, or status cannot currently be determined. |
 
 If more than one signal applies to a thread (for example, an erroring thread that is also waiting), the helper picks the highest-attention status using this priority:
 
@@ -114,7 +116,7 @@ The v1 touch app includes:
 
 Example flow:
 
-1. User opens AgentPulse on an iPad.
+1. User opens Agent Pulse on an iPad.
 2. The iPad shows the running Codex threads from the Mac.
 3. One thread changes to yellow because it needs approval.
 4. User taps that thread on the iPad.
@@ -132,11 +134,11 @@ iPad or Android tablet
         |
         | browser, paired token
         v
-AgentPulse touch web app
+Agent Pulse touch web app
         |
         | local network API
         v
-AgentPulse helper on Mac
+Agent Pulse helper on Mac
         |
         +--> codex app-server
         +--> ~/.codex local state
@@ -149,7 +151,7 @@ The tablet does not read Codex files directly. The tablet does not connect direc
 
 ## Codex Data Sources
 
-The helper uses the same safe data sources already researched for AgentPulse:
+The helper uses the same safe data sources already researched for Agent Pulse:
 
 - `codex app-server` for live Codex events where possible.
 - `~/.codex/state_5.sqlite` for thread metadata.
@@ -162,6 +164,8 @@ The helper must read Codex files as read-only. It must not write to Codex databa
 ## Network Requirements
 
 The touch app needs LAN mode because the tablet is a different device.
+
+Outside-LAN access is out of scope for this document and is tracked in `docs/REMOTE_ACCESS_REQUIREMENTS.md`.
 
 Requirements:
 
@@ -193,7 +197,7 @@ Requirements:
 
 ## Security Requirements
 
-AgentPulse must be careful because Codex can affect local files and projects.
+Agent Pulse must be careful because Codex can affect local files and projects.
 
 Security rules:
 
@@ -208,7 +212,7 @@ Security rules:
 
 ### Token lifetime
 
-- Tokens are stored in macOS Keychain under a AgentPulse service entry (e.g. `com.agentpulse.helper`), scoped per device.
+- Tokens are stored in macOS Keychain under an Agent Pulse service entry (e.g. `com.agentpulse.helper`), scoped per device.
 - Tokens have no fixed expiry but can be rotated or revoked at any time from helper settings.
 - Helper restart preserves tokens; reinstalling the helper or clearing the Keychain entry resets all pairings.
 - A "rotate token" action invalidates the old token and emits a fresh pairing PIN for that device.
@@ -332,7 +336,7 @@ For v1:
 
 - Do not depend on Codex `remote_control`.
 - Do not require OpenAI backend enrollment for the tablet app.
-- Use AgentPulse's own local helper API.
+- Use Agent Pulse's own local helper API.
 
 Future:
 

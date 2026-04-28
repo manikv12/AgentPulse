@@ -1,0 +1,25 @@
+{
+  "id": "agent-pulse",
+  "name": "AgentPulse",
+  "version": "0.1.0",
+  "description": "Touch dashboard for monitoring local AI coding agents (Codex, Claude Code, Copilot).",
+  "entry": {
+    "type": "process",
+    "command": "./run.sh",
+    "args": [],
+    "workingDirectory": "."
+  },
+  "capabilities": [
+    "http-service",
+    "dashboard-tile"
+  ],
+  "health": {
+    "url": "http://127.0.0.1:8765/health",
+    "startupGraceSeconds": 4,
+    "intervalSeconds": 15
+  },
+  "ui": {
+    "url": "http://127.0.0.1:8765/",
+    "title": "AgentPulse"
+  }
+}
