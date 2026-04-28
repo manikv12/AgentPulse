@@ -862,6 +862,167 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.getByText('Ready')).toBeInTheDocument();
   });
 
+  it('refreshes again after Codex becomes ready so the final assistant message appears', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const sockets: MockWebSocket[] = [];
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+
+      close(): void {}
+    }
+
+    let liveTranscriptFetches = 0;
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'thread-live',
+                  title: 'Fix Mac helper sync',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-04-27T18:00:00Z',
+                  lastTurnSummary: ''
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-live/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: []
+            })
+          };
+        }
+
+        if (url === '/threads/thread-live/transcript') {
+          liveTranscriptFetches += 1;
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'thread-live',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages:
+                liveTranscriptFetches >= 2
+                  ? [
+                      {
+                        id: 'assistant-final',
+                        role: 'assistant',
+                        kind: 'message',
+                        text: 'Final answer is now visible.',
+                        phase: 'final_answer',
+                        createdAt: '2026-04-27T18:11:00Z'
+                      }
+                    ]
+                  : []
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+    expect(await screen.findByText('Ready')).toBeInTheDocument();
+    liveTranscriptFetches = 0;
+    vi.useFakeTimers();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/streaming-changed',
+            payload: {
+              threadId: 'thread-live',
+              isStreaming: false
+            }
+          })
+        })
+      );
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('Final answer is now visible.')).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750);
+    });
+
+    expect(screen.getByText('Final answer is now visible.')).toBeInTheDocument();
+  });
+
   it('keeps usage badges stable when live transcript updates do not include usage', async () => {
     localStorage.setItem(
       'agent-pulse-session',
@@ -1199,6 +1360,110 @@ describe('Agent Pulse tablet UI', () => {
     expect(stopButton.closest('.codex-composer')).not.toBeNull();
   });
 
+  it('shows the stop button when the transcript carries the IPC mirror working state', async () => {
+    const workingTranscript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: 'mirror-streaming:running-1',
+      sendState: {
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Codex is working'
+      },
+      messages: [
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Still running a command.',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const fetchTranscript = vi.fn(async () => workingTranscript);
+    const stopWork = vi.fn(async () => undefined);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'running-1',
+            title: 'Fix Mac helper sync',
+            workspace: 'CodexPulse',
+            status: 'idle',
+            lastActivityAt: '2026-04-27T19:14:17.599Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        fetchTranscript={fetchTranscript}
+        stopWork={stopWork}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+
+    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    expect(stopButton.closest('.codex-composer')).not.toBeNull();
+  });
+
+  it('does not show the stop button from app-server-only working state', async () => {
+    const appServerOnlyTranscript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: 'app-server-active:running-1',
+      sendState: {
+        canSend: false,
+        reason: 'missing_active_turn',
+        label: 'Codex is working'
+      },
+      messages: [
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'App-server thinks this is running.',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const fetchTranscript = vi.fn(async () => appServerOnlyTranscript);
+    const stopWork = vi.fn(async () => undefined);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'running-1',
+            title: 'Fix Mac helper sync',
+            workspace: 'CodexPulse',
+            status: 'idle',
+            lastActivityAt: '2026-04-27T19:14:17.599Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        fetchTranscript={fetchTranscript}
+        stopWork={stopWork}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
+
+    expect(await screen.findByText('App-server thinks this is running.')).toBeInTheDocument();
+    expect(screen.queryByText('Codex is working')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
+  });
+
   it('does not show working from the old thread-list running status alone', async () => {
     const readyTranscript: ThreadTranscript = {
       threadId: 'running-1',
@@ -1444,7 +1709,6 @@ describe('Agent Pulse tablet UI', () => {
     expect(within(sidebar).getByText('Threads')).toBeInTheDocument();
     expect(within(sidebar).getByLabelText('Thread list')).toBeInTheDocument();
     expect(within(sidebar).getAllByText('Agent Pulse').length).toBeGreaterThanOrEqual(1);
-    expect(within(sidebar).getByText('v0.1.0')).toBeInTheDocument();
     expect(within(sidebar).getByText('OpenAssist')).toBeInTheDocument();
     expect(
       within(sidebar).getByRole('button', { name: /Open chat for Implement dashboard grouping/ })

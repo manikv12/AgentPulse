@@ -13,7 +13,9 @@ import type {
 import { Menu, MessagesSquare, X } from 'lucide-react';
 import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
 import type { FetchThreadTranscriptOptions } from './api';
+import { DashboardInsights } from './DashboardInsights';
 import { Sidebar } from './Sidebar';
+import { Spinner } from './Spinner';
 import { ThreadView } from './ThreadView';
 import { relativeTime, statusTone } from './status';
 
@@ -231,7 +233,7 @@ export function Dashboard({
   };
 
   return (
-    <div className="codex-shell">
+    <div className="codex-shell" data-route={activeThread ? 'thread' : 'home'}>
       {sidebarOpen ? (
         <div
           className="codex-sidebar-backdrop"
@@ -251,6 +253,7 @@ export function Dashboard({
         onGoHome={handleCloseThread}
         health={health}
         isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
       />
       <main className="codex-main">
         {activeThread ? (
@@ -302,9 +305,18 @@ export function Dashboard({
             threads={visibleThreads}
             onSelectThread={handleSelectThread}
             onOpenSidebar={() => setSidebarOpen(true)}
+            isLoading={!threadsLoaded}
           />
         )}
       </main>
+      {!activeThread ? (
+        <DashboardInsights
+          threads={visibleThreads}
+          projects={projects}
+          health={health}
+          threadModels={threadModels}
+        />
+      ) : null}
       {newThreadDialogOpen ? (
         <NewThreadDialog
           projects={projects}
@@ -462,7 +474,13 @@ function NewThreadDialog({
               type="submit"
               disabled={!selectedProjectId || creating}
             >
-              {creatingProjectId === selectedProjectId ? 'Starting' : 'Start thread'}
+              {creatingProjectId === selectedProjectId ? (
+                <>
+                  <Spinner size={14} /> Starting
+                </>
+              ) : (
+                'Start thread'
+              )}
             </button>
           </div>
           {selectedProject ? (
@@ -480,18 +498,39 @@ function NewThreadDialog({
 function EmptyMain({
   threads,
   onOpenSidebar,
-  onSelectThread
+  onSelectThread,
+  isLoading = false
 }: {
   threads: Thread[];
   onOpenSidebar: () => void;
   onSelectThread: (thread: Thread) => void;
+  isLoading?: boolean;
 }) {
   const recentThreads = [...threads]
     .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
     .slice(0, 8);
 
+  if (isLoading && threads.length === 0) {
+    return (
+      <section className="codex-shell-empty codex-home">
+        <button
+          className="codex-sidebar-toggle"
+          type="button"
+          onClick={onOpenSidebar}
+          aria-label="Open thread list"
+        >
+          <Menu size={20} />
+        </button>
+        <div className="codex-loading-overlay">
+          <Spinner size={28} label="Loading threads" />
+          <span>Loading threads…</span>
+        </div>
+      </section>
+    );
+  }
+
   return (
-    <section className="codex-shell-empty">
+    <section className="codex-shell-empty codex-home">
       <button
         className="codex-sidebar-toggle"
         type="button"
@@ -500,36 +539,41 @@ function EmptyMain({
       >
         <Menu size={20} />
       </button>
-      <div className="codex-shell-empty-body" style={{ marginTop: 'min(10vh, 60px)', marginBottom: '32px' }}>
-        <MessagesSquare size={36} aria-hidden="true" />
-        <h1>Agent Pulse</h1>
-        <p>Pick a thread to follow what Codex is doing.</p>
+      <div className="codex-home-hero glass">
+        <div className="codex-home-hero-icon" aria-hidden="true">
+          <MessagesSquare size={28} />
+        </div>
+        <h1 className="codex-home-hero-title">Agent Pulse</h1>
+        <p className="codex-home-hero-subtitle">Pick a thread to follow what Codex is doing.</p>
       </div>
 
       {recentThreads.length > 0 ? (
-        <div style={{ padding: '0 20px 40px', maxWidth: '800px', margin: '0 auto', width: '100%', textAlign: 'left' }}>
-          <div className="section-heading" style={{ marginBottom: '16px' }}>
-            <h2 style={{ fontSize: '1.125rem', margin: 0, color: 'var(--text)' }}>Recent Activity</h2>
+        <div className="codex-home-section">
+          <div className="codex-home-section-heading">
+            <h2 className="codex-home-section-title">Recent activity</h2>
+            <span className="codex-home-section-meta">{recentThreads.length} thread{recentThreads.length === 1 ? '' : 's'}</span>
           </div>
-          <div className="thread-board">
+          <div className="codex-home-tiles">
             {recentThreads.map((thread) => {
               const tone = statusTone[thread.status] || 'gray';
               return (
                 <button
                   key={thread.threadId}
-                  className="thread-tile"
-                  style={{ textAlign: 'left', padding: 0, border: '1px solid var(--border)', background: 'var(--surface)', cursor: 'pointer' }}
+                  type="button"
+                  className="codex-home-tile"
                   onClick={() => onSelectThread(thread)}
                 >
-                  <div className="thread-main">
-                    <div className="thread-status-row">
-                      <span className={`status-dot tone-${tone}`} style={{ background: `var(--tone-${tone})` }} />
-                      <span style={{ textTransform: 'capitalize' }}>{thread.status}</span>
-                      <span className="thread-time">{relativeTime(thread.lastActivityAt)}</span>
-                    </div>
-                    <h2>{thread.title}</h2>
-                    <p className="workspace-name">{thread.workspace}</p>
+                  <div className="codex-home-tile-row">
+                    <span
+                      className={`codex-home-tile-dot tone-${tone}`}
+                      style={{ background: `var(--tone-${tone})` }}
+                      aria-hidden="true"
+                    />
+                    <span className="codex-home-tile-status">{thread.status}</span>
+                    <span className="codex-home-tile-time">{relativeTime(thread.lastActivityAt)}</span>
                   </div>
+                  <h3 className="codex-home-tile-title">{thread.title}</h3>
+                  <p className="codex-home-tile-workspace">{thread.workspace}</p>
                 </button>
               );
             })}

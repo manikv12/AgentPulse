@@ -95,6 +95,7 @@ const THREADS_CACHE_KEY_PREFIX = 'agent-pulse:threads-cache:';
 const TRANSCRIPTS_CACHE_KEY_PREFIX = 'agent-pulse:transcripts-cache:';
 const CACHED_TRANSCRIPT_MESSAGE_LIMIT = 40;
 const TRANSCRIPT_REFRESH_DEBOUNCE_MS = 250;
+const SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS = [750, 1_500];
 const ACTIVE_CODEX_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
 
 const ADMIN_FLEX_SCREENS = new Set<AppScreen>(['settings', 'admin-login', 'chooser']);
@@ -646,6 +647,7 @@ export function App() {
   const transcriptFetchStateRef = useRef<
     Map<string, { inFlight: boolean; pending: boolean; trailingTimer: number | undefined }>
   >(new Map());
+  const settledTranscriptRefreshTimersRef = useRef<Map<string, number[]>>(new Map());
 
   // Apply a transcript-derived model/effort, but only when:
   //   - the user has not just made a different pick in the last TTL window, OR
@@ -767,6 +769,44 @@ export function App() {
       })();
     },
     [session, applyTranscriptModel]
+  );
+
+  const requestSettledTranscriptRefresh = useCallback(
+    (threadId: string) => {
+      requestTranscriptRefresh(threadId);
+      const timersByThread = settledTranscriptRefreshTimersRef.current;
+      for (const timer of timersByThread.get(threadId) ?? []) {
+        window.clearTimeout(timer);
+      }
+
+      const timers = SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS.map((delay) => {
+        const timer = window.setTimeout(() => {
+          const currentTimers = timersByThread.get(threadId) ?? [];
+          const remainingTimers = currentTimers.filter((currentTimer) => currentTimer !== timer);
+          if (remainingTimers.length > 0) {
+            timersByThread.set(threadId, remainingTimers);
+          } else {
+            timersByThread.delete(threadId);
+          }
+          requestTranscriptRefresh(threadId);
+        }, delay);
+        return timer;
+      });
+      timersByThread.set(threadId, timers);
+    },
+    [requestTranscriptRefresh]
+  );
+
+  useEffect(
+    () => () => {
+      for (const timers of settledTranscriptRefreshTimersRef.current.values()) {
+        for (const timer of timers) {
+          window.clearTimeout(timer);
+        }
+      }
+      settledTranscriptRefreshTimersRef.current.clear();
+    },
+    []
   );
   const [plugins, setPlugins] = useState<CatalogPlugin[]>([]);
   const [skills, setSkills] = useState<CatalogSkill[]>([]);
@@ -954,6 +994,7 @@ export function App() {
             markThreadWorking(threadId);
           } else {
             markThreadReady(threadId);
+            requestSettledTranscriptRefresh(threadId);
           }
         }
 
@@ -985,6 +1026,7 @@ export function App() {
                 markThreadWorking(streamingChange.threadId);
               } else {
                 markThreadReady(streamingChange.threadId);
+                requestSettledTranscriptRefresh(streamingChange.threadId);
               }
             }
           }
@@ -1039,7 +1081,8 @@ export function App() {
     applyTranscriptModel,
     markThreadReady,
     markThreadWorking,
-    requestTranscriptRefresh
+    requestTranscriptRefresh,
+    requestSettledTranscriptRefresh
   ]);
 
   const handlePair = async (input: PairingSubmission) => {
@@ -1202,6 +1245,7 @@ export function App() {
           onSignOut={handleAdminLogout}
           onAdminExpired={handleAdminExpired}
           onPair={handlePair}
+          helperVersion={health.version}
         />
       );
     }
@@ -1656,13 +1700,15 @@ function SettingsScreen({
   onBack,
   onSignOut,
   onAdminExpired,
-  onPair
+  onPair,
+  helperVersion
 }: {
   adminToken: string;
   onBack: () => void;
   onSignOut: () => void;
   onAdminExpired: () => void;
   onPair: (input: PairingSubmission) => Promise<void>;
+  helperVersion: string;
 }) {
   const [pin, setPin] = useState('');
   const [pinExpiresAt, setPinExpiresAt] = useState<string | undefined>();
@@ -1810,7 +1856,7 @@ function SettingsScreen({
 
       <section className="settings-overview" aria-label="Admin status">
         <div>
-          <p className="eyebrow">Local helper</p>
+          <p className="eyebrow">Local helper · v{helperVersion}</p>
           <h2>Control what paired displays can do.</h2>
           <p>Use this page to pair tablets, manage LAN access, and control mobile chat.</p>
         </div>

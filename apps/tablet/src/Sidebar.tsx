@@ -12,7 +12,7 @@ import {
   Wifi,
   WifiOff
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { CodexMark } from './CodexMark';
 import { isAttentionStatus, relativeTime, statusTone } from './status';
 import { useThemePreference, type ThemePreference } from './theme';
@@ -61,6 +61,7 @@ export type SidebarProps = {
   onGoHome?: () => void;
   health: HelperHealth;
   isOpen?: boolean;
+  onClose?: () => void;
 };
 
 type ProjectGroup = {
@@ -150,7 +151,8 @@ export function Sidebar({
   onOpenSettings,
   onGoHome,
   health,
-  isOpen = false
+  isOpen = false,
+  onClose
 }: SidebarProps) {
   const projectGroups = useMemo(() => groupAndSortThreads(threads, projects), [projects, threads]);
   const degraded = health.status !== 'ok';
@@ -184,11 +186,27 @@ export function Sidebar({
   };
 
   if (collapsed) {
+    const attentionCount = threads.reduce(
+      (acc, thread) =>
+        acc +
+        (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity) ? 1 : 0),
+      0
+    );
+    const healthLabel = health.status === 'ok' ? 'OK' : health.status === 'degraded' ? 'DEG' : 'DOWN';
+
     return (
       <aside
         className={`codex-sidebar is-collapsed ${isOpen ? 'is-open' : ''}`}
         data-testid="codex-sidebar"
       >
+        <button
+          type="button"
+          className="codex-sidebar-sheet-handle"
+          onClick={onClose}
+          aria-label="Close thread list"
+        >
+          <span className="codex-sidebar-sheet-handle-bar" aria-hidden="true" />
+        </button>
         <button
           className="codex-sidebar-brand-rail"
           onClick={onGoHome}
@@ -219,40 +237,59 @@ export function Sidebar({
           <Plus size={18} />
         </button>
 
+        {attentionCount > 0 ? (
+          <div
+            className="codex-sidebar-rail-attention"
+            title={`${attentionCount} thread${attentionCount === 1 ? '' : 's'} need attention`}
+            aria-label={`${attentionCount} threads need attention`}
+          >
+            {attentionCount}
+          </div>
+        ) : null}
+
         <div className="codex-sidebar-rail-divider" aria-hidden="true" />
 
         <ul className="codex-sidebar-rail-threads">
-          {projectGroups.flatMap((group) =>
-            group.threads.map((thread) => {
-              const active = thread.threadId === activeThreadId;
-              const tone = statusTone[thread.status];
-              const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
-              const showDot =
-                isWorking ||
-                (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
-              const initial = (group.workspace.trim().charAt(0) || '·').toUpperCase();
+          {projectGroups.map((group, groupIndex) => (
+            <Fragment key={group.workspace}>
+              {groupIndex > 0 ? (
+                <li className="codex-sidebar-rail-group-divider" aria-hidden="true" />
+              ) : null}
+              {group.threads.map((thread) => {
+                const active = thread.threadId === activeThreadId;
+                const tone = statusTone[thread.status];
+                const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
+                const showAttentionDot =
+                  isWorking ||
+                  (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
+                const initial = (group.workspace.trim().charAt(0) || '·').toUpperCase();
 
-              return (
-                <li key={thread.threadId}>
-                  <button
-                    type="button"
-                    className={`codex-sidebar-rail-thread ${active ? 'is-active' : ''}`}
-                    onClick={() => onSelectThread(thread)}
-                    aria-label={`Open chat for ${thread.title}`}
-                    title={`${group.workspace} · ${thread.title}`}
-                  >
-                    <span className="codex-sidebar-rail-initial">{initial}</span>
-                    {showDot ? (
+                return (
+                  <li key={thread.threadId}>
+                    <button
+                      type="button"
+                      className={`codex-sidebar-rail-thread ${active ? 'is-active' : ''}`}
+                      onClick={() => onSelectThread(thread)}
+                      aria-label={`Open chat for ${thread.title}`}
+                      title={`${group.workspace} · ${thread.title} · ${thread.status}`}
+                    >
+                      <span className="codex-sidebar-rail-initial">{initial}</span>
                       <span
-                        className={`codex-sidebar-rail-dot tone-${tone} ${isWorking ? 'is-working' : ''}`}
+                        className={`codex-sidebar-rail-status tone-${tone}`}
                         aria-hidden="true"
                       />
-                    ) : null}
-                  </button>
-                </li>
-              );
-            })
-          )}
+                      {showAttentionDot ? (
+                        <span
+                          className={`codex-sidebar-rail-dot tone-${tone} ${isWorking ? 'is-working' : ''}`}
+                          aria-hidden="true"
+                        />
+                      ) : null}
+                    </button>
+                  </li>
+                );
+              })}
+            </Fragment>
+          ))}
         </ul>
 
         <footer className="codex-sidebar-rail-footer">
@@ -267,9 +304,10 @@ export function Sidebar({
           </button>
           <div
             className={`codex-sidebar-rail-health ${degraded ? 'is-degraded' : 'is-ok'}`}
-            title={degraded ? 'Helper limited' : 'Helper live'}
+            title={degraded ? `Helper ${health.status}` : 'Helper live'}
           >
             {degraded ? <WifiOff size={14} /> : <Wifi size={14} />}
+            <span className="codex-sidebar-rail-health-label">{healthLabel}</span>
           </div>
         </footer>
       </aside>
@@ -278,6 +316,14 @@ export function Sidebar({
 
   return (
     <aside className={`codex-sidebar ${isOpen ? 'is-open' : ''}`} data-testid="codex-sidebar">
+      <button
+        type="button"
+        className="codex-sidebar-sheet-handle"
+        onClick={onClose}
+        aria-label="Close thread list"
+      >
+        <span className="codex-sidebar-sheet-handle-bar" aria-hidden="true" />
+      </button>
       <div className="codex-sidebar-brand">
         <button
           className="codex-sidebar-brand-left"
@@ -386,23 +432,21 @@ export function Sidebar({
   </div>
 
       <footer className="codex-sidebar-footer">
+        <div className={`codex-sidebar-health ${degraded ? 'is-degraded' : 'is-ok'}`}>
+          {degraded ? <WifiOff size={14} /> : <Wifi size={14} />}
+          <span className="codex-sidebar-health-label">{degraded ? 'Helper limited' : 'Helper live'}</span>
+        </div>
         <ThemeQuickToggle theme={theme} onChange={setTheme} />
         <button
           className="codex-sidebar-icon"
           type="button"
           onClick={onOpenSettings}
           aria-label="Open settings"
+          title="Settings"
         >
           <Settings size={14} />
         </button>
-        <div className={`codex-sidebar-health ${degraded ? 'is-degraded' : 'is-ok'}`}>
-          {degraded ? <WifiOff size={14} /> : <Wifi size={14} />}
-          <span>{degraded ? 'Limited' : 'Live'}</span>
-        </div>
       </footer>
-      <div style={{ textAlign: 'center', fontSize: '0.65rem', color: 'var(--text-subtle)', padding: '8px 0 0' }}>
-        v{health.version}
-      </div>
     </aside>
   );
 }
@@ -412,3 +456,4 @@ function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, nu
   const activityAt = Date.parse(thread.lastActivityAt);
   return Number.isFinite(activityAt) && activityAt > seenAt;
 }
+

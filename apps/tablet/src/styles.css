@@ -29,6 +29,16 @@
   --tone-orange-bg: #ffedd5;
   --tone-gray: #525252;
   --tone-gray-bg: #f0f0f0;
+  /* Frosted glass tokens (light) */
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-bg-strong: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(15, 23, 42, 0.08);
+  --glass-highlight: rgba(255, 255, 255, 0.6);
+  --glass-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  --glass-blur: 22px;
+  --app-gradient:
+    radial-gradient(1100px 700px at 10% -10%, rgba(15, 23, 42, 0.04), transparent 60%),
+    radial-gradient(900px 600px at 100% 110%, rgba(15, 23, 42, 0.04), transparent 55%);
   font-family:
     "Söhne", "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", sans-serif;
@@ -69,6 +79,14 @@
     --tone-orange-bg: rgba(249, 115, 22, 0.18);
     --tone-gray: #a3a3a3;
     --tone-gray-bg: rgba(115, 115, 115, 0.18);
+    --glass-bg: rgba(22, 22, 28, 0.55);
+    --glass-bg-strong: rgba(22, 22, 28, 0.72);
+    --glass-border: rgba(255, 255, 255, 0.08);
+    --glass-highlight: rgba(255, 255, 255, 0.08);
+    --glass-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+    --app-gradient:
+      radial-gradient(1100px 700px at 10% -10%, rgba(255, 255, 255, 0.04), transparent 60%),
+      radial-gradient(900px 600px at 100% 110%, rgba(255, 255, 255, 0.03), transparent 55%);
   }
 }
 
@@ -102,6 +120,14 @@
   --tone-orange-bg: rgba(249, 115, 22, 0.18);
   --tone-gray: #a3a3a3;
   --tone-gray-bg: rgba(115, 115, 115, 0.18);
+  --glass-bg: rgba(22, 22, 28, 0.55);
+  --glass-bg-strong: rgba(22, 22, 28, 0.72);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-highlight: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  --app-gradient:
+    radial-gradient(1100px 700px at 10% -10%, rgba(255, 255, 255, 0.04), transparent 60%),
+    radial-gradient(900px 600px at 100% 110%, rgba(255, 255, 255, 0.03), transparent 55%);
 }
 
 * {
@@ -119,6 +145,10 @@ body {
 
 body {
   overscroll-behavior: none;
+  background: var(--bg);
+  background-image: var(--app-gradient);
+  background-attachment: fixed;
+  background-size: cover;
 }
 
 #root {
@@ -2252,20 +2282,11 @@ dd {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: var(--bg);
+  background: transparent;
   overflow: hidden;
 }
 
-@media (min-width: 901px) {
-  .codex-shell {
-    display: grid;
-    grid-template-columns: 280px minmax(0, 1fr);
-  }
-
-  .codex-shell:has(> .codex-sidebar.is-collapsed) {
-    grid-template-columns: 56px minmax(0, 1fr);
-  }
-}
+/* Legacy single breakpoint disabled — see "Three responsive breakpoints" at end of file. */
 
 .codex-shell-empty {
   position: relative;
@@ -2801,6 +2822,10 @@ dd {
   font-size: 0.8125rem;
   font-weight: 600;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .new-thread-submit:disabled {
@@ -4550,6 +4575,10 @@ button.codex-event-row:hover {
 }
 
 .codex-pending-request-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
@@ -4587,6 +4616,658 @@ button.codex-event-row:hover {
 
 .codex-pending-request-action.is-danger:hover:not(:disabled) {
   background: color-mix(in srgb, #d44 12%, transparent);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Frosted glass + responsive (phone / tablet / desktop)
+   Additive layer — overrides selected pieces of the original styles.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Glass utility — apply to any panel that should look like frosted glass. */
+.glass,
+.glass-strong {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+.glass-strong {
+  background: var(--glass-bg-strong);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass,
+  .glass-strong {
+    background: var(--surface);
+  }
+}
+
+/* Sidebar — glass column. */
+.codex-sidebar {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  border-right: 1px solid var(--glass-border);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .codex-sidebar {
+    background: var(--surface);
+  }
+}
+
+/* Thread header — sticky glass bar. */
+.codex-thread-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--glass-bg-strong);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  border-bottom: 1px solid var(--glass-border);
+}
+
+/* Composer — glass card. */
+.codex-composer {
+  background: transparent;
+}
+
+.codex-composer-frame {
+  background: var(--glass-bg-strong);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+/* Empty / home — let gradient breathe through. */
+.codex-shell-empty {
+  background: transparent;
+}
+
+/* ── Three responsive breakpoints ───────────────────────────────────────── */
+
+/* Phone (≤640px): single panel, sidebar as bottom-sheet. */
+@media (max-width: 640px) {
+  .codex-shell {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Mobile sidebar behaves as a bottom sheet on phones. */
+  .codex-shell .codex-sidebar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    width: 100%;
+    height: 82dvh;
+    max-height: 82dvh;
+    border-right: none;
+    border-top: 1px solid var(--glass-border);
+    border-radius: 18px 18px 0 0;
+    box-shadow:
+      var(--glass-shadow),
+      inset 0 1px 0 var(--glass-highlight);
+    z-index: 60;
+    transform: translateY(100%);
+    transition: transform 220ms ease;
+  }
+
+  .codex-shell .codex-sidebar.is-open {
+    transform: translateY(0);
+  }
+
+  /* Composer: pinned, with safe-area padding. */
+  .codex-composer {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .codex-composer-frame {
+    border-radius: 18px;
+  }
+
+  /* Bigger touch targets on phone. */
+  .codex-thread-header,
+  .codex-thread-title {
+    font-size: 1rem;
+  }
+
+  /* Hide insights rail entirely on phone. */
+  .codex-insights-rail {
+    display: none !important;
+  }
+
+  /* Hide collapse / rail-toggle controls on phone — bottom-sheet has its own close handle. */
+  .codex-sidebar-collapse,
+  .codex-sidebar-rail-toggle {
+    display: none !important;
+  }
+}
+
+/* Tablet (641–1180px): sidebar + main, no insights rail. */
+@media (min-width: 641px) and (max-width: 1180px) {
+  .codex-shell {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+
+  .codex-shell:has(> .codex-sidebar.is-collapsed) {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .codex-insights-rail {
+    display: none !important;
+  }
+}
+
+/* Desktop (≥1181px): sidebar + main + insights rail (when on home). */
+@media (min-width: 1181px) {
+  .codex-shell {
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .codex-shell:has(> .codex-sidebar.is-collapsed) {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  /* When the shell shows the home view (no thread), reveal the insights rail. */
+  .codex-shell[data-route='home'] {
+    grid-template-columns: 280px minmax(0, 1fr) 360px;
+  }
+
+  .codex-shell[data-route='home']:has(> .codex-sidebar.is-collapsed) {
+    grid-template-columns: 56px minmax(0, 1fr) 360px;
+  }
+}
+
+/* ── Insights rail (desktop only) ───────────────────────────────────────── */
+
+.codex-insights-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+  border-left: 1px solid var(--glass-border);
+  background: transparent;
+}
+
+.codex-insight-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+.codex-insight-card-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.codex-insight-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.codex-insight-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 80px;
+}
+
+.codex-insight-stat-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.1;
+}
+
+.codex-insight-stat-label {
+  font-size: 0.75rem;
+  color: var(--text-subtle);
+}
+
+.codex-insight-bars {
+  display: flex;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--surface-sunken);
+  border: 1px solid var(--glass-border);
+}
+
+.codex-insight-bar-segment {
+  height: 100%;
+}
+
+.codex-insight-bar-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.codex-insight-bar-legend-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+.codex-insight-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.codex-insight-list-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.codex-insight-list-row-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.codex-insight-list-row-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.codex-insight-list-row-meta {
+  font-size: 0.75rem;
+  color: var(--text-subtle);
+  flex: none;
+}
+
+/* ── Home (empty) view ──────────────────────────────────────────────────── */
+
+.codex-home {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px clamp(16px, 4vw, 40px) 40px;
+  align-items: center;
+}
+
+.codex-home-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+  width: min(560px, 100%);
+  margin-top: clamp(16px, 5vh, 48px);
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.codex-home-hero-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  color: var(--text-subtle);
+  opacity: 0.7;
+}
+
+.codex-home-hero-title {
+  margin: 0;
+  font-size: clamp(1.4rem, 2.4vw, 1.85rem);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.codex-home-hero-subtitle {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--text-muted);
+}
+
+.codex-home-section {
+  width: 100%;
+  max-width: 920px;
+}
+
+.codex-home-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.codex-home-section-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.codex-home-section-meta {
+  font-size: 0.78rem;
+  color: var(--text-subtle);
+}
+
+.codex-home-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.codex-home-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.codex-home-tile:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-muted);
+}
+
+.codex-home-tile-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.codex-home-tile-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.codex-home-tile-status {
+  text-transform: capitalize;
+}
+
+.codex-home-tile-time {
+  margin-left: auto;
+  color: var(--text-subtle);
+}
+
+.codex-home-tile-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.codex-home-tile-workspace {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-subtle);
+}
+
+/* ── Collapsed (rail) sidebar polish ────────────────────────────────────── */
+
+/* Always-on dot for every thread tile in the rail (status at a glance). */
+.codex-sidebar.is-collapsed .codex-sidebar-rail-thread .codex-sidebar-rail-status {
+  position: absolute;
+  bottom: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.codex-sidebar.is-collapsed .codex-sidebar-rail-status.tone-green  { background: var(--tone-green); }
+.codex-sidebar.is-collapsed .codex-sidebar-rail-status.tone-blue   { background: var(--tone-blue); }
+.codex-sidebar.is-collapsed .codex-sidebar-rail-status.tone-yellow { background: var(--tone-yellow); }
+.codex-sidebar.is-collapsed .codex-sidebar-rail-status.tone-red    { background: var(--tone-red); }
+.codex-sidebar.is-collapsed .codex-sidebar-rail-status.tone-orange { background: var(--tone-orange); }
+.codex-sidebar.is-collapsed .codex-sidebar-rail-status.tone-gray   { background: var(--tone-gray); }
+
+/* Active thread in rail — slightly stronger fill + border, no chunky left bar. */
+.codex-sidebar.is-collapsed .codex-sidebar-rail-thread.is-active {
+  background: var(--surface-sunken);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* Project group separator inside the rail. */
+.codex-sidebar-rail-group-divider {
+  width: 18px;
+  height: 1px;
+  background: var(--border);
+  margin: 4px auto;
+  opacity: 0.7;
+}
+
+/* Attention indicator at the top of the rail — small, calm. */
+.codex-sidebar-rail-attention {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--tone-yellow);
+  border: 1px solid color-mix(in srgb, var(--tone-yellow) 50%, var(--border));
+  font-size: 0.65rem;
+  font-weight: 600;
+  margin: 2px auto;
+}
+
+/* Health pill in rail footer — a bit more informative. */
+.codex-sidebar-rail-health-label {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-top: 2px;
+  color: inherit;
+}
+
+/* ── Expanded sidebar footer redesign ───────────────────────────────────── */
+
+.codex-sidebar-footer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin-top: auto;
+  padding: 8px 4px 4px;
+  border-top: 1px solid var(--glass-border);
+  background: transparent;
+  flex: none;
+  z-index: 1;
+}
+
+/* Drop the legacy gradient mask — glass background already provides the look. */
+.codex-sidebar-footer::before {
+  display: none;
+}
+
+.codex-sidebar-footer .codex-sidebar-health {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.codex-sidebar-footer .codex-sidebar-health.is-ok svg {
+  color: var(--tone-green);
+}
+
+.codex-sidebar-footer .codex-sidebar-health.is-degraded svg {
+  color: var(--tone-orange);
+}
+
+.codex-sidebar-health-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+
+/* Spinner — used anywhere the app is loading. */
+@keyframes codex-spin {
+  to { transform: rotate(360deg); }
+}
+
+.codex-spinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  color: currentColor;
+  line-height: 0;
+}
+
+.codex-spinner svg {
+  animation: codex-spin 0.9s linear infinite;
+}
+
+/* Page-level loading overlay — used while threads/health load on app boot. */
+.codex-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.codex-loading-overlay .codex-spinner {
+  color: var(--text-muted);
+}
+
+/* Inline "loading older messages" indicator at the top of a thread. */
+.codex-thread-loading-older {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* Bottom-sheet drag/close handle — hidden by default; visible only on phone. */
+.codex-sidebar-sheet-handle {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .codex-sidebar-sheet-handle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 8px 0 6px;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+  }
+
+  .codex-sidebar-sheet-handle-bar {
+    display: block;
+    width: 44px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--border-strong);
+    opacity: 0.7;
+    transition: opacity 120ms ease, background 120ms ease;
+  }
+
+  .codex-sidebar-sheet-handle:hover .codex-sidebar-sheet-handle-bar,
+  .codex-sidebar-sheet-handle:active .codex-sidebar-sheet-handle-bar {
+    opacity: 1;
+    background: var(--text-muted);
+  }
+}
+
+.codex-sidebar-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 0 4px;
 }
 
 .codex-pending-request-context {

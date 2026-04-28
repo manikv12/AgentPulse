@@ -42,10 +42,12 @@ import remarkGfm from 'remark-gfm';
 import { TranscriptFetchTimeoutError, type FetchThreadTranscriptOptions } from './api';
 import { CodexMark } from './CodexMark';
 import { MentionPicker, type MentionItem, type MentionTrigger } from './MentionPicker';
+import { Spinner } from './Spinner';
 
 const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 40;
 const VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT = 2;
 const OLDER_MESSAGES_PAGE_SIZE = 40;
+const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
 // Older pages should load only after a deliberate extra pull at the top. A normal scroll
 // up should just reveal the prefetched messages already sitting above the latest tail.
 const OLDER_MESSAGES_PULL_TOP_PX = 12;
@@ -269,8 +271,19 @@ function splitTranscriptForScrollback(
     return { visible: transcript, scrollback: [] };
   }
 
-  const scrollback = transcript.messages.slice(0, -VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT);
-  const visibleMessages = transcript.messages.slice(-VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT);
+  // Always include the latest user message in the visible tail so the user can see
+  // what they asked, plus everything Codex sent in response. Falls back to a small
+  // tail when there's no user message in the transcript yet.
+  let cutoff = transcript.messages.length - VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT;
+  for (let i = transcript.messages.length - 1; i >= 0; i--) {
+    if (transcript.messages[i]!.role === 'user') {
+      cutoff = Math.min(cutoff, i);
+      break;
+    }
+  }
+
+  const scrollback = transcript.messages.slice(0, cutoff);
+  const visibleMessages = transcript.messages.slice(cutoff);
   return {
     visible: {
       ...transcript,
@@ -619,13 +632,20 @@ export function ThreadView({
   };
 
   const trimmedDraft = draft.trim();
-  const isAgentWorking = forceWorking;
   const sendBlockReason = transcript?.sendState.reason;
   const isHardSendBlock =
     sendBlockReason === 'mobile_send_disabled' ||
     sendBlockReason === 'waiting_on_approval' ||
     sendBlockReason === 'waiting_on_user_input' ||
     sendBlockReason === 'thread_unavailable';
+  const transcriptSaysMirrorWorking = Boolean(
+    transcript &&
+      !isHardSendBlock &&
+      (transcript.activeTurnId?.startsWith(MIRROR_STREAMING_TURN_PREFIX) ||
+        (transcript.sendState.reason === 'thread_changed' &&
+          transcript.sendState.label === 'Codex is working'))
+  );
+  const isAgentWorking = forceWorking || transcriptSaysMirrorWorking;
   const canUseComposer = Boolean(
     sendMessage && !sending && (transcript?.sendState.canSend || (isAgentWorking && !isHardSendBlock))
   );
@@ -649,7 +669,9 @@ export function ThreadView({
       ? sendBlockedLabel
       : isAgentWorking
         ? 'Codex is working'
-        : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
+        : transcript?.sendState.label === 'Codex is working'
+          ? 'Ready'
+          : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
 
   const renderable = useMemo(() => {
     const tail = transcript?.messages ?? [];
@@ -1111,13 +1133,20 @@ export function ThreadView({
         onTouchCancel={handleMessagesTouchEnd}
       >
         {loadingOlder ? (
-          <p className="codex-thread-older-status">Loading older messages...</p>
+          <div className="codex-thread-loading-older">
+            <Spinner size={14} label="Loading older messages" />
+            <span>Loading older messages…</span>
+          </div>
         ) : null}
         {olderError ? <p className="codex-thread-older-error">{olderError}</p> : null}
         {!loadingOlder && !hasMoreOlder && olderMessages.length > 0 ? (
           <p className="codex-thread-older-status">Beginning of conversation.</p>
         ) : null}
-        {loading ? <p className="codex-thread-placeholder">Loading conversation...</p> : null}
+        {loading ? (
+          <p className="codex-thread-placeholder">
+            <Spinner size={14} label="Loading conversation" /> Loading conversation…
+          </p>
+        ) : null}
         {!loading && !transcript && !error ? (
           <p className="codex-thread-placeholder">Transcript is unavailable.</p>
         ) : null}
@@ -1304,9 +1333,9 @@ export function ThreadView({
                 className="codex-composer-send"
                 type="submit"
                 disabled={!canSend}
-                aria-label="Send message"
+                aria-label={sending ? 'Sending' : 'Send message'}
               >
-                <ArrowUp size={16} />
+                {sending ? <Spinner size={16} /> : <ArrowUp size={16} />}
               </button>
             </div>
           </div>
@@ -1524,7 +1553,13 @@ function PendingRequestRow({
             onClick={() => void submit('accept', 'accept')}
             disabled={Boolean(submitting)}
           >
-            {submitting === 'accept' ? 'Approving…' : 'Approve'}
+            {submitting === 'accept' ? (
+              <>
+                <Spinner size={14} /> Approving…
+              </>
+            ) : (
+              'Approve'
+            )}
           </button>
           <button
             type="button"
@@ -1532,7 +1567,13 @@ function PendingRequestRow({
             onClick={() => void submit('acceptForSession', 'acceptForSession')}
             disabled={Boolean(submitting)}
           >
-            {submitting === 'acceptForSession' ? 'Approving…' : 'Approve for session'}
+            {submitting === 'acceptForSession' ? (
+              <>
+                <Spinner size={14} /> Approving…
+              </>
+            ) : (
+              'Approve for session'
+            )}
           </button>
           <button
             type="button"
@@ -1540,7 +1581,13 @@ function PendingRequestRow({
             onClick={() => void submit('decline', 'decline')}
             disabled={Boolean(submitting)}
           >
-            {submitting === 'decline' ? 'Declining…' : 'Decline'}
+            {submitting === 'decline' ? (
+              <>
+                <Spinner size={14} /> Declining…
+              </>
+            ) : (
+              'Decline'
+            )}
           </button>
         </div>
       ) : (
