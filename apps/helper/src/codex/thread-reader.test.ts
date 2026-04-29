@@ -41,6 +41,24 @@ describe('Codex thread reader', () => {
     expect(mapped).not.toHaveProperty('rollout_path');
   });
 
+  it('maps sqlite model and reasoning effort into thread summaries', () => {
+    const mapped = mapSqliteThreadRow({
+      id: 'thread-1',
+      title: 'Fix model chip',
+      cwd: '/Users/me/projects/CodexPulse',
+      updated_at_ms: 1777133990620,
+      archived: 0,
+      rollout_path: '/Users/me/.codex/sessions/private-rollout.jsonl',
+      model: 'gpt-5.5',
+      reasoning_effort: 'high'
+    });
+
+    expect(mapped).toMatchObject({
+      model: 'gpt-5.5',
+      reasoningEffort: 'high'
+    });
+  });
+
   it('detects waiting approval and error signals from rollout text without exposing raw content', () => {
     const signals = readRolloutSignals([
       '{"type":"event_msg","message":"waiting for approval"}',

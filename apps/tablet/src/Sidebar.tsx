@@ -189,7 +189,10 @@ export function Sidebar({
     const attentionCount = threads.reduce(
       (acc, thread) =>
         acc +
-        (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity) ? 1 : 0),
+        (threadNeedsReview(thread, seenThreadActivity) ||
+        (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity))
+          ? 1
+          : 0),
       0
     );
     const healthLabel = health.status === 'ok' ? 'OK' : health.status === 'degraded' ? 'DEG' : 'DOWN';
@@ -257,10 +260,12 @@ export function Sidebar({
               ) : null}
               {group.threads.map((thread) => {
                 const active = thread.threadId === activeThreadId;
-                const tone = statusTone[thread.status];
+                const needsReview = threadNeedsReview(thread, seenThreadActivity);
+                const tone = needsReview ? 'yellow' : statusTone[thread.status];
                 const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
                 const showAttentionDot =
                   isWorking ||
+                  needsReview ||
                   (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
                 const initial = (group.workspace.trim().charAt(0) || '·').toUpperCase();
 
@@ -396,8 +401,11 @@ export function Sidebar({
                 const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
                 const isWaitingApproval = thread.status === 'waiting_approval';
                 const isCompacting = thread.status === 'compacting';
+                const needsReview = threadNeedsReview(thread, seenThreadActivity);
+                const dotTone = needsReview ? 'yellow' : statusTone[thread.status];
                 const showDot =
                   isWorking ||
+                  needsReview ||
                   isWaitingApproval ||
                   isCompacting ||
                   (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
@@ -413,12 +421,14 @@ export function Sidebar({
                       <span className="codex-sidebar-thread-dot-slot" aria-hidden="true">
                         {showDot ? (
                           <span
-                            className={`codex-sidebar-thread-dot tone-${statusTone[thread.status]} ${isWorking ? 'is-working' : ''}`}
+                            className={`codex-sidebar-thread-dot tone-${dotTone} ${isWorking ? 'is-working' : ''}`}
                           />
                         ) : null}
                       </span>
                       <span className="codex-sidebar-thread-title">{thread.title}</span>
-                      {isWaitingApproval ? (
+                      {needsReview ? (
+                        <span className="codex-sidebar-thread-state is-review">Review</span>
+                      ) : isWaitingApproval ? (
                         <span className="codex-sidebar-thread-state">Awaiting approval</span>
                       ) : isCompacting ? (
                         <span className="codex-sidebar-thread-state is-compacting">Compacting</span>
@@ -464,4 +474,8 @@ function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, nu
   const seenAt = seenThreadActivity[thread.threadId] ?? 0;
   const activityAt = Date.parse(thread.lastActivityAt);
   return Number.isFinite(activityAt) && activityAt > seenAt;
+}
+
+function threadNeedsReview(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
+  return thread.status === 'idle' && hasUnseenActivity(thread, seenThreadActivity);
 }

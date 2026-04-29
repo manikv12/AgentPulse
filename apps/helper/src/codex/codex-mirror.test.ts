@@ -296,6 +296,150 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('exposes pending approval payloads via onPendingApprovalsChange and getPendingApprovalRequests', () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onPendingApprovalsChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onPendingApprovalsChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-approval',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['conversationState', 'requests', 0],
+            value: {
+              id: 'permission-request-1',
+              method: 'item/permissions/requestApproval',
+              params: {
+                turnId: 'turn-7',
+                reason: 'Allow Codex to use Microsoft Teams?',
+                permissions: { network: { enabled: true } }
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(onPendingApprovalsChange).toHaveBeenCalledWith({
+      threadId: 'thread-approval',
+      requests: [
+        {
+          id: 'permission-request-1',
+          method: 'item/permissions/requestApproval',
+          params: {
+            turnId: 'turn-7',
+            reason: 'Allow Codex to use Microsoft Teams?',
+            permissions: { network: { enabled: true } }
+          },
+          turnId: 'turn-7'
+        }
+      ]
+    });
+
+    expect(mirror.getPendingApprovalRequests('thread-approval')).toEqual([
+      expect.objectContaining({
+        id: 'permission-request-1',
+        method: 'item/permissions/requestApproval',
+        turnId: 'turn-7'
+      })
+    ]);
+
+    // Once Codex marks the request completed, the helper should fire an empty
+    // change and the getter should return [] — that's how the tablet learns
+    // to clear the approval card.
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-approval',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'replace',
+            path: ['conversationState', 'requests', 0, 'isCompleted'],
+            value: true
+          }
+        ]
+      }
+    });
+
+    expect(onPendingApprovalsChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-approval',
+      requests: []
+    });
+    expect(mirror.getPendingApprovalRequests('thread-approval')).toEqual([]);
+    mirror.dispose();
+  });
+
+  it('exposes pending MCP elicitation approvals from Computer Use', () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onPendingApprovalsChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onPendingApprovalsChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-approval',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['conversationState', 'requests', 0],
+            value: {
+              id: 'mcp-approval-1',
+              method: 'mcpServer/elicitation/request',
+              params: {
+                threadId: 'thread-approval',
+                turnId: 'turn-7',
+                serverName: 'computer-use',
+                mode: 'form',
+                message: 'Allow Codex to use Microsoft Teams?',
+                _meta: {
+                  codex_approval_kind: 'mcp_tool_call',
+                  connector_id: 'computer-use',
+                  connector_name: 'Computer Use',
+                  tool_params: { app: 'Microsoft Teams' },
+                  persist: ['session', 'always']
+                },
+                requestedSchema: {
+                  type: 'object',
+                  properties: {}
+                }
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadWaitingForApproval('thread-approval')).toBe(true);
+    expect(onPendingApprovalsChange).toHaveBeenCalledWith({
+      threadId: 'thread-approval',
+      requests: [
+        expect.objectContaining({
+          id: 'mcp-approval-1',
+          method: 'mcpServer/elicitation/request',
+          turnId: 'turn-7'
+        })
+      ]
+    });
+    expect(mirror.getPendingApprovalRequests('thread-approval')).toEqual([
+      expect.objectContaining({
+        id: 'mcp-approval-1',
+        method: 'mcpServer/elicitation/request',
+        turnId: 'turn-7'
+      })
+    ]);
+    mirror.dispose();
+  });
+
   it('does not mark ready when a command completes but the latest turn is still active', async () => {
     const { ipc, setReady, emitBroadcast } = createMockIpc();
     setReady(true);
@@ -547,6 +691,31 @@ describe('codex mirror', () => {
       model: 'gpt-5.5',
       reasoningEffort: 'high'
     });
+    mirror.dispose();
+  });
+
+  it('sends MCP elicitation approval responses through the Codex follower IPC method', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({ ok: true });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await mirror.respondToApproval(
+      'thread-abc',
+      'mcp-approval-1',
+      'mcpServer/elicitation/request',
+      { action: 'accept', content: {}, _meta: null }
+    );
+
+    expect(sendRequest).toHaveBeenCalledWith(
+      'thread-follower-submit-mcp-server-elicitation-response',
+      {
+        conversationId: 'thread-abc',
+        requestId: 'mcp-approval-1',
+        response: { action: 'accept', content: {}, _meta: null }
+      }
+    );
     mirror.dispose();
   });
 

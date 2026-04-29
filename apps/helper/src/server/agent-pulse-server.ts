@@ -11,9 +11,11 @@ import {
   ApprovalDecisionRequestSchema,
   ApprovalDecisionResponseSchema,
   CatalogCommandsResponseSchema,
+  CatalogModelSchema,
   CatalogModelsResponseSchema,
   CatalogPluginsResponseSchema,
   CatalogSkillsResponseSchema,
+  DeviceSessionRecoveryRequestSchema,
   DeviceRevokeRequestSchema,
   HelperHealthSchema,
   LiveEventSchema,
@@ -37,9 +39,16 @@ import {
   ThreadStopResponseSchema,
   ThreadTranscriptSchema,
   OlderThreadMessagesResponseSchema,
+  SeenThreadActivityImportRequestSchema,
+  SeenThreadActivityMarkRequestSchema,
+  SeenThreadActivityResponseSchema,
+  resolveThreadStatus,
+  type CollaborationModeKind,
   type ChatAttachment,
+  type CatalogModel,
   type HelperHealth,
   type LiveEvent,
+  type PendingApprovalRequest,
   type Project,
   type RemoteActivityLogEntry,
   type RemoteAccessSettings,
@@ -57,6 +66,7 @@ import { SendBlockedError } from '../codex/app-server-chat';
 import type { CatalogReader } from '../codex/catalog';
 import type { createThreadOpener } from '../codex/thread-opener';
 import { debugLog } from '../debug';
+import type { SeenThreadStore } from './seen-thread-store';
 import type { HelperSettings, HelperSettingsStore } from './settings';
 import { createTabletDevProxy, type TabletDevProxy } from './tablet-dev-proxy';
 
@@ -69,40 +79,74 @@ type LocalAttachment = {
 };
 
 const GLOBAL_ADMIN_LOGIN_LIMIT_KEY = '__global_admin_login_failures__';
+const DESKTOP_INTEREST_TTL_MS = 30 * 60_000;
+const MANUAL_OPEN_COOLDOWN_MS = 2_500;
+const AUTO_DESKTOP_REFRESH_SETTLE_MS = 800;
+const AUTO_DESKTOP_REFRESH_COOLDOWN_MS = 10_000;
+
+type DesktopRefreshCandidate = {
+  threadId: string;
+  turnId: string;
+};
 
 export type AppServerChatBridge = {
   isConnected(): boolean;
   readTranscript(threadId: string): Promise<ThreadTranscript>;
   readFullTranscript?(threadId: string): Promise<ThreadTranscript>;
+  subscribeThread?(threadId: string): Promise<void>;
+  listLoadedThreadIds?(): Promise<Set<string>>;
+  listLoadedThreadStatuses?(): Promise<Map<string, Thread['status']>>;
+  applyLiveState?(transcript: ThreadTranscript, threadId: string): ThreadTranscript;
   sendMessage(
     threadId: string,
     text: string,
-    options?: { model?: string; effort?: string }
+    options?: { model?: string; effort?: string; collaborationMode?: CollaborationModeKind }
   ): Promise<ThreadMessageResponse>;
-  startThread?(cwd: string): Promise<Thread>;
+  startThread?(
+    cwd: string,
+    options?: { model?: string; reasoningEffort?: string }
+  ): Promise<Thread>;
+  interruptTurn?(threadId: string): Promise<void>;
+  compactThread?(threadId: string): Promise<void>;
+  startReview?(threadId: string): Promise<void>;
+  respondToApproval?(
+    threadId: string,
+    requestId: string,
+    method: string,
+    response: unknown
+  ): Promise<void>;
+  getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
+  isThreadStreaming?(threadId: string): boolean;
+  isThreadCompacting?(threadId: string): boolean;
+  isThreadWaitingForApproval?(threadId: string): boolean;
+  onLiveEvent?(listener: (event: LiveEvent) => void): () => void;
+  onLiveStateChange?(listener: (threadId: string) => void): () => void;
+  onTurnCompleted?(listener: (event: { threadId: string; turnId: string }) => void): () => void;
+  onConnectionChange?(listener: (connected: boolean) => void): () => void;
+  ensureConnected?(): Promise<void>;
+  listModels?(): Promise<CatalogModel[]>;
 };
 
+// IPC mirror to a running Codex desktop window. Used as the preferred transport
+// for sending messages and changing the model so the desktop window mirrors
+// what the tablet does — same diff view, same model picker animation. Falls
+// back to the spawned app-server subprocess when the mirror isn't available.
 export type CodexMirrorBridge = {
   isConnected(): boolean;
-  sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse>;
-  interruptTurn?(threadId: string): Promise<void>;
+  sendMessage(
+    threadId: string,
+    text: string,
+    options?: {
+      collaborationMode?: CollaborationModeKind;
+      model?: string;
+      effort?: string;
+    }
+  ): Promise<ThreadMessageResponse>;
   setModelAndReasoning?(
     threadId: string,
     modelSlug: string,
     reasoningEffort?: string
   ): Promise<void>;
-  respondToApproval?(
-    threadId: string,
-    requestId: string,
-    method:
-      | 'item/commandExecution/requestApproval'
-      | 'item/fileChange/requestApproval'
-      | 'item/permissions/requestApproval',
-    response: unknown
-  ): Promise<void>;
-  isThreadStreaming?(threadId: string): boolean;
-  isThreadCompacting?(threadId: string): boolean;
-  isThreadWaitingForApproval?(threadId: string): boolean;
   isThreadOwned?(threadId: string): boolean;
   waitForOwnership?(threadId: string, timeoutMs: number): Promise<boolean>;
 };
@@ -118,6 +162,7 @@ export type AgentPulseServerOptions = {
   appServer?: AppServerChatBridge;
   mirror?: CodexMirrorBridge;
   catalog?: CatalogReader;
+  seenThreadStore?: SeenThreadStore;
   usageProvider?: (threadId: string) => Promise<import('@agent-pulse/shared').ThreadUsage | undefined>;
   version: string;
   tabletDistDir?: string;
@@ -146,7 +191,7 @@ export async function startAgentPulseServer(
 ): Promise<RunningAgentPulseServer> {
   const hub = new LiveEventHub();
   const tabletDevProxy = options.tabletDevUrl ? createTabletDevProxy(options.tabletDevUrl) : undefined;
-  const { app, transformTranscript } = createApp(options, hub, tabletDevProxy);
+  const { app, transformTranscript, dispose } = createApp(options, hub, tabletDevProxy);
 
   const hostname = options.settings.lanEnabled ? '0.0.0.0' : '127.0.0.1';
   const server = await new Promise<Server>((resolve, reject) => {
@@ -175,7 +220,8 @@ export async function startAgentPulseServer(
     options.threadProvider,
     hub,
     options.appServer,
-    transformTranscript
+    transformTranscript,
+    options.seenThreadStore
   );
   const detachCatalog = options.catalog?.onChange((kind) => {
     hub.broadcast({ type: 'catalog/changed', payload: { kind } });
@@ -189,6 +235,7 @@ export async function startAgentPulseServer(
     hub,
     async stop() {
       clearInterval(poller);
+      dispose();
       detachCatalog?.();
       hub.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -199,6 +246,7 @@ export async function startAgentPulseServer(
 type CreatedApp = {
   app: Hono;
   transformTranscript: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript;
+  dispose: () => void;
 };
 
 function createApp(
@@ -210,8 +258,8 @@ function createApp(
   const startedAt = Date.now();
   const localAttachments = new Map<string, LocalAttachment>();
   // Pending model/effort overrides applied on the next turn/start for that thread.
-  // Used by /threads/:id/model when no Codex window owns the thread (the IPC follower
-  // path requires ownership). The override is consumed when the user sends the next
+  // Used by /threads/:id/model when no Codex window owns the thread. The override
+  // is consumed when the user sends the next
   // message — at that point we pass it directly to turn/start, no ownership needed.
   const pendingModelOverrides = new Map<string, { model: string; effort?: string }>();
   // Last-known-good transcript per thread, updated whenever any path successfully reads
@@ -219,10 +267,21 @@ function createApp(
   // is slow or upstream Codex is degraded — we'd rather return slightly stale data fast
   // than block long enough for the cloudflared tunnel to cancel the request.
   const transcriptCache = new Map<string, ThreadTranscript>();
+  const liveSubscribedThreadIds = new Set<string>();
   // Codex's desktop "New chat" is a draft until the first user message. `thread/start`
   // returns an id immediately, but the thread may not appear in the normal session list
   // and transcript reads can say "not materialized yet" until that first turn exists.
   const draftThreads = new Map<string, Thread>();
+  const desktopInterestUntilByThread = new Map<string, number>();
+  const manualOpenInFlight = new Map<string, Promise<{ ok: boolean; error?: string }>>();
+  const lastManualOpenAtByThread = new Map<string, number>();
+  const agentPulseOwnedTurnKeys = new Set<string>();
+  const completedDesktopRefreshTurnKeys = new Set<string>();
+  const completedTranscriptTurnKeys = new Set<string>();
+  const lastAutoRefreshAtByThread = new Map<string, number>();
+  let pendingAutoDesktopRefresh: DesktopRefreshCandidate | undefined;
+  let autoDesktopRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let autoDesktopRefreshInFlight = false;
   let currentSettings = options.settings;
   const remoteActivity: RemoteActivityLogEntry[] = [];
   const recordRemoteActivity = (
@@ -269,6 +328,144 @@ function createApp(
     windowMs: 1000,
     blockMs: 10 * 1000
   });
+  const ensureAppServerLiveSubscription = async (threadId: string): Promise<void> => {
+    if (!options.appServer?.subscribeThread || liveSubscribedThreadIds.has(threadId)) {
+      return;
+    }
+    liveSubscribedThreadIds.add(threadId);
+    try {
+      await options.appServer.subscribeThread(threadId);
+    } catch (error) {
+      liveSubscribedThreadIds.delete(threadId);
+      debugLog('[server] app-server live subscribe failed', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+  const completedTurnKey = (threadId: string, turnId: string): string => `${threadId}:${turnId}`;
+  const markDesktopInterest = (threadId: string): void => {
+    desktopInterestUntilByThread.set(threadId, Date.now() + DESKTOP_INTEREST_TTL_MS);
+  };
+  const hasDesktopInterest = (threadId: string): boolean => {
+    const expiresAt = desktopInterestUntilByThread.get(threadId);
+    if (!expiresAt) {
+      return false;
+    }
+    if (expiresAt <= Date.now()) {
+      desktopInterestUntilByThread.delete(threadId);
+      return false;
+    }
+    return true;
+  };
+  const openThreadWithMiniRefresh = async (threadId: string): Promise<{ ok: boolean; error?: string }> => {
+    const now = Date.now();
+    const lastManualOpenAt = lastManualOpenAtByThread.get(threadId) ?? 0;
+    if (hasDesktopInterest(threadId) && now - lastManualOpenAt < MANUAL_OPEN_COOLDOWN_MS) {
+      return { ok: true };
+    }
+
+    const existing = manualOpenInFlight.get(threadId);
+    if (existing) {
+      return existing;
+    }
+
+    const opening = options.opener
+      .openThread(threadId, { refreshMode: 'mini-window' })
+      .then((result) => {
+        if (result.ok) {
+          markDesktopInterest(threadId);
+          lastManualOpenAtByThread.set(threadId, Date.now());
+        }
+        return result;
+      })
+      .finally(() => {
+        manualOpenInFlight.delete(threadId);
+      });
+    manualOpenInFlight.set(threadId, opening);
+    return opening;
+  };
+  const rememberAgentPulseTurn = (threadId: string, turnId: string, mode: ThreadMessageResponse['mode']): void => {
+    if (mode === 'start') {
+      agentPulseOwnedTurnKeys.add(completedTurnKey(threadId, turnId));
+    }
+  };
+  const isEligibleForAutoDesktopRefresh = (candidate: DesktopRefreshCandidate): boolean => {
+    if (!hasDesktopInterest(candidate.threadId)) {
+      return false;
+    }
+    const lastRefreshAt = lastAutoRefreshAtByThread.get(candidate.threadId) ?? 0;
+    return Date.now() - lastRefreshAt >= AUTO_DESKTOP_REFRESH_COOLDOWN_MS;
+  };
+  const drainAutoDesktopRefreshQueue = async (): Promise<void> => {
+    if (autoDesktopRefreshInFlight) {
+      return;
+    }
+    autoDesktopRefreshInFlight = true;
+    try {
+      while (pendingAutoDesktopRefresh) {
+        const candidate = pendingAutoDesktopRefresh;
+        pendingAutoDesktopRefresh = undefined;
+        if (!isEligibleForAutoDesktopRefresh(candidate)) {
+          continue;
+        }
+        const codexFrontmost = await options.opener.isCodexFrontmost?.().catch(() => false);
+        if (codexFrontmost) {
+          continue;
+        }
+        const result = await options.opener.openThread(candidate.threadId, { refreshMode: 'mini-window' });
+        if (result.ok) {
+          lastAutoRefreshAtByThread.set(candidate.threadId, Date.now());
+        }
+      }
+    } finally {
+      autoDesktopRefreshInFlight = false;
+      if (pendingAutoDesktopRefresh) {
+        void drainAutoDesktopRefreshQueue();
+      }
+    }
+  };
+  const scheduleAutoDesktopRefresh = (candidate: DesktopRefreshCandidate): void => {
+    pendingAutoDesktopRefresh = candidate;
+    if (autoDesktopRefreshTimer) {
+      clearTimeout(autoDesktopRefreshTimer);
+    }
+    autoDesktopRefreshTimer = setTimeout(() => {
+      autoDesktopRefreshTimer = undefined;
+      void drainAutoDesktopRefreshQueue();
+    }, AUTO_DESKTOP_REFRESH_SETTLE_MS);
+  };
+  const handleAppServerTurnCompleted = (candidate: DesktopRefreshCandidate): void => {
+    const key = completedTurnKey(candidate.threadId, candidate.turnId);
+    if (!completedTranscriptTurnKeys.has(key)) {
+      completedTranscriptTurnKeys.add(key);
+      void broadcastFreshTranscript(candidate.threadId);
+    }
+    if (!agentPulseOwnedTurnKeys.delete(key)) {
+      return;
+    }
+    if (completedDesktopRefreshTurnKeys.has(key)) {
+      return;
+    }
+    if (!hasDesktopInterest(candidate.threadId)) {
+      return;
+    }
+    completedDesktopRefreshTurnKeys.add(key);
+    scheduleAutoDesktopRefresh(candidate);
+  };
+  const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
+    if (!options.appServer?.readTranscript) {
+      return;
+    }
+    const transcript = await Promise.resolve(options.appServer.readTranscript(threadId)).catch(
+      () => undefined
+    );
+    if (!transcript) {
+      return;
+    }
+    const visibleTranscript = transformTranscript(transcript, threadId);
+    hub.broadcast({ type: 'thread/transcript/changed', payload: visibleTranscript });
+  };
 
   app.use('*', async (context, next) => {
     const ip = requestIp(context);
@@ -391,6 +588,36 @@ function createApp(
       deviceId: device.deviceId,
       sourceIp: ip,
       reason: parsed.existingDeviceId ? 'device reconnected' : 'device paired'
+    });
+
+    return context.json(
+      PairResponseSchema.parse({
+        token: device.token,
+        deviceId: device.deviceId,
+        deviceName: device.deviceName
+      })
+    );
+  });
+
+  app.post('/device/session/recover', async (context) => {
+    const parsed = DeviceSessionRecoveryRequestSchema.parse(await context.req.json());
+    const device = await options.registry.recoverDeviceSession(parsed.deviceId, parsed.fingerprint);
+
+    if (!device) {
+      recordRemoteActivity({
+        type: 'auth_failure',
+        deviceId: parsed.deviceId,
+        sourceIp: requestIp(context),
+        reason: 'session recovery failed'
+      });
+      return context.json({ error: 'invalid' }, 401);
+    }
+
+    recordRemoteActivity({
+      type: 'reconnect',
+      deviceId: device.deviceId,
+      sourceIp: requestIp(context),
+      reason: 'device session recovered'
     });
 
     return context.json(
@@ -652,6 +879,51 @@ function createApp(
     }));
   });
 
+  // Per-thread "user has reviewed this" timestamps. The helper is the source of
+  // truth so every paired device sees the same state. Entries auto-expire after
+  // 14 days inside SeenThreadStore.
+  app.get('/threads/seen-activity', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    const entries = options.seenThreadStore?.getAll() ?? {};
+    return context.json(SeenThreadActivityResponseSchema.parse({ entries }));
+  });
+
+  app.post('/threads/seen-activity/import', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    if (!options.seenThreadStore) {
+      return context.json({ error: 'Seen-activity store unavailable.' }, 503);
+    }
+    const parsed = SeenThreadActivityImportRequestSchema.parse(await context.req.json());
+    await options.seenThreadStore.importIfMissing(parsed.entries);
+    return context.json(
+      SeenThreadActivityResponseSchema.parse({ entries: options.seenThreadStore.getAll() })
+    );
+  });
+
+  app.post('/threads/:threadId/seen', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    if (!options.seenThreadStore) {
+      return context.json({ error: 'Seen-activity store unavailable.' }, 503);
+    }
+    const threadId = context.req.param('threadId');
+    const parsed = SeenThreadActivityMarkRequestSchema.parse(await context.req.json());
+    await options.seenThreadStore.markSeen(threadId, parsed.seenAt);
+    hub.broadcast({
+      type: 'thread/seen-activity/changed',
+      payload: { threadId, seenAt: parsed.seenAt }
+    });
+    return context.json({ ok: true });
+  });
+
   app.post('/threads/new', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -692,10 +964,14 @@ function createApp(
     }
 
     try {
-      const thread = await options.appServer.startThread(cwd);
+      const thread = await options.appServer.startThread(cwd, {
+        ...(parsed.modelSlug ? { model: parsed.modelSlug } : {}),
+        ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+      });
       draftThreads.set(thread.threadId, thread);
       hub.broadcast({ type: 'thread/upsert', payload: thread });
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+
       return context.json(ThreadCreateResponseSchema.parse({ thread }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -719,6 +995,8 @@ function createApp(
 
     const threadId = context.req.param('threadId');
     const messageLimit = parseTranscriptMessageLimit(context.req.query('limit'));
+
+    await settleWithin(ensureAppServerLiveSubscription(threadId), 750);
 
     // Race the live transcript read against a short timeout. When Codex's app-server is
     // healthy this resolves in milliseconds; when it's degraded (mcp transport flapping,
@@ -874,7 +1152,10 @@ function createApp(
       return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
     }
 
-    if (!options.appServer && !options.mirror) {
+    await options.appServer?.ensureConnected?.().catch(() => undefined);
+    const mirrorReady = options.mirror?.isConnected() === true;
+    const appServerReady = options.appServer?.isConnected() === true;
+    if (!mirrorReady && !appServerReady) {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
 
@@ -882,58 +1163,95 @@ function createApp(
 
     try {
       const threadId = context.req.param('threadId');
-      const override = pendingModelOverrides.get(threadId);
-      // Send routing:
-      //   1. Always prefer the IPC mirror when it's connected. That path goes through
-      //      `thread-follower-start-turn`, so the message appears live in the Codex desktop
-      //      window — exactly like a message sent from the VS Code extension. We pair it with
-      //      `runWithFollowerOwnership`, which auto-opens the thread on the Mac and waits for
-      //      the ownership broadcast before sending. (Codex follower discovery requires
-      //      `getThreadRole === 'owner'`; without that the IPC returns
-      //      `client-cannot-handle-request`.)
-      //   2. Only fall back to the spawned app-server subprocess when (a) the mirror isn't
-      //      connected at all, or (b) the IPC path fails with `thread_unavailable` (Codex
-      //      isn't running, or the user dismissed the focus prompt). The fallback is what
-      //      delivers any queued model override, which app-server's `turn/start` accepts via
-      //      `{model, effort}` directly.
-      const mirrorReady = options.mirror?.isConnected() === true;
-      const appServerReady = options.appServer?.isConnected() === true;
-      if (!mirrorReady && !appServerReady) {
-        return context.json({ error: 'Codex connection unavailable.' }, 503);
+
+      // Slash commands the Codex desktop intercepts client-side. Sending the
+      // raw text "/compact" as a turn would just be a literal user message;
+      // instead we route to the matching v2 RPC so the actual command runs.
+      // Detection is deliberately strict: only when the text is *just* the
+      // command (with optional whitespace) — anything like "/compact please"
+      // falls through and behaves as a normal user message.
+      const slashCommand = matchBareSlashCommand(parsed.text);
+      if (slashCommand) {
+        const handled = await handleSlashCommand(slashCommand, threadId, options.appServer, hub);
+        if (handled) {
+          return context.json(handled);
+        }
       }
 
+      const override = pendingModelOverrides.get(threadId);
+
+      // Send routing:
+      //   1. Prefer the IPC mirror when it's connected. That path goes through
+      //      `thread-follower-start-turn`, so the message appears live in the Codex
+      //      desktop window — same diff view, same model picker animation.
+      //      runWithFollowerOwnership auto-opens the thread on the Mac and waits
+      //      for ownership before sending.
+      //   2. Fall back to the spawned app-server subprocess when (a) the mirror
+      //      isn't connected, or (b) the IPC path fails with thread_unavailable
+      //      (Codex isn't running, or the user dismissed the focus prompt). The
+      //      fallback is also what delivers any queued model override, since
+      //      the app-server's turn/start accepts `{model, effort}` directly.
       const sendViaAppServer = async () => {
         if (!options.appServer) {
           throw new SendBlockedError('thread_unavailable', 'Codex app-server is not running.');
         }
-        const sendOptions = override
-          ? { model: override.model, ...(override.effort ? { effort: override.effort } : {}) }
-          : undefined;
+        const sendOptions =
+          override || parsed.collaborationMode
+            ? {
+                ...(override ? { model: override.model } : {}),
+                ...(override?.effort ? { effort: override.effort } : {}),
+                ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
+              }
+            : undefined;
         return options.appServer.sendMessage(threadId, parsed.text, sendOptions);
       };
+
+      // The mirror path runs through the desktop window's follower IPC, which
+      // forwards turn/start to Codex's app-server. So we pass the same options
+      // we'd pass to the app-server fallback — collaborationMode (plan), the
+      // queued model/effort override — and the desktop UI ends up in plan mode
+      // exactly like Shift+Tab in the local Codex window.
+      const mirrorSendOptions =
+        override || parsed.collaborationMode
+          ? {
+              ...(override ? { model: override.model } : {}),
+              ...(override?.effort ? { effort: override.effort } : {}),
+              ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
+            }
+          : undefined;
 
       let result: ThreadMessageResponse;
       if (mirrorReady && options.mirror) {
         try {
           result = ThreadMessageResponseSchema.parse(
             await runWithFollowerOwnership(
-              () => options.mirror!.sendMessage(threadId, parsed.text),
+              () => options.mirror!.sendMessage(threadId, parsed.text, mirrorSendOptions),
               options.opener,
               threadId,
               options.mirror
             )
           );
         } catch (error) {
-          // The mirror couldn't deliver — fall back to the spawned app-server subprocess so
-          // the user's send doesn't fail outright.
-          if (
-            error instanceof SendBlockedError &&
-            error.reason === 'thread_unavailable' &&
-            appServerReady
-          ) {
+          // Any mirror failure (thread_unavailable, IPC structured error,
+          // unsupported payload field, timeout, etc.) should fall back to the
+          // app-server subprocess as long as it's ready — the user's send
+          // still goes through, just without the live desktop animation.
+          // Without this fallback a single mirror hiccup (e.g. plan-mode
+          // payload rejected by an older Codex build) would surface as a red
+          // "Error submitting message" banner to the user.
+          if (appServerReady) {
             console.warn('[send] mirror failed; falling back to app-server', {
               threadId,
-              error: error.message
+              error:
+                error instanceof Error
+                  ? error.message
+                  : (() => {
+                      try {
+                        return JSON.stringify(error);
+                      } catch {
+                        return String(error);
+                      }
+                    })()
             });
             result = ThreadMessageResponseSchema.parse(await sendViaAppServer());
           } else {
@@ -943,9 +1261,10 @@ function createApp(
       } else if (appServerReady) {
         result = ThreadMessageResponseSchema.parse(await sendViaAppServer());
       } else {
-        // Should be unreachable due to the early-return above, but guard for type narrowing.
         return context.json({ error: 'Codex connection unavailable.' }, 503);
       }
+
+      rememberAgentPulseTurn(threadId, result.turnId, result.mode);
 
       // Once the message is on the wire, the override has effectively been delivered.
       if (override) {
@@ -974,7 +1293,12 @@ function createApp(
       if (error instanceof SendBlockedError) {
         return context.json({ error: error.message, reason: error.reason }, 409);
       }
-      return context.json({ error: 'Codex connection unavailable.' }, 503);
+      // Log the underlying failure — without this, the tablet only sees the
+      // generic 503 below and we lose the codex stderr / params that explain
+      // *why* the send failed.
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error('[send] threadId=%s failed:', context.req.param('threadId'), detail);
+      return context.json({ error: `Codex send failed: ${detail}` }, 503);
     }
   });
 
@@ -984,18 +1308,54 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    if (!options.mirror?.isConnected() || !options.mirror.interruptTurn) {
+    await options.appServer?.ensureConnected?.().catch(() => undefined);
+    if (!options.appServer?.isConnected() || !options.appServer.interruptTurn) {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
 
     const threadId = context.req.param('threadId');
+
+    // If Codex is currently waiting on a user-input or approval request, the
+    // turn is "active but blocked" — turn/interrupt would either no-op or get
+    // queued behind the response. Decline the pending requests first so Codex
+    // unblocks itself; this is enough to put a `requestUserInput` thread back
+    // into idle. Best-effort: failures here don't prevent the interrupt.
+    if (options.appServer.getPendingApprovalRequests && options.appServer.respondToApproval) {
+      const pending = options.appServer.getPendingApprovalRequests(threadId);
+      for (const request of pending) {
+        try {
+          if (request.method === 'item/tool/requestUserInput') {
+            // Empty answers map = "user skipped"; Codex aborts the turn cleanly.
+            await options.appServer.respondToApproval(threadId, request.id, request.method, {
+              answers: {}
+            });
+          } else if (request.method === 'mcpServer/elicitation/request') {
+            await options.appServer.respondToApproval(threadId, request.id, request.method, {
+              action: 'cancel',
+              content: null,
+              _meta: null
+            });
+          } else {
+            await options.appServer.respondToApproval(
+              threadId,
+              request.id,
+              request.method,
+              'decline'
+            );
+          }
+        } catch (declineError) {
+          debugLog('[stop] failed to decline pending request before interrupting', {
+            threadId,
+            requestId: request.id,
+            method: request.method,
+            error: declineError instanceof Error ? declineError.message : String(declineError)
+          });
+        }
+      }
+    }
+
     try {
-      await runWithFollowerOwnership(
-        () => options.mirror!.interruptTurn!(threadId),
-        options.opener,
-        threadId,
-        options.mirror
-      );
+      await options.appServer.interruptTurn(threadId);
       hub.broadcast({
         type: 'thread/streaming-changed',
         payload: { threadId, isStreaming: false }
@@ -1003,6 +1363,20 @@ function createApp(
       return context.json(ThreadStopResponseSchema.parse({ ok: true }));
     } catch (error) {
       if (error instanceof SendBlockedError) {
+        if (error.reason === 'missing_active_turn') {
+          // Codex says no turn is running — that's fine, the pending decline
+          // above already unblocked the thread. Surface success so the tablet
+          // clears the spinner and the stop button.
+          hub.broadcast({
+            type: 'thread/streaming-changed',
+            payload: { threadId, isStreaming: false }
+          });
+          hub.broadcast({
+            type: 'thread/status/changed',
+            payload: { threadId, status: 'idle' }
+          });
+          return context.json(ThreadStopResponseSchema.parse({ ok: true }));
+        }
         return context.json({ error: error.message, reason: error.reason }, 409);
       }
       return context.json({ error: 'Codex connection unavailable.' }, 503);
@@ -1016,7 +1390,7 @@ function createApp(
     }
 
     const parsed = ThreadOpenRequestSchema.parse(await context.req.json());
-    const result = await options.opener.openThread(parsed.threadId);
+    const result = await openThreadWithMiniRefresh(parsed.threadId);
     if (!result.ok) {
       return context.json(result, 503);
     }
@@ -1117,7 +1491,14 @@ function createApp(
     if (!auth.ok) {
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
-    const models = options.catalog ? await options.catalog.listModels() : [];
+    const catalogModels = options.catalog ? await options.catalog.listModels().catch(() => []) : [];
+    const appServerModels = options.appServer?.listModels
+      ? await options.appServer.listModels().catch(() => [])
+      : [];
+    const models =
+      appServerModels.length > 0
+        ? mergeModelCatalogMetadata(appServerModels, catalogModels)
+        : catalogModels;
     return context.json(CatalogModelsResponseSchema.parse({ models }));
   });
 
@@ -1148,29 +1529,41 @@ function createApp(
     }
   });
 
+  // GET the current set of approval requests Codex app-server is waiting on for a thread.
+  // The tablet hits this after reconnects so it can rebuild the approval card from the
+  // app-server request store rather than from Codex desktop IPC.
+  app.get('/threads/:threadId/pending-approvals', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    const threadId = context.req.param('threadId');
+    const requests = options.appServer?.getPendingApprovalRequests?.(threadId) ?? [];
+    return context.json({ threadId, requests });
+  });
+
   app.post('/threads/:threadId/approvals/:requestId', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
-    if (!options.mirror?.respondToApproval || !options.mirror.isConnected()) {
+    await options.appServer?.ensureConnected?.().catch(() => undefined);
+    if (!options.appServer?.respondToApproval || !options.appServer.isConnected()) {
       return context.json(
-        { error: 'Open Codex on this Mac to respond to approvals.' },
+        { error: 'Codex app-server is not available to respond to approvals.' },
         503
       );
     }
     const parsed = ApprovalDecisionRequestSchema.parse(await context.req.json());
     const threadId = context.req.param('threadId');
     const requestId = context.req.param('requestId');
-    const apply = () =>
-      options.mirror!.respondToApproval!(
+    try {
+      await options.appServer.respondToApproval(
         threadId,
         requestId,
         parsed.method,
         parsed.decision
       );
-    try {
-      await runWithFollowerOwnership(apply, options.opener, threadId, options.mirror);
       return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -1188,15 +1581,16 @@ function createApp(
     const parsed = ThreadModelUpdateRequestSchema.parse(await context.req.json());
 
     // Strategy:
-    //   1. Try to push the change live via the IPC follower path — runWithFollowerOwnership
-    //      will open the thread on the Mac if it isn't already owned, and wait for the
-    //      ownership broadcast before sending. This is the path that worked previously and
-    //      gives the user the same "GPT-5.5 -> {selected model}" desktop transition.
-    //   2. If the IPC path fails (no Codex window will accept the request — e.g. Codex isn't
-    //      running, or the user dismissed the focus prompt), queue the override locally so the
-    //      next message we send via the app-server subprocess passes `model`/`effort` directly
+    //   1. Try to push the change live via the IPC follower path so the user
+    //      sees the same "GPT-5.5 -> {selected}" picker animation in the
+    //      desktop window. runWithFollowerOwnership auto-opens the thread on
+    //      the Mac and waits for ownership before sending.
+    //   2. If the IPC path fails (Codex isn't running, or the user dismissed
+    //      the focus prompt), queue the override locally so the next message
+    //      sent via the app-server subprocess passes `model`/`effort` directly
     //      to turn/start. The override is durable until consumed.
-    // Either way the response is "ok" so the tablet UI updates its model chip optimistically.
+    // Either way we return ok so the tablet UI updates its model chip
+    // optimistically.
     let mode: 'live' | 'queued' = 'queued';
     if (options.mirror?.setModelAndReasoning && options.mirror.isConnected()) {
       const apply = () =>
@@ -1227,7 +1621,7 @@ function createApp(
         model: parsed.modelSlug,
         ...(parsed.reasoningEffort ? { effort: parsed.reasoningEffort } : {})
       });
-      debugLog('[model-change] queued for next turn', {
+      debugLog('[model-change] queued for next app-server turn', {
         threadId,
         modelSlug: parsed.modelSlug,
         reasoningEffort: parsed.reasoningEffort
@@ -1285,7 +1679,8 @@ function createApp(
   const transformTranscript = (transcript: ThreadTranscript, threadId: string): ThreadTranscript => {
     // The poller hands us a fresh transcript on every successful reconcile — cache it so
     // the HTTP fallback path always has a recent copy to serve when a live read times out.
-    const realtimeTranscript = applyMirrorStreamingState(transcript, threadId, options.mirror);
+    const realtimeTranscript =
+      options.appServer?.applyLiveState?.(transcript, threadId) ?? transcript;
     transcriptCache.set(threadId, realtimeTranscript);
     return exposeLocalAttachments(
       applyMobileSendState(realtimeTranscript, currentSettings),
@@ -1294,7 +1689,41 @@ function createApp(
     );
   };
 
-  return { app, transformTranscript };
+  const detachAppServerLiveEvent = options.appServer?.onLiveEvent?.((event) => {
+    hub.broadcast(event);
+  });
+  const detachAppServerLiveState = options.appServer?.onLiveStateChange?.((threadId) => {
+    const cached = transcriptCache.get(threadId) ?? emptyDraftTranscript(threadId);
+    const visible = transformTranscript(cached, threadId);
+    hub.broadcast({ type: 'thread/transcript/changed', payload: visible });
+  });
+  const detachAppServerTurnCompleted = options.appServer?.onTurnCompleted?.((event) => {
+    handleAppServerTurnCompleted(event);
+  });
+  const detachAppServerConnection = options.appServer?.onConnectionChange?.(() => {
+    liveSubscribedThreadIds.clear();
+    hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+  });
+  void options.appServer?.ensureConnected?.()
+    .catch(() => undefined)
+    .finally(() => {
+      hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+    });
+
+  return {
+    app,
+    transformTranscript,
+    dispose: () => {
+      if (autoDesktopRefreshTimer) {
+        clearTimeout(autoDesktopRefreshTimer);
+        autoDesktopRefreshTimer = undefined;
+      }
+      detachAppServerLiveEvent?.();
+      detachAppServerLiveState?.();
+      detachAppServerTurnCompleted?.();
+      detachAppServerConnection?.();
+    }
+  };
 }
 
 async function listProjects(
@@ -1303,29 +1732,21 @@ async function listProjects(
   return threadProvider.listProjects ? threadProvider.listProjects() : [];
 }
 
-/**
- * Wraps an IPC follower call (set-model, approval-decision, etc.) so that if Codex
- * doesn't currently own/host the conversation in any open window, we ask the desktop
- * to open the thread first, then retry. The desktop's discovery callback only accepts
- * follower requests when the receiving webview reports `getThreadRole === 'owner'`,
- * so we have to make sure a window is showing the thread before sending.
- */
-/**
- * Wraps an IPC follower call so it succeeds even when the user hasn't actively focused the
- * conversation in a Codex window. The desktop's discovery callback for follower methods
- * (`set-model-and-reasoning`, approval decisions, `start-turn`, etc.) requires
- * `getThreadRole(conversationId) === 'owner'` — that role is only established after the
- * desktop's `maybe-resume-conversation` flow finishes, which doesn't happen automatically
- * just because Codex is running.
- *
- * Strategy:
- *   1. If the mirror already saw an `streamRole.role === 'owner'` broadcast for this thread,
- *      send the request immediately.
- *   2. Otherwise, fire `codex://threads/{id}` to open/focus the thread, then wait up to
- *      `ownershipTimeoutMs` for the matching `thread-stream-state-changed` broadcast.
- *   3. Send the request. If it still fails with `thread_unavailable`, retry once after a
- *      short delay (the snapshot can race the discovery probe on first open).
- */
+function normalizeRequestedCwd(value: string): string {
+  return path.normalize(value.trim().replace(/^~(?=$|\/)/, homedir()));
+}
+
+// Codex's IPC follower discovery requires `getThreadRole === 'owner'`. If the
+// desktop window doesn't currently own the thread, the follower call returns
+// `client-cannot-handle-request` and surfaces here as a SendBlockedError with
+// reason 'thread_unavailable'. Wrap the apply call in this helper to:
+//   1. Open the thread on the Mac if it isn't owned, so the desktop window
+//      becomes the owner.
+//   2. Wait up to ownershipTimeoutMs for the matching `thread-stream-state-changed`
+//      broadcast confirming ownership.
+//   3. Send the request. If it still fails with `thread_unavailable`, retry
+//      once after a short delay (the snapshot can race the discovery probe on
+//      first open).
 async function runWithFollowerOwnership<T>(
   apply: () => Promise<T>,
   opener: ThreadOpener,
@@ -1393,8 +1814,34 @@ async function runWithFollowerOwnership<T>(
   }
 }
 
-function normalizeRequestedCwd(value: string): string {
-  return path.normalize(value.trim().replace(/^~(?=$|\/)/, homedir()));
+function mergeModelCatalogMetadata(
+  appServerModels: CatalogModel[],
+  catalogModels: CatalogModel[]
+): CatalogModel[] {
+  if (catalogModels.length === 0) {
+    return appServerModels;
+  }
+  const catalogBySlug = new Map(catalogModels.map((model) => [model.slug, model]));
+  return appServerModels.map((model) => {
+    const catalogModel = catalogBySlug.get(model.slug);
+    if (!catalogModel) {
+      return model;
+    }
+
+    const supportedReasoningLevels =
+      model.supportedReasoningLevels && model.supportedReasoningLevels.length > 0
+        ? model.supportedReasoningLevels
+        : catalogModel.supportedReasoningLevels;
+
+    return CatalogModelSchema.parse({
+      ...catalogModel,
+      ...model,
+      description: model.description ?? catalogModel.description,
+      defaultReasoningLevel: model.defaultReasoningLevel ?? catalogModel.defaultReasoningLevel,
+      supportedReasoningLevels,
+      priority: model.priority ?? catalogModel.priority
+    });
+  });
 }
 
 function healthPayload(options: AgentPulseServerOptions, startedAt: number): HelperHealth {
@@ -1434,83 +1881,6 @@ function applyMobileSendState(transcript: ThreadTranscript, settings: HelperSett
       reason: 'mobile_send_disabled',
       label: 'Mobile sending is off on the Mac.'
     }
-  });
-}
-
-const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
-
-function mirrorStreamingTurnId(threadId: string): string {
-  return `${MIRROR_STREAMING_TURN_PREFIX}${threadId}`;
-}
-
-function applyMirrorStreamingState(
-  transcript: ThreadTranscript,
-  threadId: string,
-  mirror: CodexMirrorBridge | undefined
-): ThreadTranscript {
-  const syntheticTurnId = mirrorStreamingTurnId(threadId);
-  const mirrorSaysWaitingApproval = mirror?.isThreadWaitingForApproval?.(threadId) === true;
-  const mirrorSaysCompacting = mirror?.isThreadCompacting?.(threadId) === true;
-  const mirrorSaysStreaming = mirror?.isThreadStreaming?.(threadId) === true;
-
-  if (mirrorSaysWaitingApproval) {
-    return ThreadTranscriptSchema.parse({
-      ...transcript,
-      activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
-      sendState: {
-        canSend: false,
-        reason: 'waiting_on_approval',
-        label: 'Codex is waiting for approval'
-      }
-    });
-  }
-
-  if (mirrorSaysCompacting) {
-    return ThreadTranscriptSchema.parse({
-      ...transcript,
-      activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
-      sendState: {
-        canSend: false,
-        reason: 'compacting_context',
-        label: 'Automatically compacting context'
-      }
-    });
-  }
-
-  if (mirrorSaysStreaming) {
-    if (transcript.activeTurnId) {
-      return transcript;
-    }
-
-    return ThreadTranscriptSchema.parse({
-      ...transcript,
-      activeTurnId: syntheticTurnId,
-      sendState: {
-        canSend: false,
-        reason: 'thread_changed',
-        label: 'Codex is working'
-      }
-    });
-  }
-
-  if (transcript.activeTurnId !== syntheticTurnId) {
-    return transcript;
-  }
-
-  return ThreadTranscriptSchema.parse({
-    ...transcript,
-    activeTurnId: null,
-    sendState:
-      transcript.sendState.reason === 'thread_changed' ||
-      transcript.sendState.reason === 'missing_active_turn' ||
-      transcript.sendState.reason === 'waiting_on_approval' ||
-      transcript.sendState.reason === 'compacting_context'
-        ? {
-            canSend: true,
-            reason: 'ready',
-            label: 'Ready'
-          }
-        : transcript.sendState
   });
 }
 
@@ -1787,9 +2157,8 @@ export class LiveEventHub {
   }
 }
 
-// 6s polling cadence: Codex desktop IPC is the source of truth for live working/ready state.
-// This polling loop is only a slow backstop for thread/message list freshness, so it must not
-// turn old app-server `running` status into a live working signal.
+// 6s polling cadence: app-server notifications are the source of truth for live
+// working/ready state. This loop is only a slow backstop for thread/message list freshness.
 const POLL_INTERVAL_MS = 6_000;
 const ACTIVE_RECENCY_MS = 10 * 60_000;
 // Was 15 ticks at 2s = 30s between full sweeps. Keep that real-world cadence at the new rate.
@@ -1799,25 +2168,12 @@ function startThreadPolling(
   threadProvider: { listThreads(): Promise<Thread[]> },
   hub: LiveEventHub,
   appServer: AppServerChatBridge | undefined,
-  transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
+  transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript,
+  seenThreadStore?: SeenThreadStore
 ) {
   let previous = new Map<string, string>();
   let inFlight = false;
   let tickCount = 0;
-
-  const isActiveForReconcile = (thread: Thread, fullSweep: boolean): boolean => {
-    if (fullSweep) {
-      return true;
-    }
-    if (thread.status === 'waiting_approval') {
-      return true;
-    }
-    const lastActivityMs = Date.parse(thread.lastActivityAt);
-    if (!Number.isFinite(lastActivityMs)) {
-      return false;
-    }
-    return Date.now() - lastActivityMs < ACTIVE_RECENCY_MS;
-  };
 
   const tick = async () => {
     if (inFlight) {
@@ -1827,8 +2183,24 @@ function startThreadPolling(
     try {
       tickCount += 1;
       const fullSweep = tickCount % FULL_SWEEP_EVERY_N_TICKS === 1;
-      const threads = await threadProvider.listThreads();
-      const toReconcile = threads.filter((thread) => isActiveForReconcile(thread, fullSweep));
+      // Prefer the new combined endpoint that returns ids + statuses in one round
+      // trip (openai/codex#11786). Fall back to listLoadedThreadIds for older
+      // Codex builds that only expose ids.
+      const loadedStatuses = await appServer?.listLoadedThreadStatuses?.()
+        .catch(() => undefined);
+      const loadedThreadIds =
+        loadedStatuses ?? (await appServer?.listLoadedThreadIds?.().catch(() => undefined));
+      const liveStatuses = loadedStatuses instanceof Map ? loadedStatuses : undefined;
+      const loadedIdsSet =
+        loadedThreadIds instanceof Map
+          ? new Set(loadedThreadIds.keys())
+          : loadedThreadIds;
+      const threads = (await threadProvider.listThreads()).map((thread) =>
+        applyAppServerLiveThreadStatus(thread, appServer, liveStatuses)
+      );
+      const toReconcile = threads.filter((thread) =>
+        shouldReconcileThread(thread, fullSweep, loadedIdsSet)
+      );
       const reconciledActive = await reconcileThreads(toReconcile, appServer, transformTranscript);
 
       const reconciledById = new Map(
@@ -1860,6 +2232,13 @@ function startThreadPolling(
       }
 
       previous = next;
+
+      // Drop seen-thread entries for threads that no longer exist, but only on
+      // a full sweep — partial polls only pull recently-active threads, so the
+      // 'next' map there isn't an authoritative list of what exists.
+      if (fullSweep && seenThreadStore) {
+        await seenThreadStore.pruneOrphans(new Set(next.keys())).catch(() => undefined);
+      }
     } finally {
       inFlight = false;
     }
@@ -1890,7 +2269,7 @@ async function reconcileThreads(
         return {
           thread: ThreadSchema.parse({
             ...thread,
-            status: statusFromTranscript(transcript)
+            status: reconciledThreadStatus(thread, transcript)
           }),
           transcript
         };
@@ -1901,13 +2280,86 @@ async function reconcileThreads(
   );
 }
 
+function reconciledThreadStatus(thread: Thread, transcript: ThreadTranscript): Thread['status'] {
+  const transcriptStatus = statusFromTranscript(transcript);
+  if (transcriptStatus !== 'idle') {
+    return resolveThreadStatus([thread.status, transcriptStatus]);
+  }
+
+  const lastActivityMs = Date.parse(thread.lastActivityAt);
+  const isRecent =
+    Number.isFinite(lastActivityMs) && Date.now() - lastActivityMs < ACTIVE_RECENCY_MS;
+  return isRecent ? resolveThreadStatus([thread.status, transcriptStatus]) : transcriptStatus;
+}
+
 async function reconcileThreadStatuses(
   threads: Thread[],
   appServer: AppServerChatBridge | undefined,
   transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ): Promise<Thread[]> {
-  const reconciled = await reconcileThreads(threads, appServer, transformTranscript);
-  return reconciled.map(({ thread }) => thread);
+  const liveStatuses = await appServer?.listLoadedThreadStatuses?.().catch(() => undefined);
+  const liveThreads = threads.map((thread) =>
+    applyAppServerLiveThreadStatus(thread, appServer, liveStatuses)
+  );
+  const loadedThreadIds =
+    liveStatuses ?? (await appServer?.listLoadedThreadIds?.().catch(() => undefined));
+  const loadedIdsSet =
+    loadedThreadIds instanceof Map ? new Set(loadedThreadIds.keys()) : loadedThreadIds;
+  const toReconcile = liveThreads.filter((thread) =>
+    shouldReconcileThread(thread, false, loadedIdsSet)
+  );
+  const reconciled = await reconcileThreads(toReconcile, appServer, transformTranscript);
+  const byId = new Map(reconciled.map(({ thread }) => [thread.threadId, thread]));
+  return liveThreads.map((thread) => byId.get(thread.threadId) ?? thread);
+}
+
+function applyAppServerLiveThreadStatus(
+  thread: Thread,
+  appServer: AppServerChatBridge | undefined,
+  liveStatuses?: Map<string, Thread['status']>
+): Thread {
+  // Live notification-derived state from in-memory flags (notifications are
+  // pushed in real time and beat the snapshot returned by thread/loaded/list).
+  const inMemoryStatus = appServer?.isThreadWaitingForApproval?.(thread.threadId)
+    ? 'waiting_approval'
+    : appServer?.isThreadCompacting?.(thread.threadId)
+      ? 'compacting'
+      : appServer?.isThreadStreaming?.(thread.threadId)
+        ? 'running'
+        : undefined;
+  if (inMemoryStatus) {
+    return ThreadSchema.parse({ ...thread, status: inMemoryStatus });
+  }
+
+  // Backstop: if the app-server's thread/loaded/list reports the thread as
+  // active but our in-memory state didn't catch it (e.g. we missed a
+  // notification while disconnected), trust the remote status. This keeps the
+  // tablet's working badge correct even after a brief helper reconnect.
+  const remote = liveStatuses?.get(thread.threadId);
+  if (remote && remote !== 'idle' && remote !== 'unknown') {
+    return ThreadSchema.parse({ ...thread, status: remote });
+  }
+
+  return thread;
+}
+
+function shouldReconcileThread(
+  thread: Thread,
+  fullSweep: boolean,
+  loadedThreadIds?: Set<string>
+): boolean {
+  if (loadedThreadIds?.has(thread.threadId)) {
+    return true;
+  }
+  if (thread.status !== 'idle' && thread.status !== 'unknown') {
+    return true;
+  }
+  const lastActivityMs = Date.parse(thread.lastActivityAt);
+  if (!Number.isFinite(lastActivityMs)) {
+    return false;
+  }
+  const isRecent = Date.now() - lastActivityMs < ACTIVE_RECENCY_MS;
+  return isRecent || (fullSweep && thread.status === 'unknown');
 }
 
 function mergeDraftThreads(threads: Thread[], drafts: Map<string, Thread>): Thread[] {
@@ -1942,6 +2394,78 @@ function updateDraftThreadFromTranscript(draftThread: Thread, transcript: Thread
     status: statusFromTranscript(transcript),
     lastActivityAt: latestMessage?.createdAt ?? new Date().toISOString(),
     lastTurnSummary: latestMessage?.text ?? draftThread.lastTurnSummary
+  });
+}
+
+// Recognized bare slash commands. Only fires when the user message is
+// exactly the slash + name (with optional trailing whitespace) — once a user
+// adds text after the command name we treat it as a normal message so anything
+// like "/compact please" still falls through as plain text.
+const BARE_SLASH_PATTERN = /^\s*\/([a-zA-Z][a-zA-Z0-9_-]*)\s*$/;
+
+function matchBareSlashCommand(text: string): string | null {
+  const match = BARE_SLASH_PATTERN.exec(text);
+  return match ? match[1]!.toLowerCase() : null;
+}
+
+// Returns a ThreadMessageResponse if the slash command was handled here, or
+// null if it should fall through to the normal send path. Hub broadcasts let
+// the tablet drop the optimistic pending bubble even though no real user-text
+// turn was created.
+async function handleSlashCommand(
+  command: string,
+  threadId: string,
+  appServer: AppServerChatBridge | undefined,
+  hub: LiveEventHub
+): Promise<ThreadMessageResponse | null> {
+  if (command === 'compact') {
+    if (!appServer?.compactThread) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Compact requires Codex 0.96 or newer.'
+      );
+    }
+    await appServer.compactThread(threadId);
+    hub.broadcast({
+      type: 'thread/status/changed',
+      payload: { threadId, status: 'compacting' }
+    });
+    return slashCommandAckResponse(threadId, 'compact');
+  }
+
+  if (command === 'review') {
+    if (!appServer?.startReview) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Review requires the Codex app-server.'
+      );
+    }
+    await appServer.startReview(threadId);
+    return slashCommandAckResponse(threadId, 'review');
+  }
+
+  // Commands we recognize but don't have a dedicated RPC path for — better to
+  // tell the user than to silently send the literal text as a message.
+  if (command === 'clear' || command === 'new' || command === 'help' || command === 'feedback' || command === 'model') {
+    throw new SendBlockedError(
+      'thread_unavailable',
+      `/${command} isn't supported on the tablet yet — run it from the Codex desktop app.`
+    );
+  }
+
+  return null;
+}
+
+function slashCommandAckResponse(threadId: string, command: string): ThreadMessageResponse {
+  // Codex doesn't return a transcript for fire-and-forget commands. We hand
+  // back an empty draft transcript so the tablet's send path resolves cleanly;
+  // the next live notification (item/started for compact, etc.) will refresh
+  // the visible state through the normal channels.
+  return ThreadMessageResponseSchema.parse({
+    ok: true,
+    mode: 'start',
+    turnId: `slash:${command}:${threadId}`,
+    transcript: emptyDraftTranscript(threadId)
   });
 }
 

@@ -3,6 +3,7 @@ import type {
   CatalogModel,
   CatalogPlugin,
   CatalogSkill,
+  CollaborationModeKind,
   HelperHealth,
   OlderThreadMessagesResponse,
   Project,
@@ -17,7 +18,7 @@ import { DashboardInsights } from './DashboardInsights';
 import { Sidebar } from './Sidebar';
 import { Spinner } from './Spinner';
 import { ThreadView } from './ThreadView';
-import { relativeTime, statusTone } from './status';
+import { relativeTime, statusLabels, statusTone } from './status';
 
 const SEEN_ACTIVITY_KEY = 'agent-pulse:seen-thread-activity';
 const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
@@ -36,7 +37,11 @@ export type DashboardProps = {
     threadId: string,
     options?: FetchThreadTranscriptOptions
   ) => Promise<ThreadTranscript>;
-  sendMessage?: (threadId: string, text: string) => Promise<ThreadMessageResponse>;
+  sendMessage?: (
+    threadId: string,
+    text: string,
+    options?: { collaborationMode?: CollaborationModeKind }
+  ) => Promise<ThreadMessageResponse>;
   stopWork?: (threadId: string) => Promise<void>;
   fetchOlderMessages?: (
     threadId: string,
@@ -48,6 +53,11 @@ export type DashboardProps = {
   threadReasoningEfforts?: Record<string, string>;
   threadPendingRequests?: Record<string, PendingRequest[]>;
   streamingThreadIds?: Set<string>;
+  // When provided, this is the canonical "user has reviewed this thread" map
+  // synced via the helper. Dashboard falls back to its localStorage-backed
+  // copy when undefined (offline / unauthenticated paths).
+  seenThreadActivityOverride?: Record<string, number>;
+  onMarkThreadSeen?: (threadId: string, seenAt: number) => void;
   plugins?: CatalogPlugin[];
   skills?: CatalogSkill[];
   commands?: CatalogCommand[];
@@ -67,7 +77,12 @@ export type DashboardProps = {
     method:
       | 'item/commandExecution/requestApproval'
       | 'item/fileChange/requestApproval'
-      | 'item/permissions/requestApproval',
+      | 'item/permissions/requestApproval'
+      | 'execCommandApproval'
+      | 'applyPatchApproval'
+      | 'item/tool/requestUserInput'
+      | 'item/plan/requestImplementation'
+      | 'mcpServer/elicitation/request',
     decision: string | Record<string, unknown>
   ) => Promise<void>;
 };
@@ -80,10 +95,20 @@ export type PendingRequest = {
   itemId?: string;
   turnId?: string;
   permissions?: Record<string, unknown>;
-  kind?: 'question' | 'plan' | 'commandApproval' | 'fileApproval' | 'permissionsApproval';
+  availableDecisions?: unknown[];
+  proposedExecpolicyAmendment?: string[];
+  kind?:
+    | 'question'
+    | 'plan'
+    | 'commandApproval'
+    | 'fileApproval'
+    | 'permissionsApproval'
+    | 'mcpElicitationApproval';
 };
 
-export type NewThreadTarget = { projectId: string } | { cwd: string };
+export type NewThreadTarget =
+  | { projectId: string; modelSlug?: string; reasoningEffort?: string }
+  | { cwd: string; modelSlug?: string; reasoningEffort?: string };
 
 export function Dashboard({
   health,
@@ -110,7 +135,9 @@ export function Dashboard({
   models = [],
   fetchProjectFiles,
   onChangeThreadModel,
-  onApprovalDecision
+  onApprovalDecision,
+  seenThreadActivityOverride,
+  onMarkThreadSeen
 }: DashboardProps) {
   const [internalActiveThreadId, setInternalActiveThreadId] = useState<string | undefined>(() => readActiveThreadId());
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -118,9 +145,40 @@ export function Dashboard({
   const [newThreadDialogOpen, setNewThreadDialogOpen] = useState(false);
   const [newThreadError, setNewThreadError] = useState('');
   const [creatingProjectId, setCreatingProjectId] = useState<string | undefined>();
-  const [seenThreadActivity, setSeenThreadActivity] = useState<Record<string, number>>(() =>
-    readSeenThreadActivity()
+  const [localSeenThreadActivity, setLocalSeenThreadActivity] = useState<Record<string, number>>(
+    () => readSeenThreadActivity()
   );
+  // Helper-synced state takes precedence; we merge so optimistic local marks
+  // (just-tapped threads) keep showing as seen even if the helper's broadcast
+  // hasn't echoed back yet.
+  const seenThreadActivity = useMemo(() => {
+    if (!seenThreadActivityOverride) {
+      return localSeenThreadActivity;
+    }
+    const merged: Record<string, number> = { ...seenThreadActivityOverride };
+    for (const [threadId, seenAt] of Object.entries(localSeenThreadActivity)) {
+      const remote = merged[threadId] ?? 0;
+      if (seenAt > remote) {
+        merged[threadId] = seenAt;
+      }
+    }
+    return merged;
+  }, [localSeenThreadActivity, seenThreadActivityOverride]);
+  const setSeenThreadActivity: Dispatch<SetStateAction<Record<string, number>>> = (action) => {
+    setLocalSeenThreadActivity((current) => {
+      const next = typeof action === 'function' ? (action as (prev: Record<string, number>) => Record<string, number>)(current) : action;
+      // Push any newly-changed entries to the helper so other devices learn
+      // about them. The handler is responsible for de-duping & broadcasting.
+      if (onMarkThreadSeen) {
+        for (const [threadId, seenAt] of Object.entries(next)) {
+          if ((current[threadId] ?? 0) < seenAt) {
+            onMarkThreadSeen(threadId, seenAt);
+          }
+        }
+      }
+      return next;
+    });
+  };
 
   const activeThreadId =
     controlledActiveThreadId !== undefined
@@ -190,8 +248,8 @@ export function Dashboard({
   }, [activeThreadId]);
 
   useEffect(() => {
-    window.localStorage.setItem(SEEN_ACTIVITY_KEY, JSON.stringify(seenThreadActivity));
-  }, [seenThreadActivity]);
+    window.localStorage.setItem(SEEN_ACTIVITY_KEY, JSON.stringify(localSeenThreadActivity));
+  }, [localSeenThreadActivity]);
 
   useEffect(() => {
     if (activeThread) {
@@ -287,9 +345,11 @@ export function Dashboard({
             }
             openThreadInCodex={onOpenThreadInCodex}
             liveTranscript={transcriptUpdates[activeThread.threadId]}
-            modelName={threadModels[activeThread.threadId]}
-            selectedModelSlug={threadModels[activeThread.threadId]}
-            selectedReasoningEffort={threadReasoningEfforts[activeThread.threadId]}
+            modelName={threadModels[activeThread.threadId] ?? activeThread.model}
+            selectedModelSlug={threadModels[activeThread.threadId] ?? activeThread.model}
+            selectedReasoningEffort={
+              threadReasoningEfforts[activeThread.threadId] ?? activeThread.reasoningEffort
+            }
             pendingRequests={threadPendingRequests[activeThread.threadId] ?? []}
             forceWorking={workingThreadIds.has(activeThread.threadId)}
             plugins={plugins}
@@ -321,6 +381,7 @@ export function Dashboard({
             onSelectThread={handleSelectThread}
             onOpenSidebar={() => setSidebarOpen(true)}
             isLoading={!threadsLoaded}
+            seenThreadActivity={seenThreadActivity}
           />
         )}
       </main>
@@ -335,6 +396,7 @@ export function Dashboard({
       {newThreadDialogOpen ? (
         <NewThreadDialog
           projects={projects}
+          models={models}
           creatingProjectId={creatingProjectId}
           error={newThreadError}
           onClose={() => setNewThreadDialogOpen(false)}
@@ -405,22 +467,36 @@ function markThreadSeen(
   });
 }
 
+function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
+  const seenAt = seenThreadActivity[thread.threadId] ?? 0;
+  const activityAt = Date.parse(thread.lastActivityAt);
+  return Number.isFinite(activityAt) && activityAt > seenAt;
+}
+
 function NewThreadDialog({
   projects,
+  models,
   creatingProjectId,
   error,
   onClose,
   onCreate
 }: {
   projects: Project[];
+  models: CatalogModel[];
   creatingProjectId?: string;
   error: string;
   onClose: () => void;
   onCreate: (target: NewThreadTarget) => void;
 }) {
   const [selectedProjectId, setSelectedProjectId] = useState(() => projects[0]?.projectId ?? '');
+  // Empty `selectedModelSlug` means "use the project's default model from
+  // ~/.codex/config.toml". The user can override here for one-off threads.
+  const [selectedModelSlug, setSelectedModelSlug] = useState<string>('');
+  const [selectedEffort, setSelectedEffort] = useState<string>('');
   const creating = creatingProjectId !== undefined;
   const selectedProject = projects.find((project) => project.projectId === selectedProjectId);
+  const selectedModel = models.find((model) => model.slug === selectedModelSlug);
+  const efforts = selectedModel?.supportedReasoningLevels ?? [];
 
   useEffect(() => {
     if (projects.length === 0) {
@@ -433,6 +509,23 @@ function NewThreadDialog({
     }
   }, [projects, selectedProjectId]);
 
+  // When the user picks a different model, drop any effort that isn't valid
+  // for the new model. If the new model has a default effort, prefer that.
+  useEffect(() => {
+    if (!selectedModel) {
+      setSelectedEffort('');
+      return;
+    }
+    const supported = selectedModel.supportedReasoningLevels ?? [];
+    if (supported.length === 0) {
+      setSelectedEffort('');
+      return;
+    }
+    if (!supported.some((entry) => entry.effort === selectedEffort)) {
+      setSelectedEffort(selectedModel.defaultReasoningLevel ?? '');
+    }
+  }, [selectedModelSlug, selectedModel, selectedEffort]);
+
   return (
     <div className="new-thread-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -444,8 +537,8 @@ function NewThreadDialog({
       >
         <header className="new-thread-header">
           <div>
-            <h2>Choose a project</h2>
-            <p>Pick where Codex should start the new thread.</p>
+            <h2>Start a new thread</h2>
+            <p>Pick where Codex should start, and optionally choose a model.</p>
           </div>
           <button
             className="new-thread-close"
@@ -464,26 +557,84 @@ function NewThreadDialog({
             if (!selectedProjectId || creating) {
               return;
             }
-            onCreate({ projectId: selectedProjectId });
+            const target: NewThreadTarget = {
+              projectId: selectedProjectId,
+              ...(selectedModelSlug ? { modelSlug: selectedModelSlug } : {}),
+              ...(selectedEffort ? { reasoningEffort: selectedEffort } : {})
+            };
+            onCreate(target);
           }}
         >
           <label className="new-thread-label" htmlFor="new-thread-project">
             Project
           </label>
-          <div className="new-thread-select-row">
-            <select
-              id="new-thread-project"
-              className="new-thread-select"
-              value={selectedProjectId}
-              onChange={(event) => setSelectedProjectId(event.target.value)}
-              disabled={creating || projects.length === 0}
-            >
-              {projects.map((project) => (
-                <option key={project.projectId} value={project.projectId}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
+          <select
+            id="new-thread-project"
+            className="new-thread-select"
+            value={selectedProjectId}
+            onChange={(event) => setSelectedProjectId(event.target.value)}
+            disabled={creating || projects.length === 0}
+          >
+            {projects.map((project) => (
+              <option key={project.projectId} value={project.projectId}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+          {selectedProject ? (
+            <p className="new-thread-selected-path">{selectedProject.path}</p>
+          ) : (
+            <p className="new-thread-empty">No saved Codex projects are available yet.</p>
+          )}
+
+          {models.length > 0 ? (
+            <>
+              <label className="new-thread-label" htmlFor="new-thread-model">
+                Model
+              </label>
+              <select
+                id="new-thread-model"
+                className="new-thread-select"
+                value={selectedModelSlug}
+                onChange={(event) => setSelectedModelSlug(event.target.value)}
+                disabled={creating}
+              >
+                <option value="">Use project default</option>
+                {models.map((model) => (
+                  <option key={model.slug} value={model.slug}>
+                    {model.displayName}
+                  </option>
+                ))}
+              </select>
+              {selectedModel?.description ? (
+                <p className="new-thread-selected-path">{selectedModel.description}</p>
+              ) : null}
+
+              {efforts.length > 0 ? (
+                <>
+                  <span className="new-thread-label">Reasoning effort</span>
+                  <div className="new-thread-effort-row">
+                    {efforts.map((entry) => (
+                      <button
+                        key={entry.effort}
+                        type="button"
+                        className={`new-thread-effort-pick ${
+                          selectedEffort === entry.effort ? 'is-selected' : ''
+                        }`}
+                        onClick={() => setSelectedEffort(entry.effort)}
+                        title={entry.description}
+                        disabled={creating}
+                      >
+                        {capitalizeEffort(entry.effort)}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : null}
+            </>
+          ) : null}
+
+          <div className="new-thread-actions">
             <button
               className="new-thread-submit"
               type="submit"
@@ -498,11 +649,6 @@ function NewThreadDialog({
               )}
             </button>
           </div>
-          {selectedProject ? (
-            <p className="new-thread-selected-path">{selectedProject.path}</p>
-          ) : (
-            <p className="new-thread-empty">No saved Codex projects are available yet.</p>
-          )}
         </form>
         {error ? <p className="new-thread-error">{error}</p> : null}
       </section>
@@ -510,16 +656,23 @@ function NewThreadDialog({
   );
 }
 
+function capitalizeEffort(effort: string): string {
+  if (!effort) return effort;
+  return effort.charAt(0).toUpperCase() + effort.slice(1);
+}
+
 function EmptyMain({
   threads,
   onOpenSidebar,
   onSelectThread,
-  isLoading = false
+  isLoading = false,
+  seenThreadActivity = {}
 }: {
   threads: Thread[];
   onOpenSidebar: () => void;
   onSelectThread: (thread: Thread) => void;
   isLoading?: boolean;
+  seenThreadActivity?: Record<string, number>;
 }) {
   const recentThreads = [...threads]
     .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
@@ -570,7 +723,9 @@ function EmptyMain({
           </div>
           <div className="codex-home-tiles">
             {recentThreads.map((thread) => {
-              const tone = statusTone[thread.status] || 'gray';
+              const needsReview = threadNeedsReview(thread, seenThreadActivity);
+              const tone = needsReview ? 'yellow' : statusTone[thread.status] || 'gray';
+              const statusLabel = needsReview ? 'Review' : statusLabels[thread.status] ?? thread.status;
               return (
                 <button
                   key={thread.threadId}
@@ -584,7 +739,7 @@ function EmptyMain({
                       style={{ background: `var(--tone-${tone})` }}
                       aria-hidden="true"
                     />
-                    <span className="codex-home-tile-status">{thread.status}</span>
+                    <span className="codex-home-tile-status">{statusLabel}</span>
                     <span className="codex-home-tile-time">{relativeTime(thread.lastActivityAt)}</span>
                   </div>
                   <h3 className="codex-home-tile-title">{thread.title}</h3>
@@ -597,4 +752,8 @@ function EmptyMain({
       ) : null}
     </section>
   );
+}
+
+function threadNeedsReview(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
+  return thread.status === 'idle' && hasUnseenActivity(thread, seenThreadActivity);
 }

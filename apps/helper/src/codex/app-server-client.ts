@@ -43,12 +43,23 @@ type PendingRequest = {
 };
 
 type JsonRpcResponse = {
-  id?: number;
+  id?: number | string;
   result?: unknown;
   error?: {
     code?: number;
     message?: string;
   };
+};
+
+export type CodexAppServerNotification = {
+  method: string;
+  params?: unknown;
+};
+
+export type CodexAppServerServerRequest = {
+  id: number | string;
+  method: string;
+  params?: unknown;
 };
 
 export type CodexAppServerClientOptions = {
@@ -62,6 +73,13 @@ export class CodexAppServerClient implements CodexAppServerTransport {
   private initialized = false;
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly notificationListeners = new Set<
+    (notification: CodexAppServerNotification) => void
+  >();
+  private readonly serverRequestListeners = new Set<
+    (request: CodexAppServerServerRequest) => void
+  >();
+  private readonly connectionListeners = new Set<(connected: boolean) => void>();
   private stderrRing = '';
   // De-duplicates concurrent `ensureStarted` calls. Keep a single in-flight promise so we
   // end up with at most one subprocess.
@@ -77,9 +95,36 @@ export class CodexAppServerClient implements CodexAppServerTransport {
     return Boolean(this.process && !this.process.killed && this.initialized);
   }
 
+  async ensureConnected(): Promise<void> {
+    await this.ensureStarted();
+  }
+
   async request<T = unknown>(method: string, params: unknown): Promise<T> {
     await this.ensureStarted();
     return this.sendRequest<T>(method, params);
+  }
+
+  onNotification(listener: (notification: CodexAppServerNotification) => void): () => void {
+    this.notificationListeners.add(listener);
+    return () => this.notificationListeners.delete(listener);
+  }
+
+  onServerRequest(listener: (request: CodexAppServerServerRequest) => void): () => void {
+    this.serverRequestListeners.add(listener);
+    return () => this.serverRequestListeners.delete(listener);
+  }
+
+  onConnectionChange(listener: (connected: boolean) => void): () => void {
+    this.connectionListeners.add(listener);
+    return () => this.connectionListeners.delete(listener);
+  }
+
+  async respondToServerRequest(id: number | string, result: unknown): Promise<void> {
+    const child = this.process;
+    if (!child) {
+      throw new Error('Codex App Server is not running.');
+    }
+    child.stdin.write(`${JSON.stringify({ id, result })}\n`);
   }
 
   async stop(): Promise<void> {
@@ -112,6 +157,9 @@ export class CodexAppServerClient implements CodexAppServerTransport {
     });
     this.process = child;
     this.stderrRing = '';
+    console.warn(
+      `[codex app-server] spawned pid=${child.pid ?? 'unknown'} binary=${this.codexBinary()}`
+    );
     child.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8');
       const next = this.stderrRing + text;
@@ -124,9 +172,17 @@ export class CodexAppServerClient implements CodexAppServerTransport {
     child.once('exit', (code, signal) => {
       this.initialized = false;
       this.process = undefined;
+      this.emitConnectionChange(false);
       const stderr = this.recentStderr();
       const detail = stderr ? ` — codex stderr: ${stderr}` : '';
       const reason = `Codex App Server disconnected (code=${code ?? 'null'}, signal=${signal ?? 'null'})${detail}`;
+      // Always log the exit so we can tell whether it died on its own (with
+      // stderr / non-zero code) or was killed externally (signal=SIGTERM and
+      // no stderr means something else sent the signal — possibly the desktop
+      // claiming exclusivity, or our own timeout-kill at app-server-client.ts:182).
+      console.warn(
+        `[codex app-server] exited pid=${child.pid ?? 'unknown'} code=${code ?? 'null'} signal=${signal ?? 'null'} pendingRequests=${this.pending.size}${detail}`
+      );
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error(reason));
@@ -149,6 +205,7 @@ export class CodexAppServerClient implements CodexAppServerTransport {
     });
     this.sendNotification('initialized', {});
     this.initialized = true;
+    this.emitConnectionChange(true);
   }
 
   private codexBinary(): string {
@@ -178,6 +235,9 @@ export class CodexAppServerClient implements CodexAppServerTransport {
             `Codex App Server timed out after ${timeoutMs}ms on ${method}${detail}`
           );
           // Force restart on next request: subprocess is hung.
+          console.warn(
+            `[codex app-server] killing pid=${this.process?.pid ?? 'unknown'} after ${timeoutMs}ms timeout on ${method}`
+          );
           try {
             this.process?.kill();
           } catch {
@@ -185,6 +245,7 @@ export class CodexAppServerClient implements CodexAppServerTransport {
           }
           this.process = undefined;
           this.initialized = false;
+          this.emitConnectionChange(false);
           reject(error);
         }
       }, timeoutMs);
@@ -208,10 +269,32 @@ export class CodexAppServerClient implements CodexAppServerTransport {
   }
 
   private handleLine(line: string): void {
-    let message: JsonRpcResponse;
+    let message: JsonRpcResponse & {
+      method?: unknown;
+      params?: unknown;
+    };
     try {
-      message = JSON.parse(line) as JsonRpcResponse;
+      message = JSON.parse(line) as JsonRpcResponse & {
+        method?: unknown;
+        params?: unknown;
+      };
     } catch {
+      return;
+    }
+
+    if (typeof message.method === 'string') {
+      if (typeof message.id === 'number' || typeof message.id === 'string') {
+        this.emitServerRequest({
+          id: message.id,
+          method: message.method,
+          params: message.params
+        });
+        return;
+      }
+      this.emitNotification({
+        method: message.method,
+        params: message.params
+      });
       return;
     }
 
@@ -232,6 +315,46 @@ export class CodexAppServerClient implements CodexAppServerTransport {
     }
 
     pending.resolve(message.result);
+  }
+
+  private emitNotification(notification: CodexAppServerNotification): void {
+    for (const listener of this.notificationListeners) {
+      try {
+        listener(notification);
+      } catch (error) {
+        console.warn('[codex app-server] notification listener failed', {
+          method: notification.method,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+
+  private emitServerRequest(request: CodexAppServerServerRequest): void {
+    for (const listener of this.serverRequestListeners) {
+      try {
+        listener(request);
+      } catch (error) {
+        console.warn('[codex app-server] server request listener failed', {
+          method: request.method,
+          id: request.id,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+
+  private emitConnectionChange(connected: boolean): void {
+    for (const listener of this.connectionListeners) {
+      try {
+        listener(connected);
+      } catch (error) {
+        console.warn('[codex app-server] connection listener failed', {
+          connected,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
   }
 }
 

@@ -37,7 +37,8 @@ export const ThreadSchema = z.object({
   status: ThreadStatusSchema,
   lastActivityAt: isoUtcTimestamp,
   lastTurnSummary: z.string(),
-  model: z.string().optional()
+  model: z.string().optional(),
+  reasoningEffort: z.string().optional()
 });
 
 export type Thread = z.infer<typeof ThreadSchema>;
@@ -182,6 +183,11 @@ export const PairResponseSchema = z.object({
   deviceName: z.string().min(1).max(80)
 });
 
+export const DeviceSessionRecoveryRequestSchema = z.object({
+  deviceId: z.string().trim().min(1),
+  fingerprint: z.string().min(8).max(240)
+});
+
 export const ThreadOpenRequestSchema = z.object({
   threadId: z.string().min(1),
   mode: z.enum(['open', 'sync']).optional()
@@ -190,7 +196,9 @@ export const ThreadOpenRequestSchema = z.object({
 export const ThreadCreateRequestSchema = z
   .object({
     projectId: z.string().trim().min(1).optional(),
-    cwd: z.string().trim().min(1).optional()
+    cwd: z.string().trim().min(1).optional(),
+    modelSlug: z.string().trim().min(1).optional(),
+    reasoningEffort: z.string().trim().min(1).optional()
   })
   .refine((value) => Boolean(value.projectId) !== Boolean(value.cwd), {
     message: 'Choose a project or folder path.'
@@ -292,8 +300,13 @@ export const OlderThreadMessagesResponseSchema = z.object({
 
 export type OlderThreadMessagesResponse = z.infer<typeof OlderThreadMessagesResponseSchema>;
 
+export const COLLABORATION_MODES = ['default', 'plan'] as const;
+
+export type CollaborationModeKind = (typeof COLLABORATION_MODES)[number];
+
 export const ThreadMessageRequestSchema = z.object({
-  text: z.string().trim().min(1).max(4000)
+  text: z.string().trim().min(1).max(4000),
+  collaborationMode: z.enum(COLLABORATION_MODES).optional()
 });
 
 export const ThreadMessageResponseSchema = z.object({
@@ -418,7 +431,12 @@ export const ThreadModelUpdateRequestSchema = z.object({
 export const APPROVAL_METHODS = [
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
-  'item/permissions/requestApproval'
+  'item/permissions/requestApproval',
+  'execCommandApproval',
+  'applyPatchApproval',
+  'item/tool/requestUserInput',
+  'item/plan/requestImplementation',
+  'mcpServer/elicitation/request'
 ] as const;
 
 export const ApprovalDecisionRequestSchema = z.object({
@@ -432,11 +450,51 @@ export const ApprovalDecisionResponseSchema = z.object({
   ok: z.literal(true)
 });
 
+// Approval request payload surfaced by the helper from Codex app-server live state.
+export const PendingApprovalRequestSchema = z.object({
+  id: z.string().min(1),
+  method: z.string().min(1),
+  // Free-form params blob from Codex (reason, permissions, turnId, itemId, ...).
+  // Kept opaque so future Codex builds can add fields without breaking the wire
+  // format — the tablet's existing `summarizePendingRequest` parses it.
+  params: z.record(z.string(), z.unknown()).optional(),
+  // Set when the approval was surfaced as a turn item (permissionRequest)
+  // rather than a top-level conversation `requests` entry.
+  itemId: z.string().min(1).optional(),
+  turnId: z.string().min(1).optional()
+});
+
+export type PendingApprovalRequest = z.infer<typeof PendingApprovalRequestSchema>;
+
 export const ThreadModelUpdateResponseSchema = z.object({
   ok: z.literal(true),
   modelSlug: z.string().min(1),
   reasoningEffort: z.string().min(1).optional()
 });
+
+// Map of threadId -> "user last reviewed this at" epoch ms. The helper is the
+// source of truth so the seen state is shared across every device paired with
+// the same Mac.
+export const SeenThreadActivityMapSchema = z.record(
+  z.string().min(1),
+  z.number().int().nonnegative()
+);
+export type SeenThreadActivityMap = z.infer<typeof SeenThreadActivityMapSchema>;
+
+export const SeenThreadActivityResponseSchema = z.object({
+  entries: SeenThreadActivityMapSchema
+});
+export type SeenThreadActivityResponse = z.infer<typeof SeenThreadActivityResponseSchema>;
+
+export const SeenThreadActivityMarkRequestSchema = z.object({
+  seenAt: z.number().int().nonnegative()
+});
+export type SeenThreadActivityMarkRequest = z.infer<typeof SeenThreadActivityMarkRequestSchema>;
+
+export const SeenThreadActivityImportRequestSchema = z.object({
+  entries: SeenThreadActivityMapSchema
+});
+export type SeenThreadActivityImportRequest = z.infer<typeof SeenThreadActivityImportRequestSchema>;
 
 export const LiveEventSchema = z.discriminatedUnion('type', [
   z.object({
@@ -456,11 +514,10 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
     payload: ThreadTranscriptSchema
   }),
   z.object({
-    type: z.literal('codex/broadcast'),
+    type: z.literal('thread/status/changed'),
     payload: z.object({
-      method: z.string().min(1),
-      sourceClientId: z.string().min(1),
-      params: z.unknown()
+      threadId: z.string().min(1),
+      status: ThreadStatusSchema
     })
   }),
   z.object({
@@ -474,6 +531,20 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
     payload: z.object({
       threadId: z.string().min(1),
       isStreaming: z.boolean()
+    })
+  }),
+  z.object({
+    type: z.literal('thread/pending-approvals/changed'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      requests: z.array(PendingApprovalRequestSchema)
+    })
+  }),
+  z.object({
+    type: z.literal('thread/seen-activity/changed'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      seenAt: z.number().int().nonnegative()
     })
   })
 ]);

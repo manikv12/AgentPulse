@@ -11,7 +11,8 @@ import {
   pairDevice,
   sendThreadMessage,
   stopThreadWork,
-  startThread
+  startThread,
+  AgentPulseApiError
 } from './api';
 
 describe('tablet API helpers', () => {
@@ -263,6 +264,37 @@ describe('tablet API helpers', () => {
         method: 'POST'
       })
     );
+  });
+
+  it('keeps the helper stop failure reason for stale running cleanup', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/threads/thread-1/stop') {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({
+            error: 'Codex is not currently running this thread.',
+            reason: 'missing_active_turn'
+          })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+
+    await expect(stopThreadWork(session, 'thread-1')).rejects.toMatchObject({
+      name: 'AgentPulseApiError',
+      message: 'Codex is not currently running this thread.',
+      status: 409,
+      reason: 'missing_active_turn'
+    } satisfies Partial<AgentPulseApiError>);
   });
 
   it('passes a transcript message limit to the helper when requested', async () => {

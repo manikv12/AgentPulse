@@ -1,5 +1,6 @@
 import type {
   ChatMessage,
+  PendingApprovalRequest,
   ThreadMessageResponse,
   ThreadSendState,
   ThreadTranscript
@@ -21,14 +22,36 @@ export type CodexMirrorOptions = {
   reader: Pick<CodexAppServerChat, 'readTranscript'>;
   onBroadcast?: (broadcast: CodexMirrorBroadcast) => void;
   onStreamingChange?: (event: { threadId: string; isStreaming: boolean }) => void;
+  // Fires whenever the set of pending approval requests for a thread changes,
+  // including when it becomes empty. Used by the helper server to push a
+  // replayable `thread/pending-approvals/changed` live event to the tablet so
+  // the approval card renders even after a reconnect.
+  onPendingApprovalsChange?: (event: {
+    threadId: string;
+    requests: PendingApprovalRequest[];
+  }) => void;
   hostId?: string;
   followerRequestTimeoutMs?: number;
   now?: () => number;
   unownedStreamingStaleMs?: number;
 };
 
+export type CodexMirrorSendOptions = {
+  collaborationMode?: 'default' | 'plan';
+  // Used to populate the `settings` block of the collaborationMode payload —
+  // Codex expects the active model + reasoning effort alongside the mode flag,
+  // matching what its own UI sends when you press Shift+Tab. The caller can
+  // omit them when collaborationMode is undefined.
+  model?: string;
+  effort?: string;
+};
+
 export type CodexMirror = {
-  sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse>;
+  sendMessage(
+    threadId: string,
+    text: string,
+    options?: CodexMirrorSendOptions
+  ): Promise<ThreadMessageResponse>;
   interruptTurn(threadId: string): Promise<void>;
   readTranscript(threadId: string): Promise<ThreadTranscript>;
   setModelAndReasoning(
@@ -45,6 +68,10 @@ export type CodexMirror = {
   isThreadStreaming(threadId: string): boolean;
   isThreadCompacting(threadId: string): boolean;
   isThreadWaitingForApproval(threadId: string): boolean;
+  // Returns the set of approval requests Codex has surfaced for this thread,
+  // with their full payloads (id, method, params). Used by the server to seed
+  // the tablet on reconnect via `thread/upsert`.
+  getPendingApprovalRequests(threadId: string): PendingApprovalRequest[];
   isThreadOwned(threadId: string): boolean;
   waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean>;
   isConnected(): boolean;
@@ -54,7 +81,8 @@ export type CodexMirror = {
 export type ApprovalMethod =
   | 'item/commandExecution/requestApproval'
   | 'item/fileChange/requestApproval'
-  | 'item/permissions/requestApproval';
+  | 'item/permissions/requestApproval'
+  | 'mcpServer/elicitation/request';
 
 export type ApprovalResponse = 'accept' | 'acceptForSession' | 'decline' | unknown;
 
@@ -64,12 +92,17 @@ const ACTIVE_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending
 const APPROVAL_REQUEST_METHODS = new Set([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
-  'item/permissions/requestApproval'
+  'item/permissions/requestApproval',
+  'mcpServer/elicitation/request'
 ]);
 
 type AppThreadStreamState = {
   activeItemKeys: Set<string>;
-  approvalRequestIdsByKey: Map<string, string>;
+  // Keyed by patch path (e.g. `requests.0` or `turns.3.items.5`) so we can
+  // remove the right entry when Codex emits a `remove`/`isCompleted` patch.
+  // The value is the full request payload — not just the id — so the helper
+  // can replay it to the tablet on reconnect.
+  approvalRequestsByKey: Map<string, PendingApprovalRequest>;
   latestTurnIndex: number | null;
   latestTurnStatus: string | null;
   runtimeStatusType: string | null;
@@ -90,6 +123,10 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   const streamingThreads = new Set<string>();
   const streamingUpdatedAtMs = new Map<string, number>();
   const appThreadStreamStates = new Map<string, AppThreadStreamState>();
+  // Last set of pending approval requests we've emitted to onPendingApprovalsChange,
+  // keyed by conversation id. Used to deduplicate notifications so the helper
+  // server only broadcasts when the visible-to-tablet list actually changes.
+  const lastEmittedPendingApprovals = new Map<string, PendingApprovalRequest[]>();
   // Threads where a Codex window currently reports streamRole.role === 'owner'.
   // Required for follower IPC methods (set-model-and-reasoning, approval decisions, etc.)
   // to pass the desktop's discovery callback `getThreadRole === 'owner'`.
@@ -132,12 +169,33 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     const state = appThreadStreamStates.get(conversationId);
     const isStreaming = state ? isActiveAppThreadState(state) : false;
     setStreamingState(conversationId, isStreaming);
+    notifyPendingApprovalsIfChanged(conversationId);
     return isStreaming;
   }
 
   function clearThreadState(conversationId: string): void {
     appThreadStreamStates.delete(conversationId);
     setStreamingState(conversationId, false);
+    notifyPendingApprovalsIfChanged(conversationId);
+  }
+
+  function notifyPendingApprovalsIfChanged(conversationId: string): void {
+    const state = appThreadStreamStates.get(conversationId);
+    const requests = state ? pendingApprovalsFromState(state) : [];
+    const previous = lastEmittedPendingApprovals.get(conversationId) ?? [];
+    if (arraysOfRequestsEqual(previous, requests)) {
+      return;
+    }
+    if (requests.length === 0) {
+      lastEmittedPendingApprovals.delete(conversationId);
+    } else {
+      lastEmittedPendingApprovals.set(conversationId, requests);
+    }
+    try {
+      options.onPendingApprovalsChange?.({ threadId: conversationId, requests });
+    } catch {
+      // ignore listener errors
+    }
   }
 
   function updateStreamingFromAppChange(conversationId: string, change: JsonRecord): boolean | null {
@@ -232,6 +290,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     }
     appThreadStreamStates.delete(threadId);
     setStreamingState(threadId, false);
+    notifyPendingApprovalsIfChanged(threadId);
   }
 
   detachers.push(
@@ -334,14 +393,35 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     }
   }
 
-  async function startTurn(threadId: string, text: string): Promise<{ turn: { id: string } }> {
+  async function startTurn(
+    threadId: string,
+    text: string,
+    sendOptions?: CodexMirrorSendOptions
+  ): Promise<{ turn: { id: string } }> {
+    // Codex's thread-follower-start-turn takes the same payload shape as the
+    // app-server's turn/start. When the user has Plan mode toggled on the
+    // tablet (or pressed Shift+Tab in the desktop UI, which sets the same
+    // flag), we pass collaborationMode through so the desktop window enters
+    // plan mode for this turn — matching the local Codex experience exactly.
+    const collaborationModePayload =
+      sendOptions?.collaborationMode
+        ? {
+            mode: sendOptions.collaborationMode,
+            settings: {
+              model: sendOptions.model ?? null,
+              reasoning_effort: sendOptions.effort ?? null,
+              developer_instructions: null
+            }
+          }
+        : undefined;
     const response = await sendFollowerRequest<{ result: { turn: { id: string } } }>(
       'thread-follower-start-turn',
       {
         conversationId: threadId,
         turnStartParams: {
           threadId,
-          input: userTextInput(text)
+          input: userTextInput(text),
+          ...(collaborationModePayload ? { collaborationMode: collaborationModePayload } : {})
         }
       }
     );
@@ -372,7 +452,11 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     return options.reader.readTranscript(threadId);
   }
 
-  async function sendMessage(threadId: string, text: string): Promise<ThreadMessageResponse> {
+  async function sendMessage(
+    threadId: string,
+    text: string,
+    options?: CodexMirrorSendOptions
+  ): Promise<ThreadMessageResponse> {
     const trimmed = text.trim();
     if (!trimmed) {
       throw new SendBlockedError('ready', 'Cannot send an empty message.');
@@ -387,7 +471,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     const isStreaming = isThreadStreaming(threadId);
     const result = isStreaming
       ? await steerTurn(threadId, trimmed)
-      : await startTurn(threadId, trimmed);
+      : await startTurn(threadId, trimmed, options);
 
     const transcript = await readTranscript(threadId).catch(() =>
       buildFallbackTranscript(threadId, trimmed, isStreaming, result.turn.id)
@@ -449,6 +533,14 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       });
       return;
     }
+    if (method === 'mcpServer/elicitation/request') {
+      await sendFollowerRequest('thread-follower-submit-mcp-server-elicitation-response', {
+        conversationId: threadId,
+        requestId,
+        response
+      });
+      return;
+    }
     throw new Error(`Unsupported approval method: ${method}`);
   }
 
@@ -470,6 +562,11 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   function isThreadWaitingForApproval(threadId: string): boolean {
     const state = appThreadStreamStates.get(threadId);
     return state ? hasPendingApprovalRequest(state) : false;
+  }
+
+  function getPendingApprovalRequests(threadId: string): PendingApprovalRequest[] {
+    const state = appThreadStreamStates.get(threadId);
+    return state ? pendingApprovalsFromState(state) : [];
   }
 
   function waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean> {
@@ -508,6 +605,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     isThreadStreaming,
     isThreadCompacting,
     isThreadWaitingForApproval,
+    getPendingApprovalRequests,
     isThreadOwned,
     waitForOwnership,
     isConnected: () => ipc.isReady(),
@@ -522,6 +620,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       streamingThreads.clear();
       streamingUpdatedAtMs.clear();
       appThreadStreamStates.clear();
+      lastEmittedPendingApprovals.clear();
       ownedThreads.clear();
       ownershipWaiters.clear();
     }
@@ -531,7 +630,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
 function emptyAppThreadStreamState(lastUpdatedAtMs = Date.now()): AppThreadStreamState {
   return {
     activeItemKeys: new Set(),
-    approvalRequestIdsByKey: new Map(),
+    approvalRequestsByKey: new Map(),
     latestTurnIndex: null,
     latestTurnStatus: null,
     runtimeStatusType: null,
@@ -541,7 +640,36 @@ function emptyAppThreadStreamState(lastUpdatedAtMs = Date.now()): AppThreadStrea
 }
 
 function hasPendingApprovalRequest(state: AppThreadStreamState): boolean {
-  return state.approvalRequestIdsByKey.size > 0;
+  return state.approvalRequestsByKey.size > 0;
+}
+
+function pendingApprovalsFromState(state: AppThreadStreamState): PendingApprovalRequest[] {
+  // Deduplicate by request id — Codex sometimes surfaces the same approval as
+  // both a top-level `requests` entry and a turn-level `permissionRequest`
+  // item. We keep the first occurrence (which iterates in insertion order, so
+  // it matches the order Codex emitted them).
+  const byId = new Map<string, PendingApprovalRequest>();
+  for (const request of state.approvalRequestsByKey.values()) {
+    if (!byId.has(request.id)) {
+      byId.set(request.id, request);
+    }
+  }
+  return [...byId.values()];
+}
+
+function arraysOfRequestsEqual(
+  a: PendingApprovalRequest[],
+  b: PendingApprovalRequest[]
+): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i]!.id !== b[i]!.id || a[i]!.method !== b[i]!.method) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function isActiveAppThreadState(state: AppThreadStreamState): boolean {
@@ -655,7 +783,7 @@ function applyStreamPatch(state: AppThreadStreamState, rawPatch: unknown): void 
       threadRuntimeStatus: state.runtimeStatusType ? { type: state.runtimeStatusType } : undefined
     });
     state.activeItemKeys = rebuilt.activeItemKeys;
-    state.approvalRequestIdsByKey = rebuilt.approvalRequestIdsByKey;
+    state.approvalRequestsByKey = rebuilt.approvalRequestsByKey;
     state.latestTurnIndex = rebuilt.latestTurnIndex;
     state.latestTurnStatus = rebuilt.latestTurnStatus;
     state.isCompactingContext = rebuilt.isCompactingContext;
@@ -778,9 +906,9 @@ function trackInProgressItemsForTurn(
 function trackApprovalRequests(state: AppThreadStreamState, requests: unknown[]): void {
   requests.forEach((request, requestIndex) => {
     const key = `requests.${requestIndex}`;
-    const requestId = pendingApprovalRequestId(request);
-    if (requestId) {
-      state.approvalRequestIdsByKey.set(key, requestId);
+    const summary = pendingApprovalFromRequest(request);
+    if (summary) {
+      state.approvalRequestsByKey.set(key, summary);
     }
   });
 }
@@ -810,9 +938,9 @@ function applyApprovalRequestsPatch(
       deleteApprovalRequestKey(state, key);
       return;
     }
-    const requestId = pendingApprovalRequestId(value);
-    if (requestId) {
-      state.approvalRequestIdsByKey.set(key, requestId);
+    const summary = pendingApprovalFromRequest(value);
+    if (summary) {
+      state.approvalRequestsByKey.set(key, summary);
     } else {
       deleteApprovalRequestKey(state, key);
     }
@@ -842,9 +970,9 @@ function updateApprovalRequestKeyFromItem(
   item: unknown
 ): void {
   const key = activeItemKey(turnIndex, itemIndex);
-  const requestId = pendingApprovalItemRequestId(item);
-  if (requestId) {
-    state.approvalRequestIdsByKey.set(key, requestId);
+  const summary = pendingApprovalFromItem(item, turnIndex);
+  if (summary) {
+    state.approvalRequestsByKey.set(key, summary);
   } else {
     deleteApprovalRequestKey(state, key);
   }
@@ -882,18 +1010,18 @@ function removeApprovalRequestKeysWithPrefix(
   state: AppThreadStreamState,
   prefix: string
 ): void {
-  for (const key of [...state.approvalRequestIdsByKey.keys()]) {
+  for (const key of [...state.approvalRequestsByKey.keys()]) {
     if (key.startsWith(prefix)) {
-      state.approvalRequestIdsByKey.delete(key);
+      state.approvalRequestsByKey.delete(key);
     }
   }
 }
 
 function deleteApprovalRequestKey(state: AppThreadStreamState, key: string): void {
-  state.approvalRequestIdsByKey.delete(key);
+  state.approvalRequestsByKey.delete(key);
 }
 
-function pendingApprovalRequestId(request: unknown): string | null {
+function pendingApprovalFromRequest(request: unknown): PendingApprovalRequest | null {
   const object = asObject(request);
   if (!object) {
     return null;
@@ -901,10 +1029,29 @@ function pendingApprovalRequestId(request: unknown): string | null {
   const method = typeof object.method === 'string' ? object.method : null;
   const id = typeof object.id === 'string' ? object.id : null;
   const isCompleted = object.isCompleted === true || object.completed === true;
-  return method && id && APPROVAL_REQUEST_METHODS.has(method) && !isCompleted ? id : null;
+  if (!method || !id || isCompleted || !APPROVAL_REQUEST_METHODS.has(method)) {
+    return null;
+  }
+  const params = asObject(object.params) ?? undefined;
+  const itemId =
+    typeof params?.itemId === 'string'
+      ? params.itemId
+      : typeof params?.callId === 'string'
+        ? params.callId
+        : undefined;
+  return {
+    id,
+    method,
+    ...(params ? { params } : {}),
+    ...(itemId ? { itemId } : {}),
+    ...(typeof params?.turnId === 'string' ? { turnId: params.turnId } : {})
+  };
 }
 
-function pendingApprovalItemRequestId(item: unknown): string | null {
+function pendingApprovalFromItem(
+  item: unknown,
+  turnIndex: number
+): PendingApprovalRequest | null {
   const object = asObject(item);
   if (!object) {
     return null;
@@ -916,7 +1063,27 @@ function pendingApprovalItemRequestId(item: unknown): string | null {
   if (object.completed === true) {
     return null;
   }
-  return stringField(object, 'requestId') ?? stringField(object, 'id');
+  const id = stringField(object, 'requestId') ?? stringField(object, 'id');
+  if (!id) {
+    return null;
+  }
+  // Items don't always carry a `turnId` field, but we know which turn they
+  // came from, so we still need to surface params so the tablet can render
+  // permissions/reason exactly like the request-array form.
+  const reason = stringField(object, 'reason');
+  const permissions = asObject(object.permissions) ?? undefined;
+  const itemTurnId = stringField(object, 'turnId') ?? `turn-${turnIndex}`;
+  const params: Record<string, unknown> = {
+    turnId: itemTurnId,
+    ...(reason ? { reason } : {}),
+    ...(permissions ? { permissions } : {})
+  };
+  return {
+    id,
+    method: 'item/permissions/requestApproval',
+    params,
+    turnId: itemTurnId
+  };
 }
 
 function activeItemKey(turnIndex: number, itemIndex: number): string {

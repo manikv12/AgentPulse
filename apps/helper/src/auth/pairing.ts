@@ -82,6 +82,26 @@ export class DeviceRegistry {
     return nextDevice;
   }
 
+  async recoverDeviceSession(deviceId: string, fingerprint: string): Promise<DeviceRecord | undefined> {
+    const devices = await this.store.list();
+    const device = devices.find(
+      (candidate) =>
+        candidate.deviceId === deviceId && !candidate.revokedAt && candidate.fingerprint === fingerprint
+    );
+
+    if (!device) {
+      return undefined;
+    }
+
+    const nextDevice: DeviceRecord = {
+      ...device,
+      lastSeenAt: this.now().toISOString()
+    };
+
+    await this.store.save(nextDevice);
+    return nextDevice;
+  }
+
   async listPublicDevices(): Promise<PublicDeviceRecord[]> {
     const devices = await this.store.list();
     return devices.map(({ token, ...device }) => ({

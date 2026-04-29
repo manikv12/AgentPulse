@@ -130,6 +130,17 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+wait_for_pid_exit() {
+  local pid="$1"
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 echo
 log "Removing previous helper build so the next start always loads fresh code..."
 rm -rf "$repo_root/apps/helper/dist"
@@ -154,6 +165,16 @@ if [[ -n "$existing_pids" ]]; then
 fi
 
 eval "$(read_settings)"
+
+existing_port_pids="$(lsof -tiTCP:"$helper_port" -sTCP:LISTEN 2>/dev/null || true)"
+if [[ -n "$existing_port_pids" ]]; then
+  while IFS= read -r existing_pid; do
+    [[ -n "$existing_pid" ]] || continue
+    log "Stopping existing listener on port $helper_port (pid $existing_pid)..."
+    kill -TERM "$existing_pid" 2>/dev/null || true
+    wait_for_pid_exit "$existing_pid"
+  done <<< "$existing_port_pids"
+fi
 
 helper_port_for_vite="${AGENT_PULSE_HELPER_PORT:-$helper_port}"
 hmr_host_pre="$hostname"

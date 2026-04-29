@@ -6,9 +6,11 @@ import {
   type CatalogModel,
   type CatalogPlugin,
   type CatalogSkill,
+  type CollaborationModeKind,
   type HelperHealth,
   type LiveEvent,
   type PairingDeviceOption,
+  type PendingApprovalRequest,
   type Project,
   type RemoteAccessSettings,
   type Thread,
@@ -52,14 +54,19 @@ import {
   fetchProjectFiles,
   fetchProjects,
   fetchOlderThreadMessages,
+  fetchPendingApprovals,
+  fetchSeenThreadActivity,
   fetchThreadTranscript,
   fetchThreads,
+  importSeenThreadActivity,
+  markThreadSeenOnHelper,
   getFingerprint,
   liveEventsUrl,
   loadAdminToken,
   loadSession,
   openThreadInCodex,
   pairDevice,
+  recoverDeviceSession,
   respondToApproval,
   saveAdminToken,
   saveSession,
@@ -68,6 +75,7 @@ import {
   stopThreadWork,
   updateRemoteAccess,
   updateThreadModel,
+  AgentPulseApiError,
   type AgentPulseSession
 } from './api';
 import { CodexMark } from './CodexMark';
@@ -96,7 +104,6 @@ const TRANSCRIPTS_CACHE_KEY_PREFIX = 'agent-pulse:transcripts-cache:';
 const CACHED_TRANSCRIPT_MESSAGE_LIMIT = 40;
 const TRANSCRIPT_REFRESH_DEBOUNCE_MS = 250;
 const SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS = [750, 1_500];
-const ACTIVE_CODEX_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
 const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
 
 const ADMIN_FLEX_SCREENS = new Set<AppScreen>(['settings', 'admin-login', 'chooser']);
@@ -122,14 +129,36 @@ type AdminPairingPin = {
   deviceId?: string;
 };
 
-function extractConversationId(params: unknown): string | undefined {
-  if (!params || typeof params !== 'object') {
-    return undefined;
+function sameSession(
+  left: AgentPulseSession | undefined,
+  right: AgentPulseSession | undefined
+): boolean {
+  if (!left || !right) {
+    return left === right;
   }
-  const value =
-    (params as { conversationId?: unknown }).conversationId ??
-    (params as { threadId?: unknown }).threadId;
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+
+  return (
+    left.token === right.token &&
+    left.deviceId === right.deviceId &&
+    left.fingerprint === right.fingerprint
+  );
+}
+
+function parseSeenLocalStorage(raw: string | null): Record<string, number> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, number] =>
+          typeof entry[0] === 'string' && typeof entry[1] === 'number' && Number.isFinite(entry[1])
+      )
+    );
+  } catch {
+    return {};
+  }
 }
 
 function transcriptShowsLiveActive(transcript: ThreadTranscript): boolean {
@@ -147,83 +176,6 @@ function transcriptShowsLiveActive(transcript: ThreadTranscript): boolean {
     return true;
   }
   return false;
-}
-
-function extractStreamingChange(
-  params: unknown
-): { threadId: string; isStreaming: boolean } | undefined {
-  const threadId = extractConversationId(params);
-  if (!threadId || !params || typeof params !== 'object') {
-    return undefined;
-  }
-  const change = (params as { change?: unknown }).change;
-  if (!change || typeof change !== 'object') {
-    return undefined;
-  }
-  const isStreaming = (change as { isStreaming?: unknown }).isStreaming;
-  if (typeof isStreaming !== 'boolean') {
-    const derived = deriveStreamingFromCodexChange(change);
-    return typeof derived === 'boolean' ? { threadId, isStreaming: derived } : undefined;
-  }
-  return { threadId, isStreaming };
-}
-
-function deriveStreamingFromCodexChange(change: object): boolean | undefined {
-  const type = stringField(change, 'type');
-  if (type === 'snapshot') {
-    const conversationState = objectField(change, 'conversationState');
-    return conversationState ? conversationStateLooksStreaming(conversationState) : undefined;
-  }
-
-  if (type === 'patches') {
-    const patches = Array.isArray((change as { patches?: unknown }).patches)
-      ? ((change as { patches: unknown[] }).patches)
-      : [];
-    if (patches.some(patchLooksStreaming)) {
-      return true;
-    }
-  }
-
-  return undefined;
-}
-
-function conversationStateLooksStreaming(conversationState: object): boolean {
-  const runtimeStatus = objectField(conversationState, 'threadRuntimeStatus');
-  if (isActiveCodexStatus(stringField(runtimeStatus, 'type'))) {
-    return true;
-  }
-  const turns = arrayField(conversationState, 'turns');
-  const latestTurn = objectFromUnknown(turns.at(-1));
-  if (isActiveCodexStatus(stringField(latestTurn, 'status'))) {
-    return true;
-  }
-  return turns.some((rawTurn) =>
-    arrayField(rawTurn, 'items').some((item) =>
-      isActiveCodexStatus(stringField(objectFromUnknown(item), 'status'))
-    )
-  );
-}
-
-function patchLooksStreaming(rawPatch: unknown): boolean {
-  const patch = objectFromUnknown(rawPatch);
-  if (!patch) {
-    return false;
-  }
-  const value = (patch as { value?: unknown }).value;
-  if (isActiveCodexStatus(value)) {
-    return true;
-  }
-  if (isActiveCodexStatus(stringField(objectFromUnknown(value), 'status'))) {
-    return true;
-  }
-  const path = Array.isArray((patch as { path?: unknown }).path)
-    ? ((patch as { path: unknown[] }).path)
-    : [];
-  return path.at(-1) === 'status' && isActiveCodexStatus(value);
-}
-
-function isActiveCodexStatus(value: unknown): boolean {
-  return typeof value === 'string' && ACTIVE_CODEX_STATUSES.has(value);
 }
 
 function transcriptAfterStop(transcript: ThreadTranscript): ThreadTranscript {
@@ -249,7 +201,19 @@ export type PendingRequestSummary = {
   itemId?: string;
   turnId?: string;
   permissions?: Record<string, unknown>;
-  kind?: 'question' | 'plan' | 'commandApproval' | 'fileApproval' | 'permissionsApproval';
+  availableDecisions?: unknown[];
+  proposedExecpolicyAmendment?: string[];
+  // For requestUserInput we pass the raw `{ questions: [...] }` params through
+  // so the renderer can show suggestion buttons / a freeform input. Other
+  // request kinds don't need this and leave it undefined.
+  params?: Record<string, unknown>;
+  kind?:
+    | 'question'
+    | 'plan'
+    | 'commandApproval'
+    | 'fileApproval'
+    | 'permissionsApproval'
+    | 'mcpElicitationApproval';
 };
 
 export function extractPendingRequests(
@@ -257,6 +221,17 @@ export function extractPendingRequests(
   previous: PendingRequestSummary[] = []
 ): PendingRequestSummary[] {
   return extractPendingRequestsFromParams(params, previous) ?? [];
+}
+
+// Converts the helper's `PendingApprovalRequest[]` (raw `{id, method, params}`
+// shape, same as Codex's IPC) into the tablet's `PendingRequestSummary[]`
+// (with `kind`, `title`, `body`, etc.). Used by both the live
+// `thread/pending-approvals/changed` event and the on-demand
+// `/threads/:id/pending-approvals` fetch.
+export function summarizePendingApprovalsFromHelper(
+  requests: PendingApprovalRequest[]
+): PendingRequestSummary[] {
+  return summarizePendingRequests(requests);
 }
 
 function extractPendingRequestsFromParams(
@@ -405,14 +380,26 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
   if (method === 'item/tool/requestUserInput') {
     const params = (req.params ?? {}) as { questions?: unknown; turnId?: unknown };
     const questions = Array.isArray(params.questions) ? params.questions : [];
-    const first = questions[0] as { header?: string; question?: string } | undefined;
+    const first = questions[0] as
+      | {
+          header?: string;
+          question?: string;
+          suggestions?: unknown;
+          answerType?: unknown;
+          name?: string;
+        }
+      | undefined;
     return {
       id,
       method,
       kind: 'question',
       title: first?.header ?? 'Codex needs more information',
       body: first?.question,
-      turnId: typeof params.turnId === 'string' ? params.turnId : undefined
+      turnId: typeof params.turnId === 'string' ? params.turnId : undefined,
+      // Pass the raw params through so the renderer can show answer options
+      // (suggestions / freeform input) — without this the tablet just shows
+      // "Open Codex on your Mac to answer." with no way to respond.
+      params: req.params as Record<string, unknown> | undefined
     };
   }
   if (method === 'item/plan/requestImplementation') {
@@ -432,6 +419,7 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
     method === 'item/fileChange/requestApproval' ||
     method === 'item/permissions/requestApproval'
   ) {
+    const rawParams = recordFromUnknown(req.params) ?? {};
     const params = (req.params ?? {}) as {
       itemId?: unknown;
       turnId?: unknown;
@@ -457,13 +445,145 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
             : typeof params.reason === 'string' && params.reason.trim().length > 0
               ? params.reason.trim()
               : 'Approve permissions?',
-      body: isPermissionsApproval ? describePermissions(permissions) : undefined,
+      body:
+        method === 'item/commandExecution/requestApproval'
+          ? describeExecCommandApproval(rawParams)
+          : isPermissionsApproval
+            ? describePermissions(permissions)
+            : undefined,
       permissions,
+      availableDecisions: optionalArrayField(rawParams, 'availableDecisions'),
+      proposedExecpolicyAmendment: stringArrayField(rawParams, 'proposedExecpolicyAmendment'),
       itemId: typeof params.itemId === 'string' ? params.itemId : undefined,
       turnId: typeof params.turnId === 'string' ? params.turnId : undefined
     };
   }
+  if (method === 'execCommandApproval') {
+    const params = recordFromUnknown(req.params) ?? {};
+    return {
+      id,
+      method,
+      kind: 'commandApproval',
+      title: 'Approve command?',
+      body: describeExecCommandApproval(params),
+      availableDecisions: optionalArrayField(params, 'availableDecisions'),
+      proposedExecpolicyAmendment: stringArrayField(params, 'proposedExecpolicyAmendment'),
+      itemId: stringField(params, 'callId'),
+      turnId: stringField(params, 'turnId')
+    };
+  }
+  if (method === 'applyPatchApproval') {
+    const params = recordFromUnknown(req.params) ?? {};
+    return {
+      id,
+      method,
+      kind: 'fileApproval',
+      title: 'Approve file changes?',
+      body: describeApplyPatchApproval(params),
+      availableDecisions: optionalArrayField(params, 'availableDecisions'),
+      itemId: stringField(params, 'callId'),
+      turnId: stringField(params, 'turnId')
+    };
+  }
+  if (method === 'mcpServer/elicitation/request') {
+    const params = recordFromUnknown(req.params) ?? {};
+    const title = stringField(params, 'message')?.trim() || 'Codex needs approval';
+    return {
+      id,
+      method,
+      kind: 'mcpElicitationApproval',
+      title,
+      body: describeMcpElicitation(params),
+      turnId: stringField(params, 'turnId')
+    };
+  }
   return null;
+}
+
+function optionalArrayField(params: Record<string, unknown>, key: string): unknown[] | undefined {
+  const values = arrayField(params, key);
+  return values.length > 0 ? values : undefined;
+}
+
+function stringArrayField(params: Record<string, unknown>, key: string): string[] | undefined {
+  const values = arrayField(params, key).filter((value): value is string => typeof value === 'string');
+  return values.length > 0 ? values : undefined;
+}
+
+function describeExecCommandApproval(params: Record<string, unknown>): string | undefined {
+  const lines: string[] = [];
+  const command = arrayField(params, 'command').filter(
+    (part): part is string => typeof part === 'string'
+  );
+  if (command.length > 0) {
+    lines.push(`Command: ${command.join(' ')}`);
+  } else {
+    const commandText = stringField(params, 'command');
+    if (commandText) {
+      lines.push(`Command: ${commandText}`);
+    }
+  }
+  const cwd = stringField(params, 'cwd');
+  if (cwd) {
+    lines.push(`Folder: ${cwd}`);
+  }
+  const reason = stringField(params, 'reason');
+  if (reason) {
+    lines.push(`Reason: ${reason}`);
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined;
+}
+
+function describeApplyPatchApproval(params: Record<string, unknown>): string | undefined {
+  const lines: string[] = [];
+  const fileChanges = recordFromUnknown(params.fileChanges);
+  const files = fileChanges ? Object.keys(fileChanges) : [];
+  if (files.length > 0) {
+    const visibleFiles = files.slice(0, 8);
+    lines.push(`Files: ${visibleFiles.join(', ')}${files.length > visibleFiles.length ? ', ...' : ''}`);
+  }
+  const grantRoot = stringField(params, 'grantRoot');
+  if (grantRoot) {
+    lines.push(`Folder access: ${grantRoot}`);
+  }
+  const reason = stringField(params, 'reason');
+  if (reason) {
+    lines.push(`Reason: ${reason}`);
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined;
+}
+
+function describeMcpElicitation(params: Record<string, unknown>): string | undefined {
+  const metadata = recordFromUnknown(params._meta);
+  const toolParams = recordFromUnknown(metadata?.tool_params);
+  const connectorName =
+    stringField(metadata, 'connector_name') ?? humanizeIdentifier(stringField(params, 'serverName'));
+  const targetName =
+    stringField(toolParams, 'app') ??
+    stringField(toolParams, 'application') ??
+    stringField(toolParams, 'appName') ??
+    stringField(toolParams, 'name');
+  if (connectorName && targetName) {
+    return `${connectorName} wants to use ${targetName}.`;
+  }
+  if (connectorName) {
+    return `${connectorName} is asking for approval.`;
+  }
+  if (targetName) {
+    return `Codex wants to use ${targetName}.`;
+  }
+  return undefined;
+}
+
+function humanizeIdentifier(value: string | undefined): string | undefined {
+  const cleaned = value
+    ?.replace(/^connector[_-]/, '')
+    .replace(/[_-]+/g, ' ')
+    .trim();
+  if (!cleaned) {
+    return undefined;
+  }
+  return cleaned.replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function applyPendingRequestPatches(
@@ -936,10 +1056,50 @@ function upsertTranscriptCache(
       ? { ...transcript, usage: previous.usage }
       : transcript;
 
+  if (previous && transcriptLooksOlder(stableTranscript, previous)) {
+    return current;
+  }
+
   return {
     ...current,
     [transcript.threadId]: cacheableTranscript(stableTranscript)
   };
+}
+
+function transcriptLooksOlder(candidate: ThreadTranscript, previous: ThreadTranscript): boolean {
+  const previousLatest = latestTranscriptMessage(previous);
+  if (!previousLatest) {
+    return false;
+  }
+
+  if (candidate.messages.some((message) => message.id === previousLatest.id)) {
+    return false;
+  }
+
+  const candidateLatest = latestTranscriptMessage(candidate);
+  if (!candidateLatest) {
+    return true;
+  }
+
+  return candidateLatest.createdAt < previousLatest.createdAt;
+}
+
+function latestTranscriptMessage(
+  transcript: ThreadTranscript
+): { id: string; createdAt: number } | undefined {
+  return transcript.messages.reduce<{ id: string; createdAt: number } | undefined>(
+    (latest, message) => {
+      const createdAt = Date.parse(message.createdAt);
+      if (!Number.isFinite(createdAt)) {
+        return latest;
+      }
+      if (!latest || createdAt >= latest.createdAt) {
+        return { id: message.id, createdAt };
+      }
+      return latest;
+    },
+    undefined
+  );
 }
 
 function removeTranscriptCache(
@@ -953,6 +1113,10 @@ function removeTranscriptCache(
   const next = { ...current };
   delete next[threadId];
   return next;
+}
+
+function threadStatusLooksWorking(status: Thread['status']): boolean {
+  return status === 'running' || status === 'waiting_approval' || status === 'compacting';
 }
 
 export function App() {
@@ -972,19 +1136,16 @@ export function App() {
   const [threadModels, setThreadModels] = useState<Record<string, string>>({});
   const [threadReasoningEfforts, setThreadReasoningEfforts] = useState<Record<string, string>>({});
   // Tracks user-initiated picks per thread (model + effort + timestamp). Codex's persisted thread
-  // record lags the live IPC change — `thread/resume` keeps reporting the old slug/effort until a
-  // turn starts with the new one. We hold onto the user's pick for a short window so transcript
-  // polls don't visibly flip the chip back to the previous selection.
+  // snapshot can lag until a turn starts with the new model, so we hold the user's pick briefly
+  // instead of letting transcript polls visibly flip the chip back.
   const userModelPicksRef = useRef<
     Map<string, { modelSlug: string; reasoningEffort?: string; pickedAt: number }>
   >(new Map());
   const USER_MODEL_PICK_TTL_MS = 30_000;
 
-  // Coalesce transcript refetches per thread. Codex emits many `thread-stream-state-changed`
-  // broadcasts per turn — without this we'd start a new HTTP request on every patch and end
-  // up with dozens of in-flight transcript fetches racing each other through Cloudflare,
-  // each canceling the previous one. Now: at most one in-flight per thread, with a debounced
-  // trailing fetch armed when broadcasts arrive while one is in flight.
+  // Coalesce transcript refetches per thread. Live app-server events can arrive in bursts,
+  // and every redundant HTTP fetch can race through Cloudflare with older data. Keep one
+  // in-flight request per thread, with a debounced trailing fetch when more events arrive.
   const transcriptFetchStateRef = useRef<
     Map<string, { inFlight: boolean; pending: boolean; trailingTimer: number | undefined }>
   >(new Map());
@@ -1034,6 +1195,12 @@ export function App() {
   );
 
   const [streamingThreadIds, setStreamingThreadIds] = useState<Set<string>>(() => new Set());
+  // Helper-synced "user has reviewed this thread at" map. Populated from
+  // /threads/seen-activity on session connect, then kept fresh by the
+  // thread/seen-activity/changed live event. Dashboard merges this with its
+  // local optimistic state so taps register instantly even before the broadcast
+  // round-trips.
+  const [seenThreadActivity, setSeenThreadActivity] = useState<Record<string, number>>({});
 
   const markThreadWorking = useCallback((threadId: string) => {
     setStreamingThreadIds((current) => {
@@ -1057,8 +1224,44 @@ export function App() {
     });
   }, []);
 
-  // Coalesced + debounced transcript refetch. Codex desktop IPC is the source of truth for
-  // working/ready state; this fetch only fills in message text after a live patch arrives.
+  const applyTranscriptActivityState = useCallback(
+    (transcript: ThreadTranscript) => {
+      if (transcriptShowsLiveActive(transcript)) {
+        markThreadWorking(transcript.threadId);
+        return;
+      }
+
+      markThreadReady(transcript.threadId);
+      setThreads((current) =>
+        current.map((thread) =>
+          thread.threadId === transcript.threadId && threadStatusLooksWorking(thread.status)
+            ? { ...thread, status: 'idle' as const }
+            : thread
+        )
+      );
+    },
+    [markThreadReady, markThreadWorking]
+  );
+
+  const syncWorkingStateFromThreads = useCallback((nextThreads: Thread[]) => {
+    setStreamingThreadIds((current) => {
+      let next = current;
+      for (const thread of nextThreads) {
+        const shouldWork = threadStatusLooksWorking(thread.status);
+        if (shouldWork && !next.has(thread.threadId)) {
+          next = new Set(next);
+          next.add(thread.threadId);
+        } else if (!shouldWork && next.has(thread.threadId)) {
+          next = new Set(next);
+          next.delete(thread.threadId);
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  // Coalesced + debounced transcript refetch. App-server notifications are the source of truth
+  // for working/ready state; this fetch fills in message text after live patches arrive.
   const requestTranscriptRefresh = useCallback(
     (threadId: string) => {
       const currentSession = session;
@@ -1083,6 +1286,7 @@ export function App() {
         try {
           const transcript = await fetchThreadTranscript(currentSession, threadId);
           setTranscripts((current) => upsertTranscriptCache(current, transcript));
+          applyTranscriptActivityState(transcript);
           applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
         } catch {
           // Ignore transient refresh failures; the next live broadcast can retry.
@@ -1109,7 +1313,7 @@ export function App() {
         }
       })();
     },
-    [session, applyTranscriptModel]
+    [session, applyTranscriptActivityState, applyTranscriptModel]
   );
 
   const requestSettledTranscriptRefresh = useCallback(
@@ -1163,6 +1367,38 @@ export function App() {
     const id = window.setTimeout(() => setMessage(''), 2500);
     return () => window.clearTimeout(id);
   }, [message]);
+
+  // Reconnect-time fallback for pending approvals.
+  //
+  // The live `thread/pending-approvals/changed` event keeps `threadPendingRequests`
+  // up to date while the websocket is connected. But on a fresh page load or
+  // a mid-broadcast reconnect the tablet may have missed the push, so the
+  // active thread shows `waiting_approval` with no approval rows. In that case
+  // we ask the helper directly via /threads/:id/pending-approvals.
+  useEffect(() => {
+    if (!session || !activeThreadId) return;
+    const activeThread = threads.find((thread) => thread.threadId === activeThreadId);
+    if (!activeThread || activeThread.status !== 'waiting_approval') return;
+    if ((threadPendingRequests[activeThreadId] ?? []).length > 0) return;
+
+    let cancelled = false;
+    void fetchPendingApprovals(session, activeThreadId)
+      .then((requests) => {
+        if (cancelled || requests.length === 0) return;
+        const summaries = summarizePendingApprovalsFromHelper(requests);
+        setThreadPendingRequests((current) => ({
+          ...current,
+          [activeThreadId]: summaries
+        }));
+      })
+      .catch(() => {
+        // Quiet — the helper might briefly be unreachable during reconnect.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session, activeThreadId, threads, threadPendingRequests]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -1222,6 +1458,7 @@ export function App() {
   }, [session?.deviceId]);
 
   const refresh = useCallback(async () => {
+    const requestSession = session;
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 5_000);
 
@@ -1230,7 +1467,13 @@ export function App() {
       setHealth(nextHealth);
       window.clearTimeout(timeout);
 
-      if (!session) {
+      // Pair/reconnect rotates credentials. If an older request finishes after that,
+      // ignore it instead of letting the stale result clear the new session.
+      if (!sameSession(loadSession(), requestSession)) {
+        return;
+      }
+
+      if (!requestSession) {
         setThreads([]);
         setTranscripts({});
         setThreadsLoaded(false);
@@ -1245,22 +1488,118 @@ export function App() {
       }
 
       setThreadsLoaded(false);
-      const nextThreads = await fetchThreads(session);
+      const nextThreads = await fetchThreads(requestSession);
+      if (!sameSession(loadSession(), requestSession)) {
+        return;
+      }
       setThreads(nextThreads);
+      syncWorkingStateFromThreads(nextThreads);
       setThreadsLoaded(true);
-      fetchProjects(session).then(setProjects).catch(() => setProjects([]));
-      fetchCatalogPlugins(session).then(setPlugins).catch(() => setPlugins([]));
-      fetchCatalogSkills(session).then(setSkills).catch(() => setSkills([]));
-      fetchCatalogCommands(session).then(setCommands).catch(() => setCommands([]));
-      fetchCatalogModels(session).then(setModels).catch(() => setModels([]));
+      fetchProjects(requestSession)
+        .then((nextProjects) => {
+          if (sameSession(loadSession(), requestSession)) {
+            setProjects(nextProjects);
+          }
+        })
+        .catch(() => {
+          if (sameSession(loadSession(), requestSession)) {
+            setProjects([]);
+          }
+        });
+
+      // Pull the helper's authoritative seen-thread map. If the local tablet
+      // had a localStorage map from before the helper started tracking this,
+      // import it once so users don't lose their existing review state on the
+      // first connect after the upgrade.
+      void (async () => {
+        try {
+          const localRaw = window.localStorage.getItem('agent-pulse:seen-thread-activity');
+          const localMap = parseSeenLocalStorage(localRaw);
+          let entries =
+            Object.keys(localMap).length > 0
+              ? await importSeenThreadActivity(requestSession, localMap)
+              : await fetchSeenThreadActivity(requestSession);
+          if (sameSession(loadSession(), requestSession)) {
+            setSeenThreadActivity(entries);
+          }
+        } catch {
+          // Soft-fail — Dashboard falls back to its localStorage copy when the
+          // override is empty.
+        }
+      })();
+      fetchCatalogPlugins(requestSession)
+        .then((nextPlugins) => {
+          if (sameSession(loadSession(), requestSession)) {
+            setPlugins(nextPlugins);
+          }
+        })
+        .catch(() => {
+          if (sameSession(loadSession(), requestSession)) {
+            setPlugins([]);
+          }
+        });
+      fetchCatalogSkills(requestSession)
+        .then((nextSkills) => {
+          if (sameSession(loadSession(), requestSession)) {
+            setSkills(nextSkills);
+          }
+        })
+        .catch(() => {
+          if (sameSession(loadSession(), requestSession)) {
+            setSkills([]);
+          }
+        });
+      fetchCatalogCommands(requestSession)
+        .then((nextCommands) => {
+          if (sameSession(loadSession(), requestSession)) {
+            setCommands(nextCommands);
+          }
+        })
+        .catch(() => {
+          if (sameSession(loadSession(), requestSession)) {
+            setCommands([]);
+          }
+        });
+      fetchCatalogModels(requestSession)
+        .then((nextModels) => {
+          if (sameSession(loadSession(), requestSession)) {
+            setModels(nextModels);
+          }
+        })
+        .catch(() => {
+          if (sameSession(loadSession(), requestSession)) {
+            setModels([]);
+          }
+        });
       setScreen((current) => (ADMIN_FLEX_SCREENS.has(current) ? current : 'dashboard'));
     } catch (error) {
       window.clearTimeout(timeout);
+      if (!sameSession(loadSession(), requestSession)) {
+        return;
+      }
       if (error instanceof Response && error.status === 403) {
         setScreen('revoked');
         return;
       }
       if (error instanceof Response && error.status === 401) {
+        if (requestSession) {
+          try {
+            const recovered = await recoverDeviceSession(requestSession);
+            const nextSession = {
+              ...requestSession,
+              token: recovered.token,
+              deviceId: recovered.deviceId,
+              deviceName: recovered.deviceName
+            };
+            saveSession(nextSession);
+            setSession(nextSession);
+            setScreen((current) => (ADMIN_FLEX_SCREENS.has(current) ? current : 'dashboard'));
+            return;
+          } catch {
+            // Fall through to the old reset behavior when the helper confirms this
+            // browser is not the saved device anymore.
+          }
+        }
         clearSession();
         setSession(undefined);
         setThreads([]);
@@ -1273,7 +1612,7 @@ export function App() {
       setThreadsLoaded(false);
       setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
     }
-  }, [session]);
+  }, [session, syncWorkingStateFromThreads]);
 
   useEffect(() => {
     void refresh();
@@ -1311,18 +1650,10 @@ export function App() {
             liveEvent.payload,
             ...current.filter((thread) => thread.threadId !== liveEvent.payload.threadId)
           ]);
-          if (
-            liveEvent.payload.status === 'idle' ||
-            liveEvent.payload.status === 'error' ||
-            liveEvent.payload.status === 'connection' ||
-            liveEvent.payload.status === 'unknown'
-          ) {
-            markThreadReady(liveEvent.payload.threadId);
-          } else if (
-            liveEvent.payload.status === 'waiting_approval' ||
-            liveEvent.payload.status === 'compacting'
-          ) {
+          if (threadStatusLooksWorking(liveEvent.payload.status)) {
             markThreadWorking(liveEvent.payload.threadId);
+          } else {
+            markThreadReady(liveEvent.payload.threadId);
           }
         }
 
@@ -1335,9 +1666,10 @@ export function App() {
 
         if (liveEvent.type === 'thread/transcript/changed') {
           setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
-          if (transcriptShowsLiveActive(liveEvent.payload)) {
-            markThreadWorking(liveEvent.payload.threadId);
+          if (!liveEvent.payload.usage) {
+            requestTranscriptRefresh(liveEvent.payload.threadId);
           }
+          applyTranscriptActivityState(liveEvent.payload);
           applyTranscriptModel(
             liveEvent.payload.threadId,
             liveEvent.payload.model,
@@ -1345,14 +1677,57 @@ export function App() {
           );
         }
 
+        if (liveEvent.type === 'thread/status/changed') {
+          const { threadId, status } = liveEvent.payload;
+          setThreads((current) =>
+            current.map((thread) =>
+              thread.threadId === threadId ? { ...thread, status } : thread
+            )
+          );
+          if (status === 'running' || status === 'waiting_approval' || status === 'compacting') {
+            markThreadWorking(threadId);
+          } else {
+            markThreadReady(threadId);
+          }
+        }
+
         if (liveEvent.type === 'thread/streaming-changed') {
           const { threadId, isStreaming } = liveEvent.payload;
           if (isStreaming) {
             markThreadWorking(threadId);
           } else {
+            // Don't flip thread.status to idle from streaming-changed alone — Codex briefly
+            // pauses streaming between items inside one turn, and that would make the
+            // working badge flicker. Let thread/status/changed (active→idle) be the only
+            // thing that idles the thread; meanwhile we drop the spinner immediately and
+            // refresh the transcript so the latest reply text lands.
             markThreadReady(threadId);
             requestSettledTranscriptRefresh(threadId);
           }
+        }
+
+        if (liveEvent.type === 'thread/pending-approvals/changed') {
+          // Helper-driven push of the current pending approval requests for a thread.
+          const { threadId, requests } = liveEvent.payload;
+          const summaries = summarizePendingApprovalsFromHelper(requests);
+          setThreadPendingRequests((current) => ({
+            ...current,
+            [threadId]: summaries
+          }));
+        }
+
+        if (liveEvent.type === 'thread/seen-activity/changed') {
+          // Another paired device reviewed this thread (or this device echoed
+          // back). Keep our local map in sync so the Review chip drops in
+          // realtime everywhere.
+          const { threadId, seenAt } = liveEvent.payload;
+          setSeenThreadActivity((current) => {
+            const previous = current[threadId] ?? 0;
+            if (previous >= seenAt) {
+              return current;
+            }
+            return { ...current, [threadId]: seenAt };
+          });
         }
 
         if (liveEvent.type === 'catalog/changed') {
@@ -1369,54 +1744,6 @@ export function App() {
           return;
         }
 
-        if (liveEvent.type === 'codex/broadcast') {
-          const { method, params } = liveEvent.payload;
-          const conversationId = extractConversationId(params);
-          if (!conversationId) {
-            return;
-          }
-
-          if (method === 'thread-stream-state-changed') {
-            const streamingChange = extractStreamingChange(params);
-            if (streamingChange) {
-              if (streamingChange.isStreaming) {
-                markThreadWorking(streamingChange.threadId);
-              } else {
-                markThreadReady(streamingChange.threadId);
-                requestSettledTranscriptRefresh(streamingChange.threadId);
-              }
-            }
-          }
-
-          applyTranscriptModel(
-            conversationId,
-            extractLatestModel(params),
-            extractLatestReasoningEffort(params)
-          );
-
-          setThreadPendingRequests((current) => {
-            const pending = extractPendingRequestsFromParams(params, current[conversationId] ?? []);
-            if (!pending) {
-              return current;
-            }
-            return {
-              ...current,
-              [conversationId]: pending
-            };
-          });
-
-          if (
-            method === 'thread-stream-state-changed' ||
-            method === 'thread/status/changed' ||
-            method === 'thread/compacted' ||
-            method === 'thread-queued-followups-changed' ||
-            method === 'thread-archived' ||
-            method === 'thread-unarchived' ||
-            method === 'query-cache-invalidate'
-          ) {
-            requestTranscriptRefresh(conversationId);
-          }
-        }
       };
       socket.onclose = () => {
         if (closingFromCleanup || !loadSession()) {
@@ -1440,11 +1767,13 @@ export function App() {
     };
   }, [
     session,
+    applyTranscriptActivityState,
     applyTranscriptModel,
     markThreadReady,
     markThreadWorking,
     requestTranscriptRefresh,
-    requestSettledTranscriptRefresh
+    requestSettledTranscriptRefresh,
+    syncWorkingStateFromThreads
   ]);
 
   const handlePair = async (input: PairingSubmission) => {
@@ -1537,18 +1866,62 @@ export function App() {
     [session]
   );
 
+  const handleMarkThreadSeen = useCallback(
+    (threadId: string, seenAt: number) => {
+      // Optimistic update so the Review chip drops without waiting for the
+      // helper round-trip. The live broadcast will reconcile any drift.
+      setSeenThreadActivity((current) => {
+        const previous = current[threadId] ?? 0;
+        if (previous >= seenAt) {
+          return current;
+        }
+        return { ...current, [threadId]: seenAt };
+      });
+      if (!session) {
+        return;
+      }
+      void markThreadSeenOnHelper(session, threadId, seenAt).catch(() => {
+        // Soft-fail; the next session-connect re-syncs from the helper.
+      });
+    },
+    [session]
+  );
+
   const handleSendMessage = useCallback(
-    async (threadId: string, text: string) => {
+    async (
+      threadId: string,
+      text: string,
+      options?: { collaborationMode?: CollaborationModeKind }
+    ) => {
       if (!session) {
         return Promise.reject(new Error('Not connected.'));
       }
 
-      const result = await sendThreadMessage(session, threadId, text);
-      setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
+      // Snapshot existing message ids so we can tell whether the send-response transcript
+      // already includes the new user message or is just an echo of the previous turn.
+      // The Codex app server can return `thread/read` results that haven't ingested the
+      // just-started turn yet, and committing that to the cache would make ThreadView
+      // re-show the previous turn's assistant reply under the optimistic bubble.
+      const trimmedSendText = text.trim();
+      const previousTranscript = transcripts[threadId];
+      const baselineMessageIds = new Set(
+        previousTranscript?.messages.map((message) => message.id) ?? []
+      );
+      const result = await sendThreadMessage(session, threadId, text, options);
+      const responseHasNewUserMessage = result.transcript.messages.some(
+        (message) =>
+          message.role === 'user' &&
+          message.text.trim() === trimmedSendText &&
+          !baselineMessageIds.has(message.id)
+      );
+      if (responseHasNewUserMessage) {
+        setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
+      }
+      applyTranscriptActivityState(result.transcript);
       applyTranscriptModel(threadId, result.transcript.model, result.transcript.reasoningEffort);
       return result;
     },
-    [session, applyTranscriptModel]
+    [session, transcripts, applyTranscriptActivityState, applyTranscriptModel]
   );
 
   const markThreadStopped = useCallback((threadId: string) => {
@@ -1573,9 +1946,17 @@ export function App() {
         return Promise.reject(new Error('Not connected.'));
       }
 
-      await stopThreadWork(session, threadId);
-      markThreadStopped(threadId);
-      requestTranscriptRefresh(threadId);
+      try {
+        await stopThreadWork(session, threadId);
+        markThreadStopped(threadId);
+        requestTranscriptRefresh(threadId);
+      } catch (error) {
+        if (error instanceof AgentPulseApiError && error.reason === 'missing_active_turn') {
+          markThreadStopped(threadId);
+          requestTranscriptRefresh(threadId);
+        }
+        throw error;
+      }
     },
     [session, markThreadStopped, requestTranscriptRefresh]
   );
@@ -1737,6 +2118,8 @@ export function App() {
                 }
               : undefined
           }
+          seenThreadActivityOverride={seenThreadActivity}
+          onMarkThreadSeen={handleMarkThreadSeen}
         />
         {message ? <div className="toast">{message}</div> : null}
       </>
@@ -1770,7 +2153,9 @@ export function App() {
     threadReasoningEfforts,
     threads,
     threadsLoaded,
-    transcripts
+    transcripts,
+    seenThreadActivity,
+    handleMarkThreadSeen
   ]);
 
   return visibleScreen;
