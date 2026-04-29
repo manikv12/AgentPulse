@@ -753,22 +753,29 @@ export function ThreadView({
   // reply — without it, sending two messages in a row hides the first reply behind
   // the second user bubble.
   const sessionUserBaselineRef = useRef<Set<string>>(new Set());
+  // Tracks whether the session baseline has been seeded at least once. Kept
+  // separate from sessionUserBaselineRef so that an empty thread (zero user
+  // messages on open) is still recorded as "already seeded" — otherwise the
+  // first message the user sends would incorrectly be treated as pre-existing
+  // history and excluded from the visible tail.
+  const sessionBaselineSeededRef = useRef(false);
 
   const applyTranscriptWindow = (nextTranscript: ThreadTranscript) => {
     // Seed the session baseline from the *first* transcript we ever see for this
     // thread, BEFORE we split. The full transcript is what tells us which user
     // messages are pre-existing history; everything user-authored after this is
     // a turn from the current session that should stay visible with its reply.
-    if (sessionUserBaselineRef.current.size === 0) {
+    // We check sessionBaselineSeededRef (not the set's size) so that an empty
+    // thread — which has no user messages on open — is still counted as seeded.
+    if (!sessionBaselineSeededRef.current) {
       const baseline = new Set<string>();
       for (const message of nextTranscript.messages) {
         if (message.role === 'user') {
           baseline.add(message.id);
         }
       }
-      if (baseline.size > 0) {
-        sessionUserBaselineRef.current = baseline;
-      }
+      sessionUserBaselineRef.current = baseline;
+      sessionBaselineSeededRef.current = true;
     }
     const hasUnconfirmedPendingMessage = pendingMessagesRef.current.some(
       (pending) => !pendingMessageIsConfirmed(pending, nextTranscript.messages)
@@ -956,6 +963,7 @@ export function ThreadView({
     // Reset the per-session user-message baseline. It will be seeded by the first
     // transcript paint below.
     sessionUserBaselineRef.current = new Set();
+    sessionBaselineSeededRef.current = false;
   }, [thread.threadId]);
 
 

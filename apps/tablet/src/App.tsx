@@ -1510,15 +1510,23 @@ export function App() {
       // Pull the helper's authoritative seen-thread map. If the local tablet
       // had a localStorage map from before the helper started tracking this,
       // import it once so users don't lose their existing review state on the
-      // first connect after the upgrade.
+      // first connect after the upgrade. A migration-done flag prevents the
+      // import from firing on every page load — Dashboard continues writing
+      // to the same localStorage key, so the key will always have entries
+      // once any thread has been marked seen.
       void (async () => {
         try {
+          const MIGRATION_FLAG_KEY = 'agent-pulse:seen-migration-v1';
+          const migrationDone = window.localStorage.getItem(MIGRATION_FLAG_KEY) === '1';
           const localRaw = window.localStorage.getItem('agent-pulse:seen-thread-activity');
           const localMap = parseSeenLocalStorage(localRaw);
-          let entries =
-            Object.keys(localMap).length > 0
-              ? await importSeenThreadActivity(requestSession, localMap)
-              : await fetchSeenThreadActivity(requestSession);
+          let entries: Record<string, number>;
+          if (!migrationDone && Object.keys(localMap).length > 0) {
+            entries = await importSeenThreadActivity(requestSession, localMap);
+            window.localStorage.setItem(MIGRATION_FLAG_KEY, '1');
+          } else {
+            entries = await fetchSeenThreadActivity(requestSession);
+          }
           if (sameSession(loadSession(), requestSession)) {
             setSeenThreadActivity(entries);
           }

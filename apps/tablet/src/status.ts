@@ -1,4 +1,4 @@
-import type { ThreadStatus } from '@agent-pulse/shared';
+import type { Thread, ThreadStatus } from '@agent-pulse/shared';
 
 export const statusLabels: Record<ThreadStatus, string> = {
   idle: 'Idle',
@@ -22,6 +22,16 @@ export const statusTone: Record<ThreadStatus, string> = {
 
 export function isAttentionStatus(status: ThreadStatus): boolean {
   return status === 'waiting_approval' || status === 'error' || status === 'connection';
+}
+
+export function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
+  const seenAt = seenThreadActivity[thread.threadId] ?? 0;
+  const activityAt = Date.parse(thread.lastActivityAt);
+  return Number.isFinite(activityAt) && activityAt > seenAt;
+}
+
+export function threadNeedsReview(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
+  return thread.status === 'idle' && hasUnseenActivity(thread, seenThreadActivity);
 }
 
 export function relativeTime(value: string): string {

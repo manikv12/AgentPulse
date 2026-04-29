@@ -15,6 +15,7 @@ import {
   CatalogModelsResponseSchema,
   CatalogPluginsResponseSchema,
   CatalogSkillsResponseSchema,
+  ChatMessageSchema,
   DeviceSessionRecoveryRequestSchema,
   DeviceRevokeRequestSchema,
   HelperHealthSchema,
@@ -916,11 +917,13 @@ function createApp(
     }
     const threadId = context.req.param('threadId');
     const parsed = SeenThreadActivityMarkRequestSchema.parse(await context.req.json());
-    await options.seenThreadStore.markSeen(threadId, parsed.seenAt);
-    hub.broadcast({
-      type: 'thread/seen-activity/changed',
-      payload: { threadId, seenAt: parsed.seenAt }
-    });
+    const effectiveSeenAt = await options.seenThreadStore.markSeen(threadId, parsed.seenAt);
+    if (effectiveSeenAt !== null) {
+      hub.broadcast({
+        type: 'thread/seen-activity/changed',
+        payload: { threadId, seenAt: effectiveSeenAt }
+      });
+    }
     return context.json({ ok: true });
   });
 
@@ -1172,7 +1175,7 @@ function createApp(
       // falls through and behaves as a normal user message.
       const slashCommand = matchBareSlashCommand(parsed.text);
       if (slashCommand) {
-        const handled = await handleSlashCommand(slashCommand, threadId, options.appServer, hub);
+        const handled = await handleSlashCommand(slashCommand, parsed.text, threadId, options.appServer, hub);
         if (handled) {
           return context.json(handled);
         }
@@ -2414,6 +2417,7 @@ function matchBareSlashCommand(text: string): string | null {
 // turn was created.
 async function handleSlashCommand(
   command: string,
+  originalText: string,
   threadId: string,
   appServer: AppServerChatBridge | undefined,
   hub: LiveEventHub
@@ -2430,7 +2434,7 @@ async function handleSlashCommand(
       type: 'thread/status/changed',
       payload: { threadId, status: 'compacting' }
     });
-    return slashCommandAckResponse(threadId, 'compact');
+    return slashCommandAckResponse(threadId, command, originalText);
   }
 
   if (command === 'review') {
@@ -2441,7 +2445,7 @@ async function handleSlashCommand(
       );
     }
     await appServer.startReview(threadId);
-    return slashCommandAckResponse(threadId, 'review');
+    return slashCommandAckResponse(threadId, command, originalText);
   }
 
   // Commands we recognize but don't have a dedicated RPC path for — better to
@@ -2456,16 +2460,29 @@ async function handleSlashCommand(
   return null;
 }
 
-function slashCommandAckResponse(threadId: string, command: string): ThreadMessageResponse {
-  // Codex doesn't return a transcript for fire-and-forget commands. We hand
-  // back an empty draft transcript so the tablet's send path resolves cleanly;
-  // the next live notification (item/started for compact, etc.) will refresh
-  // the visible state through the normal channels.
+function slashCommandAckResponse(threadId: string, command: string, originalText: string): ThreadMessageResponse {
+  // Codex doesn't return a transcript for fire-and-forget commands. We include
+  // a synthetic user message matching the slash text so the tablet's pending
+  // bubble is confirmed (pendingMessageIsConfirmed checks for a user message
+  // with matching text). Without it, the optimistic bubble stays "unconfirmed"
+  // indefinitely and the visible tail gets blanked.
+  const syntheticMessage = ChatMessageSchema.parse({
+    id: `slash:${command}:${threadId}`,
+    role: 'user',
+    kind: 'message',
+    text: originalText,
+    createdAt: new Date().toISOString()
+  });
   return ThreadMessageResponseSchema.parse({
     ok: true,
     mode: 'start',
     turnId: `slash:${command}:${threadId}`,
-    transcript: emptyDraftTranscript(threadId)
+    transcript: {
+      threadId,
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [syntheticMessage]
+    }
   });
 }
 

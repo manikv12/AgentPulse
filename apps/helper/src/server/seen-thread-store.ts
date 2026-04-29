@@ -66,9 +66,9 @@ export class SeenThreadStore {
     return out;
   }
 
-  async markSeen(threadId: string, seenAt: number): Promise<void> {
+  async markSeen(threadId: string, seenAt: number): Promise<number | null> {
     if (!threadId.trim() || !Number.isFinite(seenAt)) {
-      return;
+      return null;
     }
     const nowMs = this.now();
     const previous = this.cache.entries[threadId];
@@ -81,6 +81,7 @@ export class SeenThreadStore {
     };
     this.pruneOlderThan(ENTRY_TTL_MS);
     await this.persist();
+    return nextSeenAt;
   }
 
   // Drop entries for threads that no longer exist. Called by the polling loop

@@ -18,7 +18,7 @@ import { DashboardInsights } from './DashboardInsights';
 import { Sidebar } from './Sidebar';
 import { Spinner } from './Spinner';
 import { ThreadView } from './ThreadView';
-import { relativeTime, statusLabels, statusTone } from './status';
+import { relativeTime, statusLabels, statusTone, hasUnseenActivity, threadNeedsReview } from './status';
 
 const SEEN_ACTIVITY_KEY = 'agent-pulse:seen-thread-activity';
 const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
@@ -467,12 +467,6 @@ function markThreadSeen(
   });
 }
 
-function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
-  const seenAt = seenThreadActivity[thread.threadId] ?? 0;
-  const activityAt = Date.parse(thread.lastActivityAt);
-  return Number.isFinite(activityAt) && activityAt > seenAt;
-}
-
 function NewThreadDialog({
   projects,
   models,
@@ -752,8 +746,4 @@ function EmptyMain({
       ) : null}
     </section>
   );
-}
-
-function threadNeedsReview(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
-  return thread.status === 'idle' && hasUnseenActivity(thread, seenThreadActivity);
 }

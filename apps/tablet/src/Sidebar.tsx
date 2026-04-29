@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { CodexMark } from './CodexMark';
-import { isAttentionStatus, relativeTime, statusTone } from './status';
+import { hasUnseenActivity, isAttentionStatus, relativeTime, statusTone, threadNeedsReview } from './status';
 import { useThemePreference, type ThemePreference } from './theme';
 
 const COLLAPSED_KEY = 'agent-pulse:sidebar-collapsed';
@@ -468,14 +468,4 @@ export function Sidebar({
       </footer>
     </aside>
   );
-}
-
-function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
-  const seenAt = seenThreadActivity[thread.threadId] ?? 0;
-  const activityAt = Date.parse(thread.lastActivityAt);
-  return Number.isFinite(activityAt) && activityAt > seenAt;
-}
-
-function threadNeedsReview(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
-  return thread.status === 'idle' && hasUnseenActivity(thread, seenThreadActivity);
 }
