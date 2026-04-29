@@ -1989,9 +1989,17 @@ function PendingRequestRow({
   };
 
   // Build the response shape Codex expects for item/tool/requestUserInput.
-  // Each question in params.questions[] has a `name` we map to one answer.
-  const submitQuestionAnswer = async (label: string, answersByName: Record<string, string>) => {
-    await submit(label, { answers: answersByName });
+  // Codex's RequestUserInputResponse is `{ answers: HashMap<questionId,
+  // RequestUserInputAnswer> }` where RequestUserInputAnswer is
+  // `{ answers: Vec<String> }` (so multi-select is supported even though our UI
+  // is single-select for now). We wrap each per-question string into the
+  // single-element vector form Codex expects.
+  const submitQuestionAnswer = async (label: string, answersById: Record<string, string>) => {
+    const wrapped: Record<string, { answers: string[] }> = {};
+    for (const [questionId, answer] of Object.entries(answersById)) {
+      wrapped[questionId] = { answers: [answer] };
+    }
+    await submit(label, { answers: wrapped });
   };
 
   const denyQuestion = async () => {
@@ -2208,25 +2216,36 @@ function QuestionAnswerForm({
     return raw.questions.flatMap((entry, index) => {
       if (!entry || typeof entry !== 'object') return [];
       const questionEntry = entry as Record<string, unknown>;
-      const name =
-        typeof questionEntry.name === 'string' && questionEntry.name.trim()
-          ? questionEntry.name.trim()
-          : `q_${index}`;
+      // Codex's RequestUserInputQuestion uses `id` to key answers in the
+      // response. Fall back to `name` (older builds) and finally a synthetic
+      // index so the form still renders if Codex changes the field name.
+      const id =
+        typeof questionEntry.id === 'string' && questionEntry.id.trim()
+          ? questionEntry.id.trim()
+          : typeof questionEntry.name === 'string' && questionEntry.name.trim()
+            ? questionEntry.name.trim()
+            : `q_${index}`;
       const header =
         typeof questionEntry.header === 'string' ? questionEntry.header : undefined;
       const text =
         typeof questionEntry.question === 'string' ? questionEntry.question : undefined;
-      const suggestions: RawSuggestion[] = Array.isArray(questionEntry.suggestions)
-        ? questionEntry.suggestions
-            .map((suggestion) => normalizeSuggestion(suggestion))
-            .filter((suggestion): suggestion is RawSuggestion => suggestion !== null)
-        : [];
-      return [{ name, header, text, suggestions }];
+      const isSecret = questionEntry.isSecret === true;
+      // Real Codex builds send `options: [{ label, description }]`. Older
+      // ones may use `suggestions: [{ value, label, tooltip }]`. Accept both.
+      const rawOptions = Array.isArray(questionEntry.options)
+        ? (questionEntry.options as unknown[])
+        : Array.isArray(questionEntry.suggestions)
+          ? (questionEntry.suggestions as unknown[])
+          : [];
+      const suggestions: RawSuggestion[] = rawOptions
+        .map((option) => normalizeSuggestion(option))
+        .filter((option): option is RawSuggestion => option !== null);
+      return [{ id, header, text, suggestions, isSecret }];
     });
   }, [request.params]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const allAnswered = questions.every(
-    (question) => (answers[question.name] ?? '').trim().length > 0
+    (question) => (answers[question.id] ?? '').trim().length > 0
   );
   const submitDisabled = Boolean(submitting) || !allAnswered;
 
@@ -2237,9 +2256,9 @@ function QuestionAnswerForm({
   return (
     <div className="codex-pending-request-question">
       {questions.map((question) => {
-        const value = answers[question.name] ?? '';
+        const value = answers[question.id] ?? '';
         return (
-          <div key={question.name} className="codex-pending-request-question-block">
+          <div key={question.id} className="codex-pending-request-question-block">
             {question.text ? (
               <p className="codex-pending-request-question-text">{question.text}</p>
             ) : null}
@@ -2249,7 +2268,7 @@ function QuestionAnswerForm({
                   const active = value === suggestion.value;
                   return (
                     <button
-                      key={`${question.name}:${suggestion.value}`}
+                      key={`${question.id}:${suggestion.value}`}
                       type="button"
                       className={`codex-pending-request-suggestion${
                         active ? ' is-active' : ''
@@ -2258,7 +2277,7 @@ function QuestionAnswerForm({
                       onClick={() =>
                         setAnswers((current) => ({
                           ...current,
-                          [question.name]: suggestion.value
+                          [question.id]: suggestion.value
                         }))
                       }
                       disabled={Boolean(submitting)}
@@ -2277,16 +2296,21 @@ function QuestionAnswerForm({
               </div>
             ) : null}
             <input
-              type="text"
+              type={question.isSecret ? 'password' : 'text'}
               className="codex-pending-request-question-input"
-              placeholder="Type your answer..."
+              placeholder={
+                question.suggestions.length > 0
+                  ? 'Or type your own answer...'
+                  : 'Type your answer...'
+              }
               value={value}
               onChange={(event) =>
                 setAnswers((current) => ({
                   ...current,
-                  [question.name]: event.target.value
+                  [question.id]: event.target.value
                 }))
               }
+              autoComplete={question.isSecret ? 'new-password' : 'off'}
               disabled={Boolean(submitting)}
             />
           </div>
@@ -2328,10 +2352,11 @@ function QuestionAnswerForm({
 
 type RawSuggestion = { value: string; label?: string; tooltip?: string };
 type RawQuestion = {
-  name: string;
+  id: string;
   header?: string;
   text?: string;
   suggestions: RawSuggestion[];
+  isSecret?: boolean;
 };
 
 function normalizeSuggestion(raw: unknown): RawSuggestion | null {
@@ -2342,27 +2367,27 @@ function normalizeSuggestion(raw: unknown): RawSuggestion | null {
     return null;
   }
   const record = raw as Record<string, unknown>;
+  // Codex's RequestUserInputQuestionOption is { label: string, description: string }.
+  // We send `label` back as the answer string. For older/alternate shapes we
+  // fall back to `value` then to `label` as the answer key. The `description`
+  // is the per-option hint Codex shows in its desktop UI ("what does this
+  // option do") — we display it under the label on the tablet, and we also
+  // accept the older `tooltip`/`hint` field names just in case.
+  const label = typeof record.label === 'string' ? record.label : undefined;
   const value =
     typeof record.value === 'string'
       ? record.value
-      : typeof record.label === 'string'
-        ? record.label
-        : null;
+      : label ?? null;
   if (!value) {
     return null;
   }
-  const label = typeof record.label === 'string' ? record.label : undefined;
-  // Codex suggestions can carry an explanatory hint under several names depending
-  // on the question type — accept any of them so the user sees what each option
-  // does without having to commit to one. Shown as a native title tooltip on
-  // hover (desktop) and below the label on tablet (small muted text).
   const tooltip =
-    typeof record.tooltip === 'string'
-      ? record.tooltip
-      : typeof record.hint === 'string'
-        ? record.hint
-        : typeof record.description === 'string'
-          ? record.description
+    typeof record.description === 'string'
+      ? record.description
+      : typeof record.tooltip === 'string'
+        ? record.tooltip
+        : typeof record.hint === 'string'
+          ? record.hint
           : undefined;
   return {
     value,

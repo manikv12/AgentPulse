@@ -380,14 +380,12 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
   if (method === 'item/tool/requestUserInput') {
     const params = (req.params ?? {}) as { questions?: unknown; turnId?: unknown };
     const questions = Array.isArray(params.questions) ? params.questions : [];
+    // Codex's RequestUserInputQuestion has fields { id, header, question,
+    // isOther, isSecret, options? }. Pull header/question off the first one
+    // for the card's title/body — the QuestionAnswerForm renders the full
+    // questions list itself from `params`.
     const first = questions[0] as
-      | {
-          header?: string;
-          question?: string;
-          suggestions?: unknown;
-          answerType?: unknown;
-          name?: string;
-        }
+      | { header?: string; question?: string; id?: string }
       | undefined;
     return {
       id,
@@ -397,7 +395,7 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
       body: first?.question,
       turnId: typeof params.turnId === 'string' ? params.turnId : undefined,
       // Pass the raw params through so the renderer can show answer options
-      // (suggestions / freeform input) — without this the tablet just shows
+      // (options + freeform fallback) — without this the tablet just shows
       // "Open Codex on your Mac to answer." with no way to respond.
       params: req.params as Record<string, unknown> | undefined
     };
