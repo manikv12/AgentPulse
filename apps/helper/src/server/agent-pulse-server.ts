@@ -1157,9 +1157,11 @@ function createApp(
 
     await options.appServer?.ensureConnected?.().catch(() => undefined);
     const mirrorReady = options.mirror?.isConnected() === true;
-    const appServerReady = options.appServer?.isConnected() === true;
-    if (!mirrorReady && !appServerReady) {
-      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    if (!mirrorReady) {
+      return context.json(
+        { error: 'Codex desktop is not connected. Open Codex on this Mac to send.' },
+        503
+      );
     }
 
     const parsed = ThreadMessageRequestSchema.parse(await context.req.json());
@@ -1170,50 +1172,27 @@ function createApp(
       // Slash commands the Codex desktop intercepts client-side. Sending the
       // raw text "/compact" as a turn would just be a literal user message;
       // instead we route to the matching v2 RPC so the actual command runs.
-      // Detection is deliberately strict: only when the text is *just* the
-      // command (with optional whitespace) — anything like "/compact please"
-      // falls through and behaves as a normal user message.
       const slashCommand = matchBareSlashCommand(parsed.text);
       if (slashCommand) {
-        const handled = await handleSlashCommand(slashCommand, parsed.text, threadId, options.appServer, hub);
+        const handled = await handleSlashCommand(
+          slashCommand,
+          parsed.text,
+          threadId,
+          options.appServer,
+          hub
+        );
         if (handled) {
           return context.json(handled);
         }
       }
 
+      // Single source of truth for sends: the IPC mirror to the running
+      // Codex desktop window. The desktop forwards turn/start to its own
+      // app-server, so the message appears live in the desktop UI (same
+      // diff view, same model picker animation). We pass collaborationMode
+      // and any queued model/effort override through so plan mode and
+      // model selection apply on the desktop window.
       const override = pendingModelOverrides.get(threadId);
-
-      // Send routing:
-      //   1. Prefer the IPC mirror when it's connected. That path goes through
-      //      `thread-follower-start-turn`, so the message appears live in the Codex
-      //      desktop window — same diff view, same model picker animation.
-      //      runWithFollowerOwnership auto-opens the thread on the Mac and waits
-      //      for ownership before sending.
-      //   2. Fall back to the spawned app-server subprocess when (a) the mirror
-      //      isn't connected, or (b) the IPC path fails with thread_unavailable
-      //      (Codex isn't running, or the user dismissed the focus prompt). The
-      //      fallback is also what delivers any queued model override, since
-      //      the app-server's turn/start accepts `{model, effort}` directly.
-      const sendViaAppServer = async () => {
-        if (!options.appServer) {
-          throw new SendBlockedError('thread_unavailable', 'Codex app-server is not running.');
-        }
-        const sendOptions =
-          override || parsed.collaborationMode
-            ? {
-                ...(override ? { model: override.model } : {}),
-                ...(override?.effort ? { effort: override.effort } : {}),
-                ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
-              }
-            : undefined;
-        return options.appServer.sendMessage(threadId, parsed.text, sendOptions);
-      };
-
-      // The mirror path runs through the desktop window's follower IPC, which
-      // forwards turn/start to Codex's app-server. So we pass the same options
-      // we'd pass to the app-server fallback — collaborationMode (plan), the
-      // queued model/effort override — and the desktop UI ends up in plan mode
-      // exactly like Shift+Tab in the local Codex window.
       const mirrorSendOptions =
         override || parsed.collaborationMode
           ? {
@@ -1222,50 +1201,14 @@ function createApp(
               ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
             }
           : undefined;
-
-      let result: ThreadMessageResponse;
-      if (mirrorReady && options.mirror) {
-        try {
-          result = ThreadMessageResponseSchema.parse(
-            await runWithFollowerOwnership(
-              () => options.mirror!.sendMessage(threadId, parsed.text, mirrorSendOptions),
-              options.opener,
-              threadId,
-              options.mirror
-            )
-          );
-        } catch (error) {
-          // Any mirror failure (thread_unavailable, IPC structured error,
-          // unsupported payload field, timeout, etc.) should fall back to the
-          // app-server subprocess as long as it's ready — the user's send
-          // still goes through, just without the live desktop animation.
-          // Without this fallback a single mirror hiccup (e.g. plan-mode
-          // payload rejected by an older Codex build) would surface as a red
-          // "Error submitting message" banner to the user.
-          if (appServerReady) {
-            console.warn('[send] mirror failed; falling back to app-server', {
-              threadId,
-              error:
-                error instanceof Error
-                  ? error.message
-                  : (() => {
-                      try {
-                        return JSON.stringify(error);
-                      } catch {
-                        return String(error);
-                      }
-                    })()
-            });
-            result = ThreadMessageResponseSchema.parse(await sendViaAppServer());
-          } else {
-            throw error;
-          }
-        }
-      } else if (appServerReady) {
-        result = ThreadMessageResponseSchema.parse(await sendViaAppServer());
-      } else {
-        return context.json({ error: 'Codex connection unavailable.' }, 503);
-      }
+      const result = ThreadMessageResponseSchema.parse(
+        await runWithFollowerOwnership(
+          () => options.mirror!.sendMessage(threadId, parsed.text, mirrorSendOptions),
+          options.opener,
+          threadId,
+          options.mirror
+        )
+      );
 
       rememberAgentPulseTurn(threadId, result.turnId, result.mode);
 
@@ -1583,52 +1526,50 @@ function createApp(
     }
     const parsed = ThreadModelUpdateRequestSchema.parse(await context.req.json());
 
-    // Strategy:
-    //   1. Try to push the change live via the IPC follower path so the user
-    //      sees the same "GPT-5.5 -> {selected}" picker animation in the
-    //      desktop window. runWithFollowerOwnership auto-opens the thread on
-    //      the Mac and waits for ownership before sending.
-    //   2. If the IPC path fails (Codex isn't running, or the user dismissed
-    //      the focus prompt), queue the override locally so the next message
-    //      sent via the app-server subprocess passes `model`/`effort` directly
-    //      to turn/start. The override is durable until consumed.
-    // Either way we return ok so the tablet UI updates its model chip
-    // optimistically.
-    let mode: 'live' | 'queued' = 'queued';
-    if (options.mirror?.setModelAndReasoning && options.mirror.isConnected()) {
-      const apply = () =>
-        options.mirror!.setModelAndReasoning!(
-          threadId,
-          parsed.modelSlug,
-          parsed.reasoningEffort
-        );
-      try {
-        await runWithFollowerOwnership(apply, options.opener, threadId, options.mirror);
-        mode = 'live';
-        pendingModelOverrides.delete(threadId);
-        debugLog('[model-change] applied live via IPC', {
-          threadId,
-          modelSlug: parsed.modelSlug,
-          reasoningEffort: parsed.reasoningEffort
-        });
-      } catch (error) {
-        console.warn('[model-change] live IPC path failed; queueing instead', {
-          threadId,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
+    // Single source of truth: drive the change through the IPC follower so
+    // the desktop window shows the same "GPT-5.5 -> {selected}" model picker
+    // animation as Shift+Tab in the local Codex window.
+    // runWithFollowerOwnership opens the thread on the Mac if Codex desktop
+    // doesn't already own it, then waits for the ownership broadcast before
+    // sending. Errors propagate as 503 so the tablet's model chip rolls back.
+    if (!options.mirror?.setModelAndReasoning || !options.mirror.isConnected()) {
+      return context.json(
+        { error: 'Codex desktop is not connected. Open Codex on this Mac to change the model.' },
+        503
+      );
     }
-
-    if (mode === 'queued') {
-      pendingModelOverrides.set(threadId, {
-        model: parsed.modelSlug,
-        ...(parsed.reasoningEffort ? { effort: parsed.reasoningEffort } : {})
-      });
-      debugLog('[model-change] queued for next app-server turn', {
+    try {
+      await runWithFollowerOwnership(
+        () =>
+          options.mirror!.setModelAndReasoning!(
+            threadId,
+            parsed.modelSlug,
+            parsed.reasoningEffort
+          ),
+        options.opener,
+        threadId,
+        options.mirror
+      );
+      pendingModelOverrides.delete(threadId);
+      debugLog('[model-change] applied live via IPC', {
         threadId,
         modelSlug: parsed.modelSlug,
         reasoningEffort: parsed.reasoningEffort
       });
+    } catch (error) {
+      console.error('[model-change] live IPC path failed', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return context.json(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Could not change model on Codex desktop.'
+        },
+        503
+      );
     }
 
     return context.json(

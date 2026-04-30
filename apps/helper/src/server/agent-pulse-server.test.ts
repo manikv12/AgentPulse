@@ -2059,7 +2059,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('sends collaboration mode through app-server and broadcasts the updated transcript', async () => {
+  it('sends collaboration mode through the IPC mirror and broadcasts the updated transcript', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -2083,90 +2083,18 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
-      sendMessage: vi.fn(async () => ({ ok: true as const, mode: 'steer' as const, turnId: 'turn-1', transcript }))
-    };
-    const settings = {
-      port: await pickFreeHighPort(),
-      lanEnabled: false,
-      mobileSendEnabled: true,
-      remoteAccess: remoteAccessSettings()
-    };
-    const settingsStore = {
-      save: vi.fn(),
-      load: vi.fn()
-    } as unknown as HelperSettingsStore;
-    const opener = {
-      openThread: vi.fn(async () => ({ ok: true as const })),
-      revealThread: vi.fn(async () => ({ ok: true as const })),
-      refreshDesktop: vi.fn(),
-      dispose: vi.fn()
-    };
-    const server = await startAgentPulseServer({
-      settings,
-      settingsStore,
-      registry,
-      pairing,
-      adminAuth: createAdminAuth(),
-      threadProvider: { listThreads: async () => [] },
-      opener,
-      appServer,
-      version: '0.1.0'
-    });
-
-    try {
-      const { token, deviceId } = await pairForTest(server.url, pairing);
-      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
-        method: 'POST',
-        headers: {
-          ...authHeaders(token, deviceId),
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({ text: 'Hello from phone.', collaborationMode: 'plan' })
-      });
-
-      const sendBody = await sendResponse.json();
-      expect(sendBody).toEqual({
-        ok: true,
-        mode: 'steer',
-        turnId: 'turn-1',
-        transcript
-      });
-      expect(sendResponse.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', {
-        collaborationMode: 'plan'
-      });
-      expect(opener.refreshDesktop).not.toHaveBeenCalled();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(opener.openThread).not.toHaveBeenCalled();
-    } finally {
-      await server.stop();
-    }
-  });
-
-  it('uses app-server send even when the IPC mirror is connected', async () => {
-    const registry = new DeviceRegistry(new MemoryDeviceStore());
-    const pairing = new PairingManager(registry);
-    const transcript: ThreadTranscript = {
-      threadId: 'thread-1',
-      activeTurnId: null,
-      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
-      messages: []
-    };
-    const appServer = {
-      isConnected: () => true,
-      readTranscript: vi.fn(async () => transcript),
-      sendMessage: vi.fn(async () => ({
-        ok: true as const,
-        mode: 'start' as const,
-        turnId: 'app-server-turn-1',
-        transcript
-      }))
+      sendMessage: vi.fn(async () => {
+        throw new Error('app-server send must not run when mirror is the source of truth.');
+      })
     };
     const mirror = {
       isConnected: () => true,
-      sendMessage: vi.fn(async () => {
-        throw new Error('IPC mirror should not be used for sends.');
-      }),
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'steer' as const,
+        turnId: 'turn-1',
+        transcript
+      })),
       isThreadOwned: () => true,
       waitForOwnership: async () => true
     };
@@ -2195,6 +2123,92 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [] },
       opener,
       appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Hello from phone.', collaborationMode: 'plan' })
+      });
+
+      const sendBody = await sendResponse.json();
+      expect(sendBody).toEqual({
+        ok: true,
+        mode: 'steer',
+        turnId: 'turn-1',
+        transcript
+      });
+      expect(sendResponse.status).toBe(200);
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', {
+        collaborationMode: 'plan'
+      });
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
+      expect(opener.refreshDesktop).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('routes sends through the IPC mirror when it is connected', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => {
+        throw new Error('app-server send must not be used when the mirror is connected.');
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'mirror-turn-1',
+        transcript
+      })),
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -2210,8 +2224,8 @@ describe('Agent Pulse helper API', () => {
       });
 
       expect(sendResponse.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
-      expect(mirror.sendMessage).not.toHaveBeenCalled();
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -2500,7 +2514,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('applies a queued model override on the next send and clears it after success', async () => {
+  it('applies a model change live via the IPC mirror', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -2512,23 +2526,21 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
-      sendMessage: vi.fn(async () => ({
-        ok: true as const,
-        mode: 'start' as const,
-        turnId: 'turn-1',
-        transcript
-      }))
+      sendMessage: vi.fn(async () => {
+        throw new Error('app-server send must not run when mirror is the source of truth.');
+      })
     };
     const mirror = {
       isConnected: () => true,
-      sendMessage: vi.fn(async () => {
-        throw new Error('IPC mirror should not be used for sends.');
-      }),
-      setModelAndReasoning: vi.fn(async () => {
-        throw new Error('IPC mirror should not be used for model selection.');
-      }),
-      isThreadOwned: () => false,
-      waitForOwnership: async () => false
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'mirror-turn-1',
+        transcript
+      })),
+      setModelAndReasoning: vi.fn(async () => undefined),
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const settings = {
       port: await pickFreeHighPort(),
@@ -2555,13 +2567,13 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
     try {
       const { token, deviceId } = await pairForTest(server.url, pairing);
 
-      // 1. Queue a model change through app-server state only.
       const modelResponse = await fetch(`${server.url}/threads/thread-1/model`, {
         method: 'POST',
         headers: {
@@ -2571,41 +2583,31 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ modelSlug: 'gpt-5.4', reasoningEffort: 'high' })
       });
       expect(modelResponse.status).toBe(200);
-      expect(mirror.setModelAndReasoning).not.toHaveBeenCalled();
+      expect(mirror.setModelAndReasoning).toHaveBeenCalledWith(
+        'thread-1',
+        'gpt-5.4',
+        'high'
+      );
 
-      // 2. Next message should pass the queued model + effort to turn/start.
+      // The next send goes through the mirror without any queued override
+      // (since the mirror already applied the model change live).
       const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
         method: 'POST',
         headers: {
           ...authHeaders(token, deviceId),
           'content-type': 'application/json'
         },
-        body: JSON.stringify({ text: 'Now use the new model' })
+        body: JSON.stringify({ text: 'Use the new model' })
       });
       expect(sendResponse.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Now use the new model', {
-        model: 'gpt-5.4',
-        effort: 'high'
-      });
-
-      // 3. The override is consumed — a follow-up message uses default model.
-      appServer.sendMessage.mockClear();
-      const secondSend = await fetch(`${server.url}/threads/thread-1/messages`, {
-        method: 'POST',
-        headers: {
-          ...authHeaders(token, deviceId),
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({ text: 'Follow up' })
-      });
-      expect(secondSend.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Follow up', undefined);
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Use the new model', undefined);
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
   });
 
-  it('falls back to the local app-server send when the mirror is not connected', async () => {
+  it('returns 503 when the IPC mirror is not connected (single source of truth)', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -2653,6 +2655,7 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -2667,11 +2670,9 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ text: 'Hi.' })
       });
 
-      expect(sendResponse.status).toBe(200);
+      expect(sendResponse.status).toBe(503);
       expect(mirror.sendMessage).not.toHaveBeenCalled();
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hi.', undefined);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(opener.openThread).not.toHaveBeenCalled();
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -2796,7 +2797,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('refreshes an opened Agent Pulse-owned turn once after app-server completion', async () => {
+  it('refreshes an opened Agent Pulse-owned turn once after turn completion', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     let onTurnCompleted: ((event: { threadId: string; turnId: string }) => void) | undefined;
@@ -2816,17 +2817,25 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => {
+        throw new Error('mirror should own sends; app-server is reserved for app-server-only ops.');
+      }),
+      startThread: vi.fn(),
+      onTurnCompleted: vi.fn((listener: (event: { threadId: string; turnId: string }) => void) => {
+        onTurnCompleted = listener;
+        return vi.fn();
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
       sendMessage: vi.fn(async () => ({
         ok: true as const,
         mode: 'start' as const,
         turnId: 'turn-1',
         transcript
       })),
-      startThread: vi.fn(),
-      onTurnCompleted: vi.fn((listener: (event: { threadId: string; turnId: string }) => void) => {
-        onTurnCompleted = listener;
-        return vi.fn();
-      })
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const server = await startAgentPulseServer({
       settings: {
@@ -2842,6 +2851,7 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -3051,6 +3061,17 @@ describe('Agent Pulse helper API', () => {
       isCodexFrontmost: vi.fn(async () => true),
       dispose: vi.fn()
     };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'turn-1',
+        transcript
+      })),
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
+    };
     const server = await startAgentPulseServer({
       settings: {
         port: await pickFreeHighPort(),
@@ -3067,18 +3088,16 @@ describe('Agent Pulse helper API', () => {
       appServer: {
         isConnected: () => true,
         readTranscript: vi.fn(async () => transcript),
-        sendMessage: vi.fn(async () => ({
-          ok: true as const,
-          mode: 'start' as const,
-          turnId: 'turn-1',
-          transcript
-        })),
+        sendMessage: vi.fn(async () => {
+          throw new Error('mirror should own sends.');
+        }),
         startThread: vi.fn(),
         onTurnCompleted: vi.fn((listener: (event: { threadId: string; turnId: string }) => void) => {
           onTurnCompleted = listener;
           return vi.fn();
         })
       },
+      mirror,
       version: '0.1.0'
     });
 
@@ -3132,17 +3151,25 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(),
+      sendMessage: vi.fn(async () => {
+        throw new Error('mirror should own sends.');
+      }),
+      startThread: vi.fn(),
+      onTurnCompleted: vi.fn((listener: (event: { threadId: string; turnId: string }) => void) => {
+        onTurnCompleted = listener;
+        return vi.fn();
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
       sendMessage: vi.fn(async (threadId: string) => ({
         ok: true as const,
         mode: 'start' as const,
         turnId: `turn-${threadId}`,
         transcript: transcriptFor(threadId, `turn-${threadId}`)
       })),
-      startThread: vi.fn(),
-      onTurnCompleted: vi.fn((listener: (event: { threadId: string; turnId: string }) => void) => {
-        onTurnCompleted = listener;
-        return vi.fn();
-      })
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const server = await startAgentPulseServer({
       settings: {
@@ -3158,6 +3185,7 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -3332,30 +3360,43 @@ describe('Agent Pulse helper API', () => {
       readTranscript: vi.fn(async () => {
         throw new Error('thread thread-draft is not materialized yet; includeTurns is unavailable before first user message');
       }),
-      sendMessage: vi.fn(async (_threadId: string, text: string): Promise<import('@agent-pulse/shared').ThreadMessageResponse> => ({
-        ok: true,
-        mode: 'start',
-        turnId: 'turn-first',
-        transcript: {
-          threadId: 'thread-draft',
-          activeTurnId: 'turn-first',
-          sendState: {
-            canSend: false,
-            reason: 'missing_active_turn',
-            label: 'Codex is working'
-          },
-          messages: [
-            {
-              id: 'user-first',
-              role: 'user',
-              kind: 'message',
-              text,
-              createdAt: '2026-04-26T10:00:01Z'
-            }
-          ]
-        }
-      })),
+      sendMessage: vi.fn(async () => {
+        throw new Error('mirror should own sends.');
+      }),
       startThread: vi.fn(async () => draftThread)
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(
+        async (
+          _threadId: string,
+          text: string
+        ): Promise<import('@agent-pulse/shared').ThreadMessageResponse> => ({
+          ok: true,
+          mode: 'start',
+          turnId: 'turn-first',
+          transcript: {
+            threadId: 'thread-draft',
+            activeTurnId: 'turn-first',
+            sendState: {
+              canSend: false,
+              reason: 'missing_active_turn',
+              label: 'Codex is working'
+            },
+            messages: [
+              {
+                id: 'user-first',
+                role: 'user',
+                kind: 'message',
+                text,
+                createdAt: '2026-04-26T10:00:01Z'
+              }
+            ]
+          }
+        })
+      ),
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const settings = {
       port: await pickFreeHighPort(),
@@ -3391,6 +3432,7 @@ describe('Agent Pulse helper API', () => {
       },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -3436,9 +3478,12 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ text: 'Start inside this project.' })
       });
       expect(messageResponse.status).toBe(200);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-draft', 'Start inside this project.', undefined);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(opener.openThread).not.toHaveBeenCalled();
+      expect(mirror.sendMessage).toHaveBeenCalledWith(
+        'thread-draft',
+        'Start inside this project.',
+        undefined
+      );
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
