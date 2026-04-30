@@ -63,7 +63,7 @@ on openMiniWindowBriefly(bundleId, openSeconds)
   try
     tell application id bundleId to activate
   end try
-  delay 0.15
+  delay 0.25
 
   set beforeWindowSignatures to my codexWindowSignatures(bundleId)
 
@@ -72,11 +72,15 @@ on openMiniWindowBriefly(bundleId, openSeconds)
     set frontmost of codexProcess to true
     tell codexProcess
       keystroke "p" using {command down, shift down}
-      delay 0.2
+      -- Wait longer for the command palette to render; on slower machines
+      -- the previous 0.2s race meant Cmd+A and the "open in mini window"
+      -- text leaked into the chat composer instead of the palette,
+      -- accidentally sending it as a user message.
+      delay 0.45
       keystroke "a" using {command down}
-      delay 0.03
+      delay 0.08
       keystroke "open in mini window"
-      delay 0.3
+      delay 0.4
       key code 36
     end tell
   end tell
@@ -85,6 +89,10 @@ on openMiniWindowBriefly(bundleId, openSeconds)
   if openedMiniWindow then
     delay openSeconds
     my closeNewMiniCodexWindow(bundleId, beforeWindowSignatures)
+  else
+    -- Surface the failure to the parent process so the helper log shows
+    -- "mini-window never appeared" rather than silently succeeding.
+    error "Codex mini-window did not appear within 4 seconds — Accessibility permission or palette focus may be the issue." number 2
   end if
 end openMiniWindowBriefly
 

@@ -89,6 +89,14 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
     return new Promise((resolve, reject) => {
       execFile(command, args, (error) => {
         if (error) {
+          // Surface the underlying message so the helper log shows why
+          // osascript failed (Accessibility permission, app not found,
+          // mini-window detection timed out, etc.) instead of silently
+          // falling through to plain `open`.
+          console.warn(`[thread-opener] ${command} failed`, {
+            args,
+            error: error instanceof Error ? error.message : String(error)
+          });
           reject(error);
           return;
         }
@@ -112,6 +120,16 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
       await run('osascript', scriptArgs);
       return { ok: true };
     } catch (scriptError) {
+      // The mini-window dance failed (palette focus race, Accessibility
+      // permission revoked, or the new window never appeared). The thread
+      // URL still needs to land on Codex, so fall back to a plain
+      // `open codex://...` — the user just won't see the brief mini-window
+      // pop. This logs once per failure so the underlying cause is visible.
+      console.warn('[thread-opener] mini-window osascript failed; falling back to plain open', {
+        targetUrl,
+        miniWindow: options.miniWindow === true,
+        error: scriptError instanceof Error ? scriptError.message : String(scriptError)
+      });
       try {
         if (options.preflightUrl) {
           await run('open', ['-b', bundleId, options.preflightUrl]).catch(() => undefined);
