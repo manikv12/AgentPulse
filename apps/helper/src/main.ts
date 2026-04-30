@@ -16,6 +16,7 @@ import { debugLog } from './debug';
 import { startAgentPulseServer, type RunningAgentPulseServer } from './server/agent-pulse-server';
 import { CloudflareTunnelSupervisor } from './server/cloudflare-tunnel';
 import { BonjourAdvertiser } from './server/mdns';
+import { SeenThreadStore } from './server/seen-thread-store';
 import { HelperSettingsStore } from './server/settings';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,6 +53,10 @@ const usageProvider = async (threadId: string) => {
 const catalog = new CatalogReader();
 catalog.start();
 const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: app.getVersion() }));
+
+// IPC mirror to a running Codex desktop window. See dev-server.ts for the
+// rationale on why we don't wire onStreamingChange / onPendingApprovalsChange
+// here (app-server-chat.ts already emits those events from notifications).
 const ipc = createIpcClient({
   clientType: 'agent-pulse',
   logger: {
@@ -60,29 +65,13 @@ const ipc = createIpcClient({
     warn: (msg, extra) => console.warn(`[ipc] ${msg}`, extra ?? '')
   }
 });
-const mirror = createCodexMirror({
-  ipc,
-  reader: appServer,
-  onBroadcast: (broadcast) => {
-    runningServer?.hub.broadcast({
-      type: 'codex/broadcast',
-      payload: {
-        method: broadcast.method,
-        sourceClientId: broadcast.sourceClientId,
-        params: broadcast.params
-      }
-    });
-  },
-  onStreamingChange: ({ threadId, isStreaming }) => {
-    runningServer?.hub.broadcast({
-      type: 'thread/streaming-changed',
-      payload: { threadId, isStreaming }
-    });
-  }
-});
+const mirror = createCodexMirror({ ipc, reader: appServer });
 ipc.connect();
 
+const seenThreadStore = new SeenThreadStore();
+
 async function startOrRestartServer(): Promise<RunningAgentPulseServer> {
+  await seenThreadStore.load().catch(() => undefined);
   if (runningServer) {
     await runningServer.stop();
     await advertiser.stop();
@@ -108,6 +97,7 @@ async function startOrRestartServer(): Promise<RunningAgentPulseServer> {
     appServer,
     mirror,
     catalog,
+    seenThreadStore,
     usageProvider,
     version: app.getVersion(),
     tabletDistDir,
@@ -182,7 +172,5 @@ app.on('before-quit', async () => {
   await remoteSupervisor?.stop();
   await advertiser.stop();
   opener.dispose();
-  mirror.dispose();
-  ipc.dispose();
   catalog.dispose();
 });

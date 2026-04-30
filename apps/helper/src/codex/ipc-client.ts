@@ -243,7 +243,29 @@ export function createIpcClient(options: IpcClientOptions): IpcClient {
         if (message.resultType === 'success') {
           pending.resolve(message.result);
         } else {
-          pending.reject(new Error(message.error ?? 'ipc-error'));
+          // Codex's follower IPC sometimes rejects with a structured object
+          // rather than a string. new Error(<object>) produces an Error with
+          // message "[object Object]", which masks the real cause. Stringify
+          // it so the message at least carries the JSON, then preserve the
+          // raw payload on a `cause` property for callers that want to inspect.
+          const rawError = message.error;
+          let errorMessage: string;
+          if (typeof rawError === 'string') {
+            errorMessage = rawError;
+          } else if (rawError === undefined || rawError === null) {
+            errorMessage = 'ipc-error';
+          } else {
+            try {
+              errorMessage = JSON.stringify(rawError);
+            } catch {
+              errorMessage = String(rawError);
+            }
+          }
+          const wrapped = new Error(errorMessage);
+          if (rawError && typeof rawError === 'object') {
+            (wrapped as Error & { cause?: unknown }).cause = rawError;
+          }
+          pending.reject(wrapped);
         }
         return;
       }

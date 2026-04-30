@@ -16,6 +16,10 @@ export type ThreadOpenResult = {
   error?: string;
 };
 
+export type ThreadOpenOptions = {
+  refreshMode?: 'mini-window';
+};
+
 export type ThreadOpenerOptions = {
   execFile?: ExecFile;
   rolloutLookup?: RolloutLookup;
@@ -32,10 +36,17 @@ export type ThreadOpenerOptions = {
   now?: () => number;
 };
 
+export type ThreadRefreshOptions = {
+  waitForGrowth?: boolean;
+  immediate?: boolean;
+  forceRemount?: boolean;
+};
+
 export type ThreadOpener = {
-  openThread(threadId: string): Promise<ThreadOpenResult>;
+  openThread(threadId: string, options?: ThreadOpenOptions): Promise<ThreadOpenResult>;
   revealThread(threadId: string): Promise<ThreadOpenResult>;
-  refreshDesktop(threadId: string): void;
+  refreshDesktop(threadId: string, options?: ThreadRefreshOptions): void;
+  isCodexFrontmost?(): Promise<boolean>;
   dispose(): void;
 };
 
@@ -43,6 +54,7 @@ const DEFAULT_DEBOUNCE_MS = 1_200;
 const DEFAULT_REFRESH_THROTTLE_MS = 1_500;
 const DEFAULT_GROWTH_WAIT_MS = 1_500;
 const DEFAULT_LIVE_REFRESH_IDLE_MS = 60_000;
+const DEFAULT_MINI_WINDOW_OPEN_MS = 2_500;
 const DEFAULT_BUNDLE_ID = 'com.openai.codex';
 const DEFAULT_APP_PATH = '/Applications/Codex.app';
 
@@ -68,6 +80,7 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
   let lastRefreshAt = 0;
   let disposed = false;
   let pendingRefreshShouldWaitForGrowth = true;
+  let pendingRefreshForceRemount = false;
   let liveWatcher: RolloutWatcher | undefined;
   let liveWatcherThreadId: string | null = null;
   let liveWatcherGeneration = 0;
@@ -84,17 +97,32 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
     });
   }
 
-  async function executeBounce(threadId: string): Promise<ThreadOpenResult> {
-    const targetUrl = `codex://threads/${encodeURIComponent(threadId)}`;
+  async function executeBounceUrl(
+    targetUrl: string,
+    options: { preflightUrl?: string; miniWindow?: boolean; miniWindowOpenMs?: number } = {}
+  ): Promise<ThreadOpenResult> {
+    const scriptArgs = [scriptPath, bundleId, appPath, targetUrl];
+    if (options.miniWindow) {
+      scriptArgs.push('mini-window', String(options.miniWindowOpenMs ?? DEFAULT_MINI_WINDOW_OPEN_MS));
+    } else if (options.preflightUrl) {
+      scriptArgs.push(options.preflightUrl);
+    }
+
     try {
-      await run('osascript', [scriptPath, bundleId, appPath, targetUrl]);
+      await run('osascript', scriptArgs);
       return { ok: true };
     } catch (scriptError) {
       try {
+        if (options.preflightUrl) {
+          await run('open', ['-b', bundleId, options.preflightUrl]).catch(() => undefined);
+        }
         await run('open', ['-b', bundleId, targetUrl]);
         return { ok: true };
       } catch {
         try {
+          if (options.preflightUrl) {
+            await run('open', ['-a', 'Codex', options.preflightUrl]).catch(() => undefined);
+          }
           await run('open', ['-a', 'Codex', targetUrl]);
           return { ok: true };
         } catch (fallbackError) {
@@ -112,7 +140,24 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
     }
   }
 
-  async function performRefresh(threadId: string, waitForGrowth: boolean): Promise<void> {
+  async function executeBounce(
+    threadId: string,
+    options: ThreadOpenOptions = {}
+  ): Promise<ThreadOpenResult> {
+    return executeBounceUrl(`codex://threads/${encodeURIComponent(threadId)}`, {
+      miniWindow: options.refreshMode === 'mini-window'
+    });
+  }
+
+  async function executeHardRefresh(threadId: string): Promise<ThreadOpenResult> {
+    return executeBounce(threadId, { refreshMode: 'mini-window' });
+  }
+
+  async function performRefresh(
+    threadId: string,
+    waitForGrowth: boolean,
+    forceRemount: boolean
+  ): Promise<void> {
     if (disposed) {
       return;
     }
@@ -125,29 +170,33 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
           growthWaitMs
         });
       }
-      const result = await executeBounce(threadId);
+      const result = forceRemount ? await executeHardRefresh(threadId) : await executeBounce(threadId);
       lastRefreshAt = now();
-      if (result.ok) {
+      if (result.ok && !forceRemount) {
         startLiveRefreshWatcher(threadId);
       }
     } finally {
       refreshing = false;
       if (queuedAfterCurrent && pendingThreadId && !disposed) {
         queuedAfterCurrent = false;
-        scheduleRefresh(pendingThreadId, { waitForGrowth: pendingRefreshShouldWaitForGrowth });
+        scheduleRefresh(pendingThreadId, {
+          forceRemount: pendingRefreshForceRemount,
+          waitForGrowth: pendingRefreshShouldWaitForGrowth
+        });
       }
     }
   }
 
-  function scheduleRefresh(
-    threadId: string,
-    options: { waitForGrowth?: boolean } = {}
-  ): void {
+  function scheduleRefresh(threadId: string, options: ThreadRefreshOptions = {}): void {
     if (disposed) {
       return;
     }
     pendingThreadId = threadId;
     if (options.waitForGrowth === false) {
+      pendingRefreshShouldWaitForGrowth = false;
+    }
+    if (options.forceRemount) {
+      pendingRefreshForceRemount = true;
       pendingRefreshShouldWaitForGrowth = false;
     }
 
@@ -161,7 +210,7 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
     }
 
     const elapsed = now() - lastRefreshAt;
-    const wait = Math.max(debounceMs, refreshThrottleMs - elapsed);
+    const wait = options.immediate ? 0 : Math.max(debounceMs, refreshThrottleMs - elapsed);
 
     debounceTimer = setTimeoutFn(() => {
       debounceTimer = undefined;
@@ -170,9 +219,11 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
         return;
       }
       const waitForGrowth = pendingRefreshShouldWaitForGrowth;
+      const forceRemount = pendingRefreshForceRemount;
       pendingThreadId = null;
       pendingRefreshShouldWaitForGrowth = true;
-      void performRefresh(target, waitForGrowth);
+      pendingRefreshForceRemount = false;
+      void performRefresh(target, waitForGrowth, forceRemount);
     }, Math.max(0, wait));
   }
 
@@ -264,18 +315,42 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
     }
   }
 
+  async function executeIsCodexFrontmost(): Promise<boolean> {
+    try {
+      await run('osascript', [
+        '-e',
+        'tell application "System Events"',
+        '-e',
+        'set frontmostBundleId to bundle identifier of first application process whose frontmost is true',
+        '-e',
+        `if frontmostBundleId is not "${appleScriptString(bundleId)}" then error "Codex is not frontmost" number 1`,
+        '-e',
+        'end tell'
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   return {
-    async openThread(threadId: string): Promise<ThreadOpenResult> {
-      return executeBounce(threadId);
+    async openThread(
+      threadId: string,
+      options: ThreadOpenOptions = {}
+    ): Promise<ThreadOpenResult> {
+      return executeBounce(threadId, options);
     },
     async revealThread(threadId: string): Promise<ThreadOpenResult> {
       return executeReveal(threadId);
     },
-    refreshDesktop(threadId: string): void {
+    refreshDesktop(threadId: string, options: ThreadRefreshOptions = {}): void {
       if (!threadId) {
         return;
       }
-      scheduleRefresh(threadId);
+      scheduleRefresh(threadId, options);
+    },
+    isCodexFrontmost(): Promise<boolean> {
+      return executeIsCodexFrontmost();
     },
     dispose(): void {
       disposed = true;
@@ -287,8 +362,13 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
       pendingThreadId = null;
       queuedAfterCurrent = false;
       pendingRefreshShouldWaitForGrowth = true;
+      pendingRefreshForceRemount = false;
     }
   };
+}
+
+function appleScriptString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 async function waitForRolloutGrowth(

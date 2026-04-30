@@ -12,9 +12,10 @@ import { CodexThreadReader, readUsageFromRollout } from './codex/thread-reader';
 import { createRolloutLookup } from './codex/rollout-lookup';
 import { createThreadOpener } from './codex/thread-opener';
 import { debugLog } from './debug';
-import { startAgentPulseServer, type RunningAgentPulseServer } from './server/agent-pulse-server';
+import { startAgentPulseServer } from './server/agent-pulse-server';
 import { CloudflareTunnelSupervisor } from './server/cloudflare-tunnel';
 import { BonjourAdvertiser } from './server/mdns';
+import { SeenThreadStore } from './server/seen-thread-store';
 import { HelperSettingsStore } from './server/settings';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -46,6 +47,17 @@ const catalog = new CatalogReader();
 catalog.start();
 const advertiser = new BonjourAdvertiser();
 const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: '0.1.0' }));
+
+// IPC mirror to a running Codex desktop window. Used by the helper's send and
+// model-change routes as the preferred transport so the desktop window mirrors
+// what the tablet does. The app-server subprocess is the fallback when no
+// desktop window owns the thread.
+//
+// Note: app-server-chat.ts already emits thread/streaming-changed and
+// thread/pending-approvals/changed live events from notification-derived state.
+// We deliberately don't wire mirror's onStreamingChange / onPendingApprovalsChange
+// here — that would double-broadcast. The mirror's role is just send + model
+// change (and ownership tracking that backs them).
 const ipc = createIpcClient({
   clientType: 'agent-pulse',
   logger: {
@@ -54,28 +66,11 @@ const ipc = createIpcClient({
     warn: (msg, extra) => console.warn(`[ipc] ${msg}`, extra ?? '')
   }
 });
-let runningServerRef: RunningAgentPulseServer | undefined;
-const mirror = createCodexMirror({
-  ipc,
-  reader: appServer,
-  onBroadcast: (broadcast) => {
-    runningServerRef?.hub.broadcast({
-      type: 'codex/broadcast',
-      payload: {
-        method: broadcast.method,
-        sourceClientId: broadcast.sourceClientId,
-        params: broadcast.params
-      }
-    });
-  },
-  onStreamingChange: ({ threadId, isStreaming }) => {
-    runningServerRef?.hub.broadcast({
-      type: 'thread/streaming-changed',
-      payload: { threadId, isStreaming }
-    });
-  }
-});
+const mirror = createCodexMirror({ ipc, reader: appServer });
 ipc.connect();
+
+const seenThreadStore = new SeenThreadStore();
+await seenThreadStore.load();
 
 const settings = await settingsStore.load();
 const remoteSupervisor = new CloudflareTunnelSupervisor({
@@ -96,6 +91,7 @@ const server = await startAgentPulseServer({
   appServer,
   mirror,
   catalog,
+  seenThreadStore,
   usageProvider,
   version: '0.1.0',
   tabletDistDir,
@@ -109,8 +105,6 @@ const server = await startAgentPulseServer({
     }
   }
 });
-
-runningServerRef = server;
 
 if (settings.lanEnabled) {
   await advertiser.start(settings.port);
@@ -135,8 +129,6 @@ process.on('SIGINT', async () => {
   await remoteSupervisor.stop();
   await advertiser.stop();
   opener.dispose();
-  mirror.dispose();
-  ipc.dispose();
   catalog.dispose();
   process.exit(0);
 });
@@ -146,8 +138,6 @@ process.on('SIGTERM', async () => {
   await remoteSupervisor.stop();
   await advertiser.stop();
   opener.dispose();
-  mirror.dispose();
-  ipc.dispose();
   catalog.dispose();
   process.exit(0);
 });

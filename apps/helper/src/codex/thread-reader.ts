@@ -26,6 +26,7 @@ export type SqliteThreadRow = {
   archived: number;
   rollout_path: string;
   model?: string;
+  reasoning_effort?: string;
 };
 
 export type CodexThreadReaderOptions = {
@@ -105,7 +106,7 @@ export class CodexThreadReader {
   private async readSqliteRows(): Promise<SqliteThreadRow[]> {
     const dbPath = path.join(this.codexHome, 'state_5.sqlite');
     const query = `
-      select id, substr(coalesce(title, ''), 1, 240) as title, cwd, source, updated_at_ms, archived, rollout_path, model
+      select id, substr(coalesce(title, ''), 1, 240) as title, cwd, source, updated_at_ms, archived, rollout_path, model, reasoning_effort
       from threads
       where archived = 0
         and (source is null or source in ('vscode', 'cli', 'exec', 'appServer', 'unknown'))
@@ -306,7 +307,8 @@ export function mapSqliteThreadRow(row: SqliteThreadRow, workspaceRoot = row.cwd
     status: 'idle',
     lastActivityAt: new Date(row.updated_at_ms).toISOString(),
     lastTurnSummary: '',
-    ...(row.model ? { model: row.model } : {})
+    ...(row.model ? { model: row.model } : {}),
+    ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {})
   });
 }
 

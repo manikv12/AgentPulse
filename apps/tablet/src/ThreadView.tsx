@@ -5,6 +5,7 @@ import type {
   CatalogSkill,
   ChatAttachment,
   ChatMessage,
+  CollaborationModeKind,
   OlderThreadMessagesResponse,
   Thread,
   ThreadMessageResponse,
@@ -66,13 +67,29 @@ export type ThreadPendingRequest = {
   itemId?: string;
   turnId?: string;
   permissions?: Record<string, unknown>;
-  kind?: 'question' | 'plan' | 'commandApproval' | 'fileApproval' | 'permissionsApproval';
+  availableDecisions?: unknown[];
+  proposedExecpolicyAmendment?: string[];
+  // Raw params for requestUserInput — carries `{ questions: [...] }` so the
+  // renderer can show suggestion buttons / a freeform input.
+  params?: Record<string, unknown>;
+  kind?:
+    | 'question'
+    | 'plan'
+    | 'commandApproval'
+    | 'fileApproval'
+    | 'permissionsApproval'
+    | 'mcpElicitationApproval';
 };
 
 export type ApprovalMethodForUi =
   | 'item/commandExecution/requestApproval'
   | 'item/fileChange/requestApproval'
-  | 'item/permissions/requestApproval';
+  | 'item/permissions/requestApproval'
+  | 'execCommandApproval'
+  | 'applyPatchApproval'
+  | 'item/tool/requestUserInput'
+  | 'item/plan/requestImplementation'
+  | 'mcpServer/elicitation/request';
 
 export type ThreadViewProps = {
   thread: Thread;
@@ -82,7 +99,11 @@ export type ThreadViewProps = {
     threadId: string,
     options?: FetchThreadTranscriptOptions
   ) => Promise<ThreadTranscript>;
-  sendMessage?: (threadId: string, text: string) => Promise<ThreadMessageResponse>;
+  sendMessage?: (
+    threadId: string,
+    text: string,
+    options?: { collaborationMode?: CollaborationModeKind }
+  ) => Promise<ThreadMessageResponse>;
   stopWork?: (threadId: string) => Promise<void>;
   fetchOlderMessages?: (
     beforeMessageId: string,
@@ -266,20 +287,52 @@ function findFinalResponseIndex(messages: ChatMessage[]): number {
 }
 
 function splitTranscriptForScrollback(
-  transcript: ThreadTranscript
+  transcript: ThreadTranscript,
+  options: {
+    hasUnconfirmedPendingMessage?: boolean;
+    sessionUserBaselineIds?: Set<string>;
+  } = {}
 ): { visible: ThreadTranscript; scrollback: ChatMessage[] } {
   if (transcript.messages.length <= VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT) {
     return { visible: transcript, scrollback: [] };
   }
 
-  // Always include the latest user message in the visible tail so the user can see
-  // what they asked, plus everything Codex sent in response. Falls back to a small
-  // tail when there's no user message in the transcript yet.
+  // When the user just sent a message that the server transcript hasn't confirmed yet,
+  // the latest user message in the transcript is the *previous* turn. Anchoring the
+  // visible tail to it would drag the previous turn's assistant reply back on screen
+  // under the new pending bubble. Push everything to scrollback in that case so the
+  // chat shows only the new pending bubble until the real user message lands.
+  if (options.hasUnconfirmedPendingMessage) {
+    return {
+      visible: { ...transcript, messages: [] },
+      scrollback: transcript.messages
+    };
+  }
+
+  // Anchor the visible tail on the *earliest* user message the user sent this session
+  // (anything not in the baseline-at-thread-open snapshot). That way every turn the
+  // user just sent stays visible together with its assistant reply, instead of the
+  // newest user message hiding earlier turns' replies in scrollback.
+  const baseline = options.sessionUserBaselineIds;
   let cutoff = transcript.messages.length - VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT;
-  for (let i = transcript.messages.length - 1; i >= 0; i--) {
-    if (transcript.messages[i]!.role === 'user') {
-      cutoff = Math.min(cutoff, i);
-      break;
+  let foundSessionUser = false;
+  if (baseline) {
+    for (let i = 0; i < transcript.messages.length; i++) {
+      const message = transcript.messages[i]!;
+      if (message.role === 'user' && !baseline.has(message.id)) {
+        cutoff = i;
+        foundSessionUser = true;
+        break;
+      }
+    }
+  }
+  if (!foundSessionUser) {
+    // Fallback to the previous behavior: latest user message.
+    for (let i = transcript.messages.length - 1; i >= 0; i--) {
+      if (transcript.messages[i]!.role === 'user') {
+        cutoff = i;
+        break;
+      }
     }
   }
 
@@ -309,6 +362,39 @@ function mergeMessagesById(current: ChatMessage[], additions: ChatMessage[]): Ch
     next.push(message);
   }
   return next;
+}
+
+type PendingChatMessage = ChatMessage & {
+  baselineMessageIds: string[];
+};
+
+function hasNewMatchingUserMessage(
+  messages: ChatMessage[],
+  text: string,
+  baselineMessageIds: Set<string>
+): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return messages.some(
+    (message) =>
+      message.role === 'user' &&
+      message.text.trim() === trimmed &&
+      !baselineMessageIds.has(message.id)
+  );
+}
+
+function transcriptContainsNewUserText(
+  transcript: ThreadTranscript,
+  text: string,
+  baselineMessageIds: Set<string>
+): boolean {
+  return hasNewMatchingUserMessage(transcript.messages, text, baselineMessageIds);
+}
+
+function pendingMessageIsConfirmed(pending: PendingChatMessage, messages: ChatMessage[]): boolean {
+  return hasNewMatchingUserMessage(messages, pending.text, new Set(pending.baselineMessageIds));
 }
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
@@ -619,6 +705,7 @@ export function ThreadView({
   const [loading, setLoading] = useState(Boolean(fetchTranscript));
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [implementingPlan, setImplementingPlan] = useState(false);
   const [openingCodex, setOpeningCodex] = useState(false);
   const [error, setError] = useState('');
   const [mention, setMention] = useState<{ trigger: MentionTrigger; query: string; start: number; end: number } | undefined>();
@@ -626,12 +713,14 @@ export function ThreadView({
   const [filesLoading, setFilesLoading] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelUpdating, setModelUpdating] = useState(false);
+  const [collaborationMode, setCollaborationMode] =
+    useState<CollaborationModeKind>('default');
   // Optimistic local copies of just-sent user messages. These get merged into `renderable`
   // immediately on send so the chat shows the bubble without waiting for the round-trip
   // transcript fetch (which can lag several seconds while Codex is streaming the reply).
   // An entry is dropped as soon as a message with the same trimmed text appears in the
   // server transcript.
-  const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([]);
+  const [pendingMessages, setPendingMessages] = useState<PendingChatMessage[]>([]);
   // Older history shown above the latest tail. The helper prefetch can include more than
   // the default latest two messages, so we keep the extra history in a separate bucket and
   // prepend it at render time. Reset whenever the active thread changes.
@@ -649,9 +738,52 @@ export function ThreadView({
   const loadingOlderRef = useRef(false);
   const olderWheelPullRef = useRef(0);
   const olderTouchStartYRef = useRef<number | null>(null);
+  // After the first transcript paint for a thread, we scroll the latest user message to
+  // the top of the viewport so the user sees their question, the agent work group, and
+  // the final response in reading order. This ref guards that one-shot positioning so
+  // later transcript updates (live streams, polls) don't yank the scroll back.
+  const hasPositionedInitialRef = useRef(false);
+  // Pending bubbles change on every send/confirm. We track them in a ref so
+  // applyTranscriptWindow can ask "is there a pending message that the transcript
+  // doesn't yet contain?" without rebuilding the closure on every pending update.
+  const pendingMessagesRef = useRef<PendingChatMessage[]>([]);
+  // Snapshot of message IDs that existed when this thread was first opened on the
+  // tablet. Anchoring the visible tail on the *first* user message that isn't in
+  // this baseline keeps every turn the user just sent visible together with its
+  // reply — without it, sending two messages in a row hides the first reply behind
+  // the second user bubble.
+  const sessionUserBaselineRef = useRef<Set<string>>(new Set());
+  // Tracks whether the session baseline has been seeded at least once. Kept
+  // separate from sessionUserBaselineRef so that an empty thread (zero user
+  // messages on open) is still recorded as "already seeded" — otherwise the
+  // first message the user sends would incorrectly be treated as pre-existing
+  // history and excluded from the visible tail.
+  const sessionBaselineSeededRef = useRef(false);
 
   const applyTranscriptWindow = (nextTranscript: ThreadTranscript) => {
-    const { visible, scrollback } = splitTranscriptForScrollback(nextTranscript);
+    // Seed the session baseline from the *first* transcript we ever see for this
+    // thread, BEFORE we split. The full transcript is what tells us which user
+    // messages are pre-existing history; everything user-authored after this is
+    // a turn from the current session that should stay visible with its reply.
+    // We check sessionBaselineSeededRef (not the set's size) so that an empty
+    // thread — which has no user messages on open — is still counted as seeded.
+    if (!sessionBaselineSeededRef.current) {
+      const baseline = new Set<string>();
+      for (const message of nextTranscript.messages) {
+        if (message.role === 'user') {
+          baseline.add(message.id);
+        }
+      }
+      sessionUserBaselineRef.current = baseline;
+      sessionBaselineSeededRef.current = true;
+    }
+    const hasUnconfirmedPendingMessage = pendingMessagesRef.current.some(
+      (pending) => !pendingMessageIsConfirmed(pending, nextTranscript.messages)
+    );
+    const { visible, scrollback } = splitTranscriptForScrollback(nextTranscript, {
+      hasUnconfirmedPendingMessage,
+      sessionUserBaselineIds: sessionUserBaselineRef.current
+    });
     if (scrollback.length > 0) {
       setOlderMessages((current) => mergeMessagesById(current, scrollback));
     }
@@ -667,6 +799,7 @@ export function ThreadView({
     sendBlockReason === 'compacting_context' ||
     sendBlockReason === 'thread_unavailable';
   const hasPendingRequest = pendingRequests.length > 0;
+  const hasPlanRequest = pendingRequests.some((request) => request.kind === 'plan');
   const hasPendingPermissionRequest = pendingRequests.some(
     (request) => request.kind === 'permissionsApproval'
   );
@@ -705,12 +838,27 @@ export function ThreadView({
   );
   const canSend = Boolean(canUseComposer && trimmedDraft);
   const effectiveModelName = modelName || thread.model;
+  const latestPlanMessage = useMemo(
+    () =>
+      [...(transcript?.messages ?? [])]
+        .reverse()
+        .find((message) => message.kind === 'plan' && message.text.trim()),
+    [transcript?.messages]
+  );
+  const canOfferPlanImplementation = Boolean(
+    latestPlanMessage &&
+      sendMessage &&
+      !hasPendingRequest &&
+      !hasPlanRequest &&
+      !isCodexActive &&
+      transcript?.sendState.canSend
+  );
 
   // Status bar text logic:
   // - When sending: "Sending to Codex..."
   // - When sendState blocks sending: show the explicit reason (e.g. "Approve on Mac to continue")
   //   only for hard blocks that really require the user to wait or use the Mac.
-  // - Else when Codex desktop IPC says the thread is active: "Codex is working"
+  // - Else when app-server says the thread is active: "Codex is working"
   // - Otherwise: sendState.label (which may be "Ready", "Mobile sending is off on the Mac.", etc.)
   // - If loading and no transcript yet: "Loading conversation..."
   const sendBlockedLabel =
@@ -745,11 +893,15 @@ export function ThreadView({
     );
     // Drop pending entries whose text already shows up in the real transcript, then append
     // any remaining ones at the end so the user sees their just-sent message immediately.
-    const realUserTexts = new Set(
-      merged.filter((m) => m.role === 'user').map((m) => m.text.trim())
-    );
-    const stillPending = pendingMessages.filter((m) => !realUserTexts.has(m.text.trim()));
-    return buildRenderableEntries([...merged, ...stillPending]);
+    const stillPending = pendingMessages.filter((message) => !pendingMessageIsConfirmed(message, merged));
+    const combined = [...merged, ...stillPending];
+    if (stillPending.length > 0) {
+      const latestPending = stillPending[stillPending.length - 1]!;
+      const baselineMessageIds = new Set(latestPending.baselineMessageIds);
+      const freshServerMessages = merged.filter((message) => !baselineMessageIds.has(message.id));
+      return buildRenderableEntries([...stillPending, ...freshServerMessages]);
+    }
+    return buildRenderableEntries(combined);
   }, [transcript?.messages, olderMessages, pendingMessages]);
   // Identify the most recent work group so we can auto-expand it while the agent is
   // working. Only the latest one — older work groups stay collapsed even when a new
@@ -767,18 +919,31 @@ export function ThreadView({
     () => transcript?.messages.map((message) => message.id).join('|') ?? '',
     [transcript?.messages]
   );
+  // Total visible text length. Used as a dep for the autoscroll effect so it
+  // fires on every streaming delta — without this, the viewport only updates
+  // when a new message id appears, and the assistant's reply streams in below
+  // the visible window until the user scrolls down manually.
+  const transcriptContentLength = useMemo(() => {
+    let total = 0;
+    for (const message of transcript?.messages ?? []) {
+      total += message.text.length;
+    }
+    return total;
+  }, [transcript?.messages]);
+  const previousLastMessageIdRef = useRef<string | undefined>();
+
+  // Mirror pendingMessages into a ref so applyTranscriptWindow can read the current
+  // pending state without being recreated on every push/confirm.
+  useEffect(() => {
+    pendingMessagesRef.current = pendingMessages;
+  }, [pendingMessages]);
 
   // Reconcile pendingMessages whenever the transcript changes — once the server confirms a
   // pending message, drop it from local state so duplicates don't pile up.
   useEffect(() => {
     if (pendingMessages.length === 0) return;
-    const realUserTexts = new Set(
-      (transcript?.messages ?? [])
-        .filter((m) => m.role === 'user')
-        .map((m) => m.text.trim())
-    );
     setPendingMessages((current) => {
-      const next = current.filter((m) => !realUserTexts.has(m.text.trim()));
+      const next = current.filter((message) => !pendingMessageIsConfirmed(message, transcript?.messages ?? []));
       return next.length === current.length ? current : next;
     });
   }, [transcript?.messages, pendingMessages.length]);
@@ -794,20 +959,76 @@ export function ThreadView({
     olderTouchStartYRef.current = null;
     setOlderError('');
     pinnedToBottomRef.current = true;
+    hasPositionedInitialRef.current = false;
+    // Reset the per-session user-message baseline. It will be seeded by the first
+    // transcript paint below.
+    sessionUserBaselineRef.current = new Set();
+    sessionBaselineSeededRef.current = false;
   }, [thread.threadId]);
 
-  // Auto-scroll to bottom when new messages arrive — but only when the user is already
-  // pinned at the bottom. If they've scrolled up to read older history we leave them
-  // alone so the next streamed token doesn't yank them back down.
+
+  // Initial-paint positioning + auto-scroll on new messages.
+  //
+  // First paint for a thread: scroll the latest user message to the top of the viewport
+  // so the user sees their question, the agent work group, and the final response in
+  // reading order without having to scroll up. Without this, the previous behavior
+  // jumped to the bottom and pushed the user message off-screen on long turns (e.g. a
+  // turn with 179 activity updates).
+  //
+  // After that initial positioning, only auto-scroll to the bottom when the user is
+  // already pinned there — so a streamed token doesn't yank them back down while they
+  // read history.
   useEffect(() => {
     const node = messagesRef.current;
     if (!node) {
       return;
     }
+    if (loading) {
+      return;
+    }
+
+    if (!hasPositionedInitialRef.current) {
+      // Find the last user message in the rendered DOM and align it to the top of the
+      // scroll container. Fall back to scrolling to the bottom if there's no user
+      // message yet (empty thread).
+      const userNodes = node.querySelectorAll<HTMLElement>('[data-role="user-message"]');
+      const lastUser = userNodes.length > 0 ? userNodes[userNodes.length - 1]! : null;
+      if (lastUser) {
+        const containerTop = node.getBoundingClientRect().top;
+        const messageTop = lastUser.getBoundingClientRect().top;
+        node.scrollTop = node.scrollTop + (messageTop - containerTop);
+        // The user is reading from the top of their question — they aren't pinned to
+        // the bottom, so live streams shouldn't drag them down.
+        pinnedToBottomRef.current = false;
+      } else {
+        node.scrollTop = node.scrollHeight;
+      }
+      hasPositionedInitialRef.current = true;
+      previousLastMessageIdRef.current = transcript?.messages.at(-1)?.id;
+      return;
+    }
+
+    // When a brand-new message lands at the end of the transcript, treat it as
+    // "user just sent / agent just started a new turn" and re-pin to the bottom
+    // so the streaming reply follows the viewport. The scroll handler will flip
+    // pinnedToBottomRef back to false the moment the user scrolls away, so this
+    // doesn't yank them around while they're reading history.
+    const latestId = transcript?.messages.at(-1)?.id;
+    if (latestId && latestId !== previousLastMessageIdRef.current) {
+      pinnedToBottomRef.current = true;
+      previousLastMessageIdRef.current = latestId;
+    }
+
     if (pinnedToBottomRef.current) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [transcriptMessageIds, transcript?.activeTurnId, loading]);
+  }, [
+    transcriptMessageIds,
+    transcriptContentLength,
+    transcript?.activeTurnId,
+    loading,
+    pendingMessages.length
+  ]);
 
   // Apply live transcript updates immediately (WebSocket path)
   useEffect(() => {
@@ -931,23 +1152,35 @@ export function ThreadView({
     }
 
     const textToSend = trimmedDraft;
+    const baselineMessageIds = new Set(
+      [...olderMessages, ...(transcript?.messages ?? [])].map((message) => message.id)
+    );
     // Optimistic UI: clear the textarea and append the user's bubble to the chat right away.
     // The full transcript round-trip can take several seconds while Codex is streaming a
     // reply, so we don't want the message to appear "stuck" in the input.
-    const optimistic: ChatMessage = {
+    const optimistic: PendingChatMessage = {
       id: `pending-${Date.now()}`,
       role: 'user',
       kind: 'message',
       text: textToSend,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      baselineMessageIds: [...baselineMessageIds]
     };
     setPendingMessages((current) => [...current, optimistic]);
     setDraft('');
     setSending(true);
     setError('');
+    // The user just sent a new message — re-pin to the bottom so their new bubble and
+    // Codex's streaming reply are visible without them having to scroll down.
+    pinnedToBottomRef.current = true;
     try {
-      const result = await sendMessage(thread.threadId, textToSend);
-      applyTranscriptWindow(result.transcript);
+      const result =
+        collaborationMode === 'plan'
+          ? await sendMessage(thread.threadId, textToSend, { collaborationMode })
+          : await sendMessage(thread.threadId, textToSend);
+      if (transcriptContainsNewUserText(result.transcript, textToSend, baselineMessageIds)) {
+        applyTranscriptWindow(result.transcript);
+      }
     } catch (sendError) {
       // Roll back the optimistic bubble and restore the draft so the user can retry.
       setPendingMessages((current) => current.filter((m) => m.id !== optimistic.id));
@@ -1131,6 +1364,23 @@ export function ThreadView({
     }
   };
 
+  const handleImplementPlan = async () => {
+    if (!sendMessage || !latestPlanMessage || !canOfferPlanImplementation) {
+      return;
+    }
+    setImplementingPlan(true);
+    setError('');
+    pinnedToBottomRef.current = true;
+    try {
+      const result = await sendMessage(thread.threadId, 'Please implement this plan.');
+      applyTranscriptWindow(result.transcript);
+    } catch (sendError) {
+      setError(sendError instanceof Error ? sendError.message : 'Could not start the plan.');
+    } finally {
+      setImplementingPlan(false);
+    }
+  };
+
   return (
     <section className="codex-thread" data-testid="thread-chat-drawer">
       <header className="codex-thread-header">
@@ -1276,7 +1526,12 @@ export function ThreadView({
 
           if (message.role === 'user') {
             return (
-              <div key={message.id} className="codex-message codex-message--user">
+              <div
+                key={message.id}
+                className="codex-message codex-message--user"
+                data-role="user-message"
+                data-message-id={message.id}
+              >
                 <MessageAttachments attachments={message.attachments} />
                 <article className="codex-bubble codex-bubble--user">
                   {message.text.trim() ? <p>{message.text}</p> : null}
@@ -1324,6 +1579,29 @@ export function ThreadView({
               Waiting for the live approval details. Open Codex on your Mac if the buttons do not
               appear.
             </p>
+          </article>
+        </div>
+      ) : null}
+      {canOfferPlanImplementation ? (
+        <div className="codex-pending-requests" role="region" aria-label="Plan actions">
+          <article className="codex-pending-request">
+            <header className="codex-pending-request-title">Plan is ready</header>
+            <div className="codex-pending-request-actions">
+              <button
+                type="button"
+                className="codex-pending-request-action is-primary"
+                onClick={() => void handleImplementPlan()}
+                disabled={implementingPlan}
+              >
+                {implementingPlan ? (
+                  <>
+                    <Spinner size={14} /> Starting...
+                  </>
+                ) : (
+                  'Implement plan'
+                )}
+              </button>
+            </div>
           </article>
         </div>
       ) : null}
@@ -1422,6 +1700,23 @@ export function ThreadView({
                 disabled={modelUpdating || !onChangeModel}
                 setUpdating={setModelUpdating}
               />
+              <button
+                type="button"
+                className={`codex-composer-mode ${collaborationMode === 'plan' ? 'is-active' : ''}`}
+                aria-pressed={collaborationMode === 'plan'}
+                title={
+                  collaborationMode === 'plan'
+                    ? 'Plan mode is on for the next message'
+                    : 'Ask Codex to make a plan first'
+                }
+                onClick={() =>
+                  setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))
+                }
+                disabled={!sendMessage}
+              >
+                <ListChecks size={14} />
+                <span>Plan</span>
+              </button>
             </div>
             <div className="codex-composer-actions">
               {stopWork && isCodexActive ? (
@@ -1595,6 +1890,21 @@ function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
+const APPROVAL_METHODS_FOR_UI = new Set<ApprovalMethodForUi>([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+  'execCommandApproval',
+  'applyPatchApproval',
+  'item/tool/requestUserInput',
+  'item/plan/requestImplementation',
+  'mcpServer/elicitation/request'
+]);
+
+function isApprovalMethodForUi(method: string): method is ApprovalMethodForUi {
+  return APPROVAL_METHODS_FOR_UI.has(method as ApprovalMethodForUi);
+}
+
 function PendingRequestRow({
   request,
   transcript,
@@ -1618,16 +1928,25 @@ function PendingRequestRow({
   const isApproval =
     request.kind === 'commandApproval' ||
     request.kind === 'fileApproval' ||
-    request.kind === 'permissionsApproval';
+    request.kind === 'permissionsApproval' ||
+    request.kind === 'mcpElicitationApproval';
+  const isPlanRequest = request.kind === 'plan';
+  const isQuestionRequest = request.kind === 'question';
+  const canAnswerRequest = isApproval || isPlanRequest || isQuestionRequest;
 
   const submit = async (label: string, decision: string | Record<string, unknown>) => {
-    if (!onApprovalDecision || !isApproval) return;
-    const method =
-      request.kind === 'commandApproval'
+    if (!onApprovalDecision || !canAnswerRequest) return;
+    const fallbackMethod =
+      request.kind === 'plan'
+        ? 'item/plan/requestImplementation'
+        : request.kind === 'commandApproval'
         ? 'item/commandExecution/requestApproval'
         : request.kind === 'fileApproval'
           ? 'item/fileChange/requestApproval'
-          : 'item/permissions/requestApproval';
+          : request.kind === 'mcpElicitationApproval'
+            ? 'mcpServer/elicitation/request'
+            : 'item/permissions/requestApproval';
+    const method = isApprovalMethodForUi(request.method) ? request.method : fallbackMethod;
     setSubmitting(label);
     setError('');
     try {
@@ -1653,15 +1972,97 @@ function PendingRequestRow({
     });
   };
 
-  const primaryApprovalLabel = request.kind === 'permissionsApproval' ? 'Allow once' : 'Approve';
+  const submitMcpElicitation = async (label: string, persist?: 'always') => {
+    await submit(label, {
+      action: 'accept',
+      content: {},
+      _meta: persist ? { persist } : null
+    });
+  };
+
+  const denyMcpElicitation = async () => {
+    await submit('decline', {
+      action: 'decline',
+      content: null,
+      _meta: null
+    });
+  };
+
+  // Build the response shape Codex expects for item/tool/requestUserInput.
+  // Codex's RequestUserInputResponse is `{ answers: HashMap<questionId,
+  // RequestUserInputAnswer> }` where RequestUserInputAnswer is
+  // `{ answers: Vec<String> }` (so multi-select is supported even though our UI
+  // is single-select for now). We wrap each per-question string into the
+  // single-element vector form Codex expects.
+  const submitQuestionAnswer = async (label: string, answersById: Record<string, string>) => {
+    const wrapped: Record<string, { answers: string[] }> = {};
+    for (const [questionId, answer] of Object.entries(answersById)) {
+      wrapped[questionId] = { answers: [answer] };
+    }
+    await submit(label, { answers: wrapped });
+  };
+
+  const denyQuestion = async () => {
+    // Codex treats an empty answers payload as "skipped" — the turn aborts
+    // gracefully. This also unblocks the thread so the stop button works
+    // again on the next idle.
+    await submit('skip', { answers: {} });
+  };
+
+  const commandPrefix = request.proposedExecpolicyAmendment?.join(' ');
+  const commandPrefixDecision =
+    request.method === 'item/commandExecution/requestApproval' && request.proposedExecpolicyAmendment?.length
+      ? {
+          acceptWithExecpolicyAmendment: {
+            execpolicy_amendment: request.proposedExecpolicyAmendment
+          }
+        }
+      : undefined;
+  const hasSessionApproval =
+    request.kind === 'mcpElicitationApproval' ||
+    request.kind === 'permissionsApproval' ||
+    request.method === 'execCommandApproval' ||
+    request.method === 'applyPatchApproval' ||
+    Boolean(commandPrefixDecision);
+  const negativeApprovalDecision = request.availableDecisions?.includes('cancel') ? 'cancel' : 'decline';
+  const primaryApprovalLabel =
+    request.kind === 'mcpElicitationApproval'
+      ? 'Allow'
+      : request.kind === 'permissionsApproval'
+        ? 'Allow once'
+        : 'Approve';
   const primarySubmittingLabel =
-    request.kind === 'permissionsApproval' ? 'Allowing...' : 'Approving...';
+    request.kind === 'permissionsApproval' || request.kind === 'mcpElicitationApproval'
+      ? 'Allowing...'
+      : 'Approving...';
   const sessionApprovalLabel =
-    request.kind === 'permissionsApproval' ? 'Allow for session' : 'Approve for session';
+    request.kind === 'mcpElicitationApproval'
+      ? 'Always allow'
+      : request.kind === 'permissionsApproval'
+        ? 'Allow for session'
+        : commandPrefix
+          ? `Always allow ${truncate(commandPrefix, 28)}`
+          : 'Approve for session';
   const sessionSubmittingLabel =
-    request.kind === 'permissionsApproval' ? 'Allowing...' : 'Approving...';
-  const denyLabel = request.kind === 'permissionsApproval' ? 'Deny' : 'Decline';
-  const denySubmittingLabel = request.kind === 'permissionsApproval' ? 'Denying...' : 'Declining...';
+    request.kind === 'permissionsApproval' || request.kind === 'mcpElicitationApproval'
+      ? 'Allowing...'
+      : 'Approving...';
+  const denyLabel =
+    request.kind === 'mcpElicitationApproval'
+      ? 'Cancel'
+      : request.kind === 'permissionsApproval'
+        ? 'Deny'
+        : negativeApprovalDecision === 'cancel'
+          ? 'Cancel'
+          : 'Decline';
+  const denySubmittingLabel =
+    request.kind === 'mcpElicitationApproval'
+      ? 'Cancelling...'
+      : request.kind === 'permissionsApproval'
+        ? 'Denying...'
+        : negativeApprovalDecision === 'cancel'
+          ? 'Cancelling...'
+          : 'Declining...';
 
   return (
     <article className="codex-pending-request">
@@ -1676,15 +2077,55 @@ function PendingRequestRow({
           <pre className="codex-pending-request-context-pre">{matchedItem.text}</pre>
         </div>
       ) : null}
-      {isApproval && onApprovalDecision ? (
+      {isPlanRequest && onApprovalDecision ? (
+        <div className="codex-pending-request-actions">
+          <button
+            type="button"
+            className="codex-pending-request-action is-primary"
+            onClick={() => void submit('implement', 'accept')}
+            disabled={Boolean(submitting)}
+          >
+            {submitting === 'implement' ? (
+              <>
+                <Spinner size={14} /> Starting...
+              </>
+            ) : (
+              'Implement'
+            )}
+          </button>
+          <button
+            type="button"
+            className="codex-pending-request-action is-danger"
+            onClick={() => void submit('cancel', 'decline')}
+            disabled={Boolean(submitting)}
+          >
+            {submitting === 'cancel' ? (
+              <>
+                <Spinner size={14} /> Cancelling...
+              </>
+            ) : (
+              'Cancel'
+            )}
+          </button>
+        </div>
+      ) : isQuestionRequest && onApprovalDecision ? (
+        <QuestionAnswerForm
+          request={request}
+          submitting={submitting}
+          onSubmit={(label, answers) => void submitQuestionAnswer(label, answers)}
+          onSkip={() => void denyQuestion()}
+        />
+      ) : isApproval && onApprovalDecision ? (
         <div className="codex-pending-request-actions">
           <button
             type="button"
             className="codex-pending-request-action is-primary"
             onClick={() =>
-              void (request.kind === 'permissionsApproval'
-                ? submitPermissions('accept', 'turn')
-                : submit('accept', 'accept'))
+              void (request.kind === 'mcpElicitationApproval'
+                ? submitMcpElicitation('accept')
+                : request.kind === 'permissionsApproval'
+                  ? submitPermissions('accept', 'turn')
+                  : submit('accept', 'accept'))
             }
             disabled={Boolean(submitting)}
           >
@@ -1696,35 +2137,43 @@ function PendingRequestRow({
               primaryApprovalLabel
             )}
           </button>
-          <button
-            type="button"
-            className="codex-pending-request-action"
-            onClick={() =>
-              void (request.kind === 'permissionsApproval'
-                ? submitPermissions('acceptForSession', 'session')
-                : submit('acceptForSession', 'acceptForSession'))
-            }
-            disabled={Boolean(submitting)}
-          >
-            {submitting === 'acceptForSession' ? (
-              <>
-                <Spinner size={14} /> {sessionSubmittingLabel}
-              </>
-            ) : (
-              sessionApprovalLabel
-            )}
-          </button>
+          {hasSessionApproval ? (
+            <button
+              type="button"
+              className="codex-pending-request-action"
+              onClick={() =>
+                void (request.kind === 'mcpElicitationApproval'
+                  ? submitMcpElicitation('acceptForSession', 'always')
+                  : request.kind === 'permissionsApproval'
+                    ? submitPermissions('acceptForSession', 'session')
+                    : commandPrefixDecision
+                      ? submit('acceptForSession', commandPrefixDecision)
+                      : submit('acceptForSession', 'acceptForSession'))
+              }
+              disabled={Boolean(submitting)}
+            >
+              {submitting === 'acceptForSession' ? (
+                <>
+                  <Spinner size={14} /> {sessionSubmittingLabel}
+                </>
+              ) : (
+                sessionApprovalLabel
+              )}
+            </button>
+          ) : null}
           <button
             type="button"
             className="codex-pending-request-action is-danger"
             onClick={() =>
-              void (request.kind === 'permissionsApproval'
-                ? denyPermissions()
-                : submit('decline', 'decline'))
+              void (request.kind === 'mcpElicitationApproval'
+                ? denyMcpElicitation()
+                : request.kind === 'permissionsApproval'
+                  ? denyPermissions()
+                  : submit(negativeApprovalDecision, negativeApprovalDecision))
             }
             disabled={Boolean(submitting)}
           >
-            {submitting === 'decline' || submitting === 'deny' ? (
+            {submitting === negativeApprovalDecision || submitting === 'deny' ? (
               <>
                 <Spinner size={14} /> {denySubmittingLabel}
               </>
@@ -1739,6 +2188,212 @@ function PendingRequestRow({
       {error ? <p className="codex-pending-request-error">{error}</p> : null}
     </article>
   );
+}
+
+// Renders a Codex requestUserInput question with its suggestion buttons and a
+// freeform fallback. Codex sends `params.questions[]`, each with a `name`, a
+// human-readable `header`/`question`, optional `suggestions: [{ value, label }]`,
+// and an `answerType` ('string' | 'enum' | etc.). For each question we render
+// either the suggestion buttons (if present) or a single-line text input. The
+// answers are collected into `{ <questionName>: <answer> }` and submitted as
+// `{ answers: {...} }` to match what the helper's app-server bridge expects.
+function QuestionAnswerForm({
+  request,
+  submitting,
+  onSubmit,
+  onSkip
+}: {
+  request: ThreadPendingRequest;
+  submitting: string | undefined;
+  onSubmit: (label: string, answers: Record<string, string>) => void;
+  onSkip: () => void;
+}) {
+  const questions = useMemo<RawQuestion[]>(() => {
+    const raw = (request.params ?? {}) as { questions?: unknown };
+    if (!Array.isArray(raw.questions)) {
+      return [];
+    }
+    return raw.questions.flatMap((entry, index) => {
+      if (!entry || typeof entry !== 'object') return [];
+      const questionEntry = entry as Record<string, unknown>;
+      // Codex's RequestUserInputQuestion uses `id` to key answers in the
+      // response. Fall back to `name` (older builds) and finally a synthetic
+      // index so the form still renders if Codex changes the field name.
+      const id =
+        typeof questionEntry.id === 'string' && questionEntry.id.trim()
+          ? questionEntry.id.trim()
+          : typeof questionEntry.name === 'string' && questionEntry.name.trim()
+            ? questionEntry.name.trim()
+            : `q_${index}`;
+      const header =
+        typeof questionEntry.header === 'string' ? questionEntry.header : undefined;
+      const text =
+        typeof questionEntry.question === 'string' ? questionEntry.question : undefined;
+      const isSecret = questionEntry.isSecret === true;
+      // Real Codex builds send `options: [{ label, description }]`. Older
+      // ones may use `suggestions: [{ value, label, tooltip }]`. Accept both.
+      const rawOptions = Array.isArray(questionEntry.options)
+        ? (questionEntry.options as unknown[])
+        : Array.isArray(questionEntry.suggestions)
+          ? (questionEntry.suggestions as unknown[])
+          : [];
+      const suggestions: RawSuggestion[] = rawOptions
+        .map((option) => normalizeSuggestion(option))
+        .filter((option): option is RawSuggestion => option !== null);
+      return [{ id, header, text, suggestions, isSecret }];
+    });
+  }, [request.params]);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const allAnswered = questions.every(
+    (question) => (answers[question.id] ?? '').trim().length > 0
+  );
+  const submitDisabled = Boolean(submitting) || !allAnswered;
+
+  if (questions.length === 0) {
+    return <p className="codex-pending-request-hint">Open Codex on your Mac to answer.</p>;
+  }
+
+  return (
+    <div className="codex-pending-request-question">
+      {questions.map((question) => {
+        const value = answers[question.id] ?? '';
+        return (
+          <div key={question.id} className="codex-pending-request-question-block">
+            {question.text ? (
+              <p className="codex-pending-request-question-text">{question.text}</p>
+            ) : null}
+            {question.suggestions.length > 0 ? (
+              <div className="codex-pending-request-question-suggestions">
+                {question.suggestions.map((suggestion) => {
+                  const active = value === suggestion.value;
+                  return (
+                    <button
+                      key={`${question.id}:${suggestion.value}`}
+                      type="button"
+                      className={`codex-pending-request-suggestion${
+                        active ? ' is-active' : ''
+                      }`}
+                      title={suggestion.tooltip}
+                      onClick={() =>
+                        setAnswers((current) => ({
+                          ...current,
+                          [question.id]: suggestion.value
+                        }))
+                      }
+                      disabled={Boolean(submitting)}
+                    >
+                      <span className="codex-pending-request-suggestion-label">
+                        {suggestion.label ?? suggestion.value}
+                      </span>
+                      {suggestion.tooltip ? (
+                        <span className="codex-pending-request-suggestion-hint">
+                          {suggestion.tooltip}
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+            <input
+              type={question.isSecret ? 'password' : 'text'}
+              className="codex-pending-request-question-input"
+              placeholder={
+                question.suggestions.length > 0
+                  ? 'Or type your own answer...'
+                  : 'Type your answer...'
+              }
+              value={value}
+              onChange={(event) =>
+                setAnswers((current) => ({
+                  ...current,
+                  [question.id]: event.target.value
+                }))
+              }
+              autoComplete={question.isSecret ? 'new-password' : 'off'}
+              disabled={Boolean(submitting)}
+            />
+          </div>
+        );
+      })}
+      <div className="codex-pending-request-actions">
+        <button
+          type="button"
+          className="codex-pending-request-action is-primary"
+          disabled={submitDisabled}
+          onClick={() => onSubmit('answer', answers)}
+        >
+          {submitting === 'answer' ? (
+            <>
+              <Spinner size={14} /> Sending...
+            </>
+          ) : (
+            'Send answer'
+          )}
+        </button>
+        <button
+          type="button"
+          className="codex-pending-request-action is-danger"
+          disabled={Boolean(submitting)}
+          onClick={onSkip}
+        >
+          {submitting === 'skip' ? (
+            <>
+              <Spinner size={14} /> Cancelling...
+            </>
+          ) : (
+            'Skip'
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+type RawSuggestion = { value: string; label?: string; tooltip?: string };
+type RawQuestion = {
+  id: string;
+  header?: string;
+  text?: string;
+  suggestions: RawSuggestion[];
+  isSecret?: boolean;
+};
+
+function normalizeSuggestion(raw: unknown): RawSuggestion | null {
+  if (typeof raw === 'string') {
+    return { value: raw };
+  }
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  // Codex's RequestUserInputQuestionOption is { label: string, description: string }.
+  // We send `label` back as the answer string. For older/alternate shapes we
+  // fall back to `value` then to `label` as the answer key. The `description`
+  // is the per-option hint Codex shows in its desktop UI ("what does this
+  // option do") — we display it under the label on the tablet, and we also
+  // accept the older `tooltip`/`hint` field names just in case.
+  const label = typeof record.label === 'string' ? record.label : undefined;
+  const value =
+    typeof record.value === 'string'
+      ? record.value
+      : label ?? null;
+  if (!value) {
+    return null;
+  }
+  const tooltip =
+    typeof record.description === 'string'
+      ? record.description
+      : typeof record.tooltip === 'string'
+        ? record.tooltip
+        : typeof record.hint === 'string'
+          ? record.hint
+          : undefined;
+  return {
+    value,
+    ...(label ? { label } : {}),
+    ...(tooltip ? { tooltip } : {})
+  };
 }
 
 function UsageBadges({ usage }: { usage: ThreadUsage }) {

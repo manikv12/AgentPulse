@@ -51,6 +51,36 @@ describe('thread opener', () => {
     opener.dispose();
   });
 
+  it('opens the target thread with a mini-window refresh when requested', async () => {
+    const execFile = vi.fn((_command, _args, callback) => callback(null));
+    const opener = createThreadOpener({
+      execFile,
+      rolloutLookup: stubLookup,
+      watchRollout: stubWatch,
+      scriptPath: '/abs/script.applescript',
+      bundleId: 'com.openai.codex',
+      appPath: '/Applications/Codex.app'
+    });
+
+    await expect(
+      opener.openThread('019dc68a-aedf-70f0-901e-825a65116744', { refreshMode: 'mini-window' })
+    ).resolves.toEqual({ ok: true });
+
+    expect(execFile).toHaveBeenCalledWith(
+      'osascript',
+      [
+        '/abs/script.applescript',
+        'com.openai.codex',
+        '/Applications/Codex.app',
+        'codex://threads/019dc68a-aedf-70f0-901e-825a65116744',
+        'mini-window',
+        '2500'
+      ],
+      expect.any(Function)
+    );
+    opener.dispose();
+  });
+
   it('finds the AppleScript copied into the built helper dist folder', async () => {
     const tempRoot = await mkdtemp(path.join(tmpdir(), 'agent-pulse-refresh-script-'));
     const distDir = path.join(tempRoot, 'dist');
@@ -93,7 +123,7 @@ describe('thread opener', () => {
     const execFile = vi
       .fn()
       .mockImplementationOnce((_command, _args, callback) => callback(new Error('osascript missing')))
-      .mockImplementationOnce((_command, _args, callback) => callback(new Error('bad settings url')))
+      .mockImplementationOnce((_command, _args, callback) => callback(new Error('bad thread url')))
       .mockImplementationOnce((_command, _args, callback) => callback(null));
     const opener = createThreadOpener({ execFile, rolloutLookup: stubLookup, watchRollout: stubWatch });
 
@@ -101,6 +131,97 @@ describe('thread opener', () => {
 
     expect(execFile).toHaveBeenLastCalledWith('open', ['-a', 'Codex', 'codex://threads/thread-123'], expect.any(Function));
     opener.dispose();
+  });
+
+  it('uses the mini-window refresh path for forced desktop remounts', async () => {
+    vi.useFakeTimers();
+    const execFile = vi.fn((_command, _args, callback) => callback(null));
+    const opener = createThreadOpener({
+      execFile,
+      rolloutLookup: stubLookup,
+      watchRollout: stubWatch,
+      scriptPath: '/script.applescript',
+      debounceMs: 0,
+      refreshThrottleMs: 0,
+      growthWaitMs: 10
+    });
+
+    opener.refreshDesktop('thread-123', {
+      forceRemount: true,
+      immediate: true,
+      waitForGrowth: false
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+
+    expect(execFile).toHaveBeenCalledWith(
+      'osascript',
+      [
+        '/script.applescript',
+        'com.openai.codex',
+        '/Applications/Codex.app',
+        'codex://threads/thread-123',
+        'mini-window',
+        '2500'
+      ],
+      expect.any(Function)
+    );
+    expect(execFile).not.toHaveBeenCalledWith(
+      'open',
+      ['-b', 'com.openai.codex', 'codex://settings'],
+      expect.any(Function)
+    );
+
+    opener.dispose();
+    vi.useRealTimers();
+  });
+
+  it('does not start the rollout live watcher after a forced mini-window refresh', async () => {
+    vi.useFakeTimers();
+    const execFile = vi.fn((_command, _args, callback) => callback(null));
+    const lookup: RolloutLookup = {
+      findRolloutPath: vi.fn(async () => '/sessions/rollout-x.jsonl')
+    };
+    const watchRollout = vi.fn(stubWatch);
+    const opener = createThreadOpener({
+      execFile,
+      rolloutLookup: lookup,
+      watchRollout,
+      scriptPath: '/script.applescript',
+      debounceMs: 0,
+      refreshThrottleMs: 0,
+      growthWaitMs: 10
+    });
+
+    opener.refreshDesktop('thread-123', {
+      forceRemount: true,
+      immediate: true,
+      waitForGrowth: false
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+
+    expect(execFile).toHaveBeenCalledWith(
+      'osascript',
+      [
+        '/script.applescript',
+        'com.openai.codex',
+        '/Applications/Codex.app',
+        'codex://threads/thread-123',
+        'mini-window',
+        '2500'
+      ],
+      expect.any(Function)
+    );
+    expect(lookup.findRolloutPath).not.toHaveBeenCalled();
+    expect(watchRollout).not.toHaveBeenCalled();
+
+    opener.dispose();
+    vi.useRealTimers();
   });
 
   it('debounces rapid refreshDesktop calls into a single bounce', async () => {
