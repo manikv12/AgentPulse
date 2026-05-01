@@ -1,59 +1,72 @@
+<p align="center">
+  <img src="apps/tablet/public/icon.svg" alt="Agent Pulse logo" width="128" />
+</p>
+
 # Agent Pulse
 
-Agent Pulse is a tablet-friendly control surface for Codex running on your Mac.
+Agent Pulse is a browser-based control surface for local coding agents running on your Mac.
 
-It gives you a live view of your Codex threads on an iPad, Android tablet, or small touch display, so you can glance across active work without keeping the Codex window in front of you all day. The helper runs on your Mac, reads local Codex state, and serves a web app that paired devices can open.
+It gives you one live dashboard for active agent work, recent threads, approvals, transcripts, models, and health. Open it on an iPad, Android tablet, phone, or desktop browser so you can watch and steer work even when you are not sitting next to your computer.
 
-Version 1 is built around Codex. The long-term idea is to support more local coding agents later, but the current app is specifically a Codex companion.
+Agent Pulse is local-first with optional remote access: the helper runs on your Mac, reads local agent state, and serves a paired web app to trusted devices. When remote access is enabled, the helper can expose that same paired web app through a Cloudflare Tunnel.
 
-## What You Can Do With It
+## Supported Providers
 
-From a paired tablet or browser, Agent Pulse can:
+Agent Pulse is built around provider choice. You can use the agent that fits the task instead of forcing every workflow through one tool.
 
-- show your Codex threads with color-coded status
-- show recent thread activity and health
-- open a thread in Codex on the Mac
-- view thread transcripts
-- start a new thread
-- send a message to a thread
-- stop active work
-- respond to supported approval prompts
-- manage pairing and remote-access settings from the built-in settings screen
+| Provider | Status | What Agent Pulse Can Do |
+| --- | --- | --- |
+| Codex | Supported | Read threads, show live status, open threads in Codex, send messages, stop work, change models, use plan mode, handle supported approvals, and show transcripts. |
+| Claude Code | Supported | Read sessions, show provider-aware threads, send messages, change models when available, show live work, show transcripts, and keep Claude-specific composer behavior separate from Codex. |
+| GitHub Copilot | Supported | Read sessions, show provider-aware threads, send prompts through the helper, show transcripts, and track live work from Copilot sessions. |
+| Codex app-server / local app server | Supported internally | Used by the helper for Codex state, live updates, transcripts, approvals, model data, and local control flows. |
 
-The tablet is a control and visibility surface. The Mac helper remains the system that talks to Codex and owns the local data.
+Some features depend on what each provider exposes. For example, image sending from the tablet composer is planned, but the current send channel is text-first.
+
+## What You Can Do
+
+From a paired tablet, phone, or browser, Agent Pulse can:
+
+- see active and recent threads across supported providers
+- tell which provider owns each thread with clear provider color and icons
+- show running, waiting, review, error, and idle status
+- open a Codex thread on the Mac
+- view transcript history and loaded screenshots/images from provider history
+- send follow-up messages to supported providers
+- start new provider-backed threads from known workspaces
+- switch models where the provider supports it
+- use Codex plan mode from the composer menu
+- stop active work when supported
+- respond to supported approvals and plan requests
+- manage pairing, local access, and Cloudflare Tunnel remote access settings
+
+The browser UI is the control and visibility surface. The Mac helper remains the trusted process that talks to local agents and owns the local data.
 
 ## How It Works
 
 Agent Pulse has three main parts:
 
-1. **Codex on your Mac**
-   Codex keeps its own local state, thread index, rollout files, and app-server data.
+1. **Local agents on your Mac**
+   Codex, Claude Code, GitHub Copilot, and app-server style backends keep their own local sessions and state.
 2. **Agent Pulse helper**
-   A local service on macOS reads Codex data, tracks status changes, handles device pairing, and serves the web UI.
-3. **Tablet web app**
-   A browser-based UI that connects to the helper over your local network and receives live updates.
+   A macOS helper service reads local agent data, tracks status changes, handles pairing, and exposes one safe API for the browser UI.
+3. **Browser web app**
+   A React/Vite web app that connects to the helper over a paired HTTP and WebSocket connection.
 
-In practice, the flow looks like this:
-
-1. You run the Agent Pulse helper on your Mac.
-2. The helper reads your local Codex state and starts a small web server.
-3. You open the Agent Pulse web app on an iPad, Android tablet, or another browser.
-4. You pair that device with a PIN generated by the helper.
-5. The tablet receives thread lists and live status updates from the helper.
-6. When you tap a thread or send an action, the helper performs that action against Codex on the Mac.
-
-High-level architecture:
+High-level flow:
 
 ```text
-Tablet browser
-	 |
-	 | paired HTTP + WebSocket connection
-	 v
+Tablet / phone / browser
+        |
+        | paired HTTP + WebSocket
+        | local LAN or optional Cloudflare Tunnel
+        v
 Agent Pulse helper on macOS
-	 |
-	 +--> Codex app-server
-	 +--> ~/.codex local state
-	 +--> Codex desktop app
+        |
+        +--> Codex desktop + app-server + ~/.codex
+        +--> Claude Code session files / live process
+        +--> GitHub Copilot sessions / live process
+        +--> optional Cloudflare Tunnel for remote access
 ```
 
 ## Current Scope
@@ -61,11 +74,11 @@ Agent Pulse helper on macOS
 Agent Pulse is currently designed for a trusted personal setup:
 
 - the helper runs on macOS
-- the tablet app is usually used on the same LAN
-- pairing is required before a device can read thread data
-- raw Codex files and raw Codex server endpoints are not exposed directly to the tablet
-
-Optional remote access is being built around a helper-managed Cloudflare Tunnel, but the core product is still local-first.
+- paired devices can use the browser UI from the local network
+- optional remote access can expose the same paired UI through the helper-managed Cloudflare Tunnel flow
+- pairing is required before a device can read or control thread data
+- raw provider files and raw provider endpoints are not exposed directly to the browser
+- provider-specific features stay provider-specific, so Codex commands do not appear in Claude-only composer flows
 
 More detailed product and architecture notes live here:
 
@@ -74,23 +87,25 @@ More detailed product and architecture notes live here:
 
 ## Platform Requirements
 
-Agent Pulse is **macOS-only for v1**.
+Agent Pulse is macOS-first.
 
 You need:
 
-- a Mac with Codex installed and local Codex data available under `~/.codex/`
+- a Mac running the helper
+- at least one supported local provider, such as Codex, Claude Code, or GitHub Copilot
 - `pnpm` for local development
-- an iPad, Android tablet, or any browser-capable touch display if you want the companion screen experience
+- an iPad, Android tablet, phone, or browser-capable display for local or remote access
 
-The tablet client itself is just a web app, but the helper depends on macOS-specific pieces such as Keychain integration and AppleScript-driven thread opening.
+The client is just a web app. The helper depends on local macOS behavior for pairing storage, provider discovery, and opening local apps.
 
 ## Repository Layout
 
-- `apps/helper`: the macOS helper server that reads Codex state, manages pairing, and serves the UI
-- `apps/tablet`: the React/Vite tablet web app
-- `packages/shared`: shared API schemas and status types
+- `apps/helper`: macOS helper server, provider adapters, pairing, settings, remote access, and API routes
+- `apps/tablet`: React/Vite browser UI for tablet, phone, and desktop access
+- `packages/shared`: shared schemas, provider types, thread types, and API contracts
 - `docs`: product and architecture requirements
 - `scripts`: local development runners
+- `assets`: README and product visual assets
 
 ## Getting Started For Development
 
@@ -103,17 +118,7 @@ pnpm typecheck
 pnpm build
 ```
 
-If you want to run the built helper directly:
-
-```bash
-pnpm --filter @agent-pulse/helper start
-```
-
-That starts the helper and prints a local settings URL. Open that URL in a browser on your Mac to manage pairing and settings.
-
-## Local Development Workflow
-
-For normal development, use the repo-level runner:
+Run the full local development loop:
 
 ```bash
 pnpm dev:run
@@ -121,13 +126,13 @@ pnpm dev:run
 
 This script:
 
-- rebuilds the shared package and helper
+- rebuilds shared packages and helper code
 - starts the helper
-- starts the tablet dev server
-- connects the helper to the tablet dev server
-- also manages the Cloudflare tunnel when remote access is enabled in Agent Pulse settings
+- starts the browser UI dev server
+- connects the helper to the browser UI
+- manages the Cloudflare tunnel when remote access is enabled in Agent Pulse settings
 
-If you want the local helper flow without the managed remote-access hookup, use:
+For local-only helper development without the managed remote-access hookup:
 
 ```bash
 pnpm dev:run:local
@@ -137,22 +142,49 @@ After the helper starts:
 
 1. Open the settings URL printed in the terminal.
 2. Generate or view the pairing PIN.
-3. Open the tablet UI in a browser.
+3. Open the browser UI on a phone, tablet, or desktop browser.
 4. Pair the device.
-5. Start using the dashboard.
+5. Use the dashboard to monitor and control supported agent threads.
 
-## What The Helper Reads
+## Remote Access With Cloudflare Tunnel
 
-The helper is intentionally the only process that reads Codex state directly. It uses local Codex sources such as:
+Agent Pulse can be used away from your Mac when remote access is enabled. The Mac still runs the helper and talks to the local agents, but your phone, tablet, or browser can reach the paired Agent Pulse UI through a Cloudflare Tunnel URL.
 
-- Codex app-server events
-- thread metadata and indexes under `~/.codex/`
-- rollout/session files for status and transcript updates
+Basic flow:
 
-This keeps the tablet client simple. The browser never reads Codex files directly.
+1. Start the helper with `pnpm dev:run` or run the built helper.
+2. Open the settings URL printed by the helper.
+3. Go to **Agent Pulse settings**.
+4. Pair your device first, or generate a pairing PIN if the device is not paired yet.
+5. In settings, turn on **Remote access**.
+6. Agent Pulse starts or supervises the Cloudflare Tunnel.
+7. Open the remote URL or scan the QR code shown in settings.
+8. Use the paired device to view threads, send messages, respond to supported approvals, and monitor work while away from your computer.
+
+Remote access notes:
+
+- The Mac must stay awake and the Agent Pulse helper must keep running.
+- Pairing is still required; the tunnel does not make raw provider data public.
+- The remote URL is managed by the helper and can change if the tunnel is restarted or remote access is turned off and on.
+- If you only want local network access, leave remote access off and use the LAN URL from settings.
+
+## Helper Data Model
+
+The helper is the only process that reads provider state directly. It normalizes provider-specific data into shared thread, transcript, provider, status, and approval schemas.
+
+Examples of local sources include:
+
+- Codex app-server events and local `~/.codex` state
+- Codex desktop IPC mirror for live sends
+- Claude Code JSONL/session data and live process state
+- GitHub Copilot session data and live process state
+- local helper settings, pairing records, and remote-access state
+
+This keeps the browser simple and safer. The paired web app talks to Agent Pulse, not directly to each provider's raw files or internal endpoints.
 
 ## Notes
 
-- Version 1 is centered on Codex.
-- Windows is not supported.
-- The current product is local-first even though remote access support is being added.
+- Agent Pulse is local-first and personal-workspace focused.
+- Windows is not supported by the helper today.
+- Image display from provider history is supported where transcripts expose images, but composer image sending is not fully wired yet.
+- Provider support will continue to expand behind the shared helper API.

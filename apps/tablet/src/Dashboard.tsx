@@ -876,32 +876,6 @@ function EmptyMain({
       </button>
 
       <div className="codex-home-dashboard">
-        <div className="codex-home-topbar">
-          <h1 className="codex-home-topbar-title">Agent Pulse</h1>
-          {threads.length > 0 && (
-            <div className="codex-home-status-chips">
-              {running > 0 && (
-                <span className="codex-home-chip codex-home-chip-blue">
-                  <span className="codex-home-chip-dot is-working" aria-hidden="true" />
-                  {running} running
-                </span>
-              )}
-              {waiting > 0 && (
-                <span className="codex-home-chip codex-home-chip-yellow">
-                  <span className="codex-home-chip-dot" aria-hidden="true" />
-                  {waiting} waiting
-                </span>
-              )}
-              {errors > 0 && (
-                <span className="codex-home-chip codex-home-chip-red">
-                  <span className="codex-home-chip-dot" aria-hidden="true" />
-                  {errors} error{errors !== 1 ? 's' : ''}
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-
         {threads.length === 0 ? (
           <div className="codex-home-empty">
             <MessagesSquare size={28} aria-hidden="true" />
@@ -909,15 +883,34 @@ function EmptyMain({
           </div>
         ) : (
           <div className="codex-home-content">
-            <div className="codex-home-hero-panel">
+            <div className="codex-home-hero">
               <div className="codex-home-hero-icon" aria-hidden="true">
-                <MessagesSquare size={22} />
+                <MessagesSquare size={28} />
               </div>
-              <div className="codex-home-hero-copy">
-                <p className="codex-home-hero-eyebrow">{threads.length} total threads</p>
-                <h2 className="codex-home-hero-title">{heroTitle}</h2>
-                <p className="codex-home-hero-subtitle">{heroCopy}</p>
-              </div>
+              <h2 className="codex-home-hero-title">{heroTitle}</h2>
+              <p className="codex-home-hero-subtitle">{heroCopy}</p>
+              {(running > 0 || waiting > 0 || errors > 0) && (
+                <div className="codex-home-status-chips">
+                  {running > 0 && (
+                    <span className="codex-home-chip codex-home-chip-blue">
+                      <span className="codex-home-chip-dot is-working" aria-hidden="true" />
+                      {running} running
+                    </span>
+                  )}
+                  {waiting > 0 && (
+                    <span className="codex-home-chip codex-home-chip-yellow">
+                      <span className="codex-home-chip-dot" aria-hidden="true" />
+                      {waiting} waiting
+                    </span>
+                  )}
+                  {errors > 0 && (
+                    <span className="codex-home-chip codex-home-chip-red">
+                      <span className="codex-home-chip-dot" aria-hidden="true" />
+                      {errors} error{errors !== 1 ? 's' : ''}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="codex-home-kpi-row" aria-label="Thread summary">
