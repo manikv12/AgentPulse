@@ -96,7 +96,8 @@ export class CodexThreadReader {
       projects.push(ProjectSchema.parse({
         projectId: projectIdForPath(normalized),
         name: workspaceNameFromCwd(normalized),
-        path: normalized
+        path: normalized,
+        providers: ['codex']
       }));
     }
 
@@ -302,8 +303,11 @@ export function isUserFacingThreadSource(source: string | undefined): boolean {
 export function mapSqliteThreadRow(row: SqliteThreadRow, workspaceRoot = row.cwd): Thread {
   return ThreadSchema.parse({
     threadId: row.id,
+    provider: 'codex',
+    providerThreadId: row.id,
     title: row.title || 'Untitled thread',
     workspace: workspaceNameFromCwd(workspaceRoot),
+    workspacePath: workspaceRoot,
     status: 'idle',
     lastActivityAt: new Date(row.updated_at_ms).toISOString(),
     lastTurnSummary: '',

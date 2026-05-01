@@ -4,6 +4,7 @@ import type {
   CatalogPlugin,
   CatalogSkill,
   CollaborationModeKind,
+  AgentProvider,
   HelperHealth,
   OlderThreadMessagesResponse,
   Project,
@@ -17,7 +18,8 @@ import type { FetchThreadTranscriptOptions } from './api';
 import { DashboardInsights } from './DashboardInsights';
 import { Sidebar } from './Sidebar';
 import { Spinner } from './Spinner';
-import { ThreadView } from './ThreadView';
+import { ThreadView, type ApprovalMethodForUi } from './ThreadView';
+import { providerForModel, providerLabel, providerTone } from './providers';
 import { relativeTime, statusLabels, statusTone, hasUnseenActivity, threadNeedsReview } from './status';
 
 const SEEN_ACTIVITY_KEY = 'agent-pulse:seen-thread-activity';
@@ -75,15 +77,7 @@ export type DashboardProps = {
   onApprovalDecision?: (
     threadId: string,
     requestId: string,
-    method:
-      | 'item/commandExecution/requestApproval'
-      | 'item/fileChange/requestApproval'
-      | 'item/permissions/requestApproval'
-      | 'execCommandApproval'
-      | 'applyPatchApproval'
-      | 'item/tool/requestUserInput'
-      | 'item/plan/requestImplementation'
-      | 'mcpServer/elicitation/request',
+    method: ApprovalMethodForUi,
     decision: string | Record<string, unknown>
   ) => Promise<void>;
 };
@@ -108,8 +102,8 @@ export type PendingRequest = {
 };
 
 export type NewThreadTarget =
-  | { projectId: string; modelSlug?: string; reasoningEffort?: string }
-  | { cwd: string; modelSlug?: string; reasoningEffort?: string };
+  | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
+  | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string };
 
 export function Dashboard({
   health,
@@ -486,13 +480,22 @@ function NewThreadDialog({
   onCreate: (target: NewThreadTarget) => void;
 }) {
   const [selectedProjectId, setSelectedProjectId] = useState(() => projects[0]?.projectId ?? '');
+  const [selectedProvider, setSelectedProvider] = useState<AgentProvider>('codex');
   // Empty `selectedModelSlug` means "use the project's default model from
   // ~/.codex/config.toml". The user can override here for one-off threads.
   const [selectedModelSlug, setSelectedModelSlug] = useState<string>('');
   const [selectedEffort, setSelectedEffort] = useState<string>('');
   const creating = creatingProjectId !== undefined;
   const selectedProject = projects.find((project) => project.projectId === selectedProjectId);
-  const selectedModel = models.find((model) => model.slug === selectedModelSlug);
+  const availableProviders = useMemo<AgentProvider[]>(
+    () => (selectedProject?.providers?.length ? [...selectedProject.providers] : ['codex']),
+    [selectedProject?.providers]
+  );
+  const providerModels = useMemo(
+    () => models.filter((model) => providerForModel(model) === selectedProvider),
+    [models, selectedProvider]
+  );
+  const selectedModel = providerModels.find((model) => model.slug === selectedModelSlug);
   const efforts = selectedModel?.supportedReasoningLevels ?? [];
 
   useEffect(() => {
@@ -505,6 +508,19 @@ function NewThreadDialog({
       setSelectedProjectId(projects[0]?.projectId ?? '');
     }
   }, [projects, selectedProjectId]);
+
+  useEffect(() => {
+    if (!availableProviders.includes(selectedProvider)) {
+      setSelectedProvider(availableProviders[0] ?? 'codex');
+    }
+  }, [availableProviders, selectedProvider]);
+
+  useEffect(() => {
+    if (selectedModelSlug && !providerModels.some((model) => model.slug === selectedModelSlug)) {
+      setSelectedModelSlug('');
+      setSelectedEffort('');
+    }
+  }, [providerModels, selectedModelSlug]);
 
   // When the user picks a different model, drop any effort that isn't valid
   // for the new model. If the new model has a default effort, prefer that.
@@ -535,7 +551,7 @@ function NewThreadDialog({
         <header className="new-thread-header">
           <div>
             <h2>Start a new thread</h2>
-            <p>Pick where Codex should start, and optionally choose a model.</p>
+            <p>Pick the folder and agent provider for this chat.</p>
           </div>
           <button
             className="new-thread-close"
@@ -556,6 +572,7 @@ function NewThreadDialog({
             }
             const target: NewThreadTarget = {
               projectId: selectedProjectId,
+              provider: selectedProvider,
               ...(selectedModelSlug ? { modelSlug: selectedModelSlug } : {}),
               ...(selectedEffort ? { reasoningEffort: selectedEffort } : {})
             };
@@ -581,10 +598,34 @@ function NewThreadDialog({
           {selectedProject ? (
             <p className="new-thread-selected-path">{selectedProject.path}</p>
           ) : (
-            <p className="new-thread-empty">No saved Codex projects are available yet.</p>
+            <p className="new-thread-empty">No saved projects are available yet.</p>
           )}
 
-          {models.length > 0 ? (
+          {selectedProject && availableProviders.length > 1 ? (
+            <>
+              <span className="new-thread-label">Provider</span>
+              <div className="new-thread-provider-row" role="radiogroup" aria-label="Provider">
+                {availableProviders.map((provider) => (
+                  <button
+                    key={provider}
+                    type="button"
+                    role="radio"
+                    aria-checked={selectedProvider === provider}
+                    className={`new-thread-provider-pick provider-${providerTone(provider)} ${
+                      selectedProvider === provider ? 'is-selected' : ''
+                    }`}
+                    onClick={() => setSelectedProvider(provider)}
+                    disabled={creating}
+                  >
+                    <span className="new-thread-provider-dot" aria-hidden="true" />
+                    <span className="provider-inline-text">{providerLabel(provider)}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : null}
+
+          {providerModels.length > 0 ? (
             <>
               <label className="new-thread-label" htmlFor="new-thread-model">
                 Model
@@ -597,7 +638,7 @@ function NewThreadDialog({
                 disabled={creating}
               >
                 <option value="">Use project default</option>
-                {models.map((model) => (
+                {providerModels.map((model) => (
                   <option key={model.slug} value={model.slug}>
                     {model.displayName}
                   </option>

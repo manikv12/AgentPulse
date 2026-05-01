@@ -1260,8 +1260,11 @@ function mapAppServerThreadToSummary(thread: AppServerThread, fallbackCwd?: stri
 
   return ThreadSchema.parse({
     threadId: thread.id,
+    provider: 'codex',
+    providerThreadId: thread.id,
     title: thread.name || thread.preview || 'New thread',
     workspace: workspaceNameFromCwd(cwd),
+    workspacePath: cwd,
     status: mapAppServerStatus(thread.status),
     lastActivityAt: new Date(updatedAt * 1000).toISOString(),
     lastTurnSummary: ''
@@ -1313,6 +1316,8 @@ function isAppServerDisconnectedError(error: unknown): boolean {
 function startedDraftTranscript(threadId: string, text: string, turnId: string): ThreadTranscript {
   return ThreadTranscriptSchema.parse({
     threadId,
+    provider: 'codex',
+    providerThreadId: threadId,
     activeTurnId: turnId,
     sendState: {
       canSend: false,
@@ -1594,6 +1599,8 @@ function mapThreadToTranscript(
 
   return ThreadTranscriptSchema.parse({
     threadId: thread.id,
+    provider: 'codex',
+    providerThreadId: thread.id,
     activeTurnId,
     sendState,
     messages,

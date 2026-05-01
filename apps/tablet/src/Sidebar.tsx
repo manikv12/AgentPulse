@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { CodexMark } from './CodexMark';
+import { providerLabel, providerTone } from './providers';
 import { hasUnseenActivity, isAttentionStatus, relativeTime, statusTone, threadNeedsReview } from './status';
 import { useThemePreference, type ThemePreference } from './theme';
 
@@ -66,6 +67,7 @@ export type SidebarProps = {
 
 type ProjectGroup = {
   workspace: string;
+  workspacePath: string;
   project?: Project;
   threads: Thread[];
 };
@@ -80,19 +82,27 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
   const groups = new Map<string, Thread[]>();
 
   for (const thread of threads) {
-    const existing = groups.get(thread.workspace) ?? [];
+    const key = thread.workspacePath ?? thread.workspace;
+    const existing = groups.get(key) ?? [];
     existing.push(thread);
-    groups.set(thread.workspace, existing);
+    groups.set(key, existing);
   }
 
+  const projectByPath = new Map(projects.map((project) => [project.path, project]));
   const projectByName = new Map(projects.map((project) => [project.name, project]));
-  const seenProjectNames = new Set<string>();
+  const seenProjectPaths = new Set<string>();
   const groupedThreads = [...groups.entries()]
-    .map(([workspace, groupThreads]) => ({
-      workspace,
-      project: projectByName.get(workspace),
-      threads: sortThreadsByActivity(groupThreads)
-    }))
+    .map(([workspacePath, groupThreads]) => {
+      const project =
+        projectByPath.get(workspacePath) ??
+        projectByName.get(groupThreads[0]?.workspace ?? workspacePath);
+      return {
+        workspace: groupThreads[0]?.workspace ?? project?.name ?? workspacePath,
+        workspacePath: project?.path ?? workspacePath,
+        project,
+        threads: sortThreadsByActivity(groupThreads)
+      };
+    })
     .sort((a, b) => {
       const aLatest = new Date(a.threads[0]?.lastActivityAt ?? 0).getTime();
       const bLatest = new Date(b.threads[0]?.lastActivityAt ?? 0).getTime();
@@ -101,14 +111,15 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
 
   for (const group of groupedThreads) {
     if (group.project) {
-      seenProjectNames.add(group.project.name);
+      seenProjectPaths.add(group.project.path);
     }
   }
 
   const emptyProjectGroups = projects
-    .filter((project) => !seenProjectNames.has(project.name) && !groups.has(project.name))
+    .filter((project) => !seenProjectPaths.has(project.path) && !groups.has(project.path))
     .map((project) => ({
       workspace: project.name,
+      workspacePath: project.path,
       project,
       threads: []
     }));
@@ -254,7 +265,7 @@ export function Sidebar({
 
         <ul className="codex-sidebar-rail-threads">
           {projectGroups.map((group, groupIndex) => (
-            <Fragment key={group.workspace}>
+            <Fragment key={group.workspacePath}>
               {groupIndex > 0 ? (
                 <li className="codex-sidebar-rail-group-divider" aria-hidden="true" />
               ) : null}
@@ -276,9 +287,9 @@ export function Sidebar({
                       className={`codex-sidebar-rail-thread ${active ? 'is-active' : ''}`}
                       onClick={() => onSelectThread(thread)}
                       aria-label={`Open chat for ${thread.title}`}
-                      title={`${group.workspace} · ${thread.title} · ${thread.status}`}
+                      title={`${group.workspace} · ${providerLabel(thread.provider)} · ${thread.title} · ${thread.status}`}
                     >
-                      <span className="codex-sidebar-rail-initial">{initial}</span>
+                      <span className={`codex-sidebar-rail-initial provider-${providerTone(thread.provider)}`}>{initial}</span>
                       <span
                         className={`codex-sidebar-rail-status tone-${tone}`}
                         aria-hidden="true"
@@ -366,14 +377,14 @@ export function Sidebar({
 
       <div className="codex-sidebar-thread-scroll" aria-label="Thread list">
         {projectGroups.map((group) => {
-          const isGroupCollapsed = collapsedGroups.has(group.workspace);
+          const isGroupCollapsed = collapsedGroups.has(group.workspacePath);
           return (
-            <div key={group.workspace} className="codex-sidebar-group">
+            <div key={group.workspacePath} className="codex-sidebar-group">
               <div className="codex-sidebar-group-heading">
                 <button
                   className="codex-sidebar-group-name"
                   type="button"
-                  onClick={() => toggleGroup(group.workspace)}
+                  onClick={() => toggleGroup(group.workspacePath)}
                   style={{ background: 'transparent', border: 0, cursor: 'pointer', textAlign: 'left', color: 'inherit', fontFamily: 'inherit' }}
                 >
                   <span style={{ color: 'var(--text-subtle)', display: 'grid', placeItems: 'center' }}>
@@ -426,6 +437,10 @@ export function Sidebar({
                         ) : null}
                       </span>
                       <span className="codex-sidebar-thread-title">{thread.title}</span>
+                      <span className={`codex-sidebar-thread-provider provider-${providerTone(thread.provider)}`}>
+                        <span className="provider-inline-dot" aria-hidden="true" />
+                        <span className="provider-inline-text">{providerLabel(thread.provider)}</span>
+                      </span>
                       {needsReview ? (
                         <span className="codex-sidebar-thread-state is-review">Review</span>
                       ) : isWaitingApproval ? (

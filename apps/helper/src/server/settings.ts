@@ -3,12 +3,18 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:net';
-import type { RemoteAccessSettings } from '@agent-pulse/shared';
+import {
+  AGENT_PROVIDERS,
+  AgentProviderSchema,
+  type AgentProvider,
+  type RemoteAccessSettings
+} from '@agent-pulse/shared';
 
 export type HelperSettings = {
   port: number;
   lanEnabled: boolean;
   mobileSendEnabled: boolean;
+  enabledProviders?: AgentProvider[];
   remoteAccess: RemoteAccessSettings;
 };
 
@@ -76,6 +82,7 @@ async function mergeSettings(
   return {
     ...defaults,
     ...stored,
+    enabledProviders: normalizeEnabledProviders(stored.enabledProviders),
     remoteAccess: {
       ...defaults.remoteAccess,
       ...(stored.remoteAccess ?? {}),
@@ -93,6 +100,7 @@ async function defaultSettings(settingsPath: string): Promise<HelperSettings> {
     port: await pickFreeHighPort(),
     lanEnabled: false,
     mobileSendEnabled: false,
+    enabledProviders: [...AGENT_PROVIDERS],
     remoteAccess: {
       enabled: false,
       provider: 'cloudflare',
@@ -118,6 +126,20 @@ async function defaultSettings(settingsPath: string): Promise<HelperSettings> {
       }
     }
   };
+}
+
+export function normalizeEnabledProviders(input: unknown): AgentProvider[] {
+  if (!Array.isArray(input)) {
+    return [...AGENT_PROVIDERS];
+  }
+
+  const providers = input
+    .map((provider) => AgentProviderSchema.safeParse(provider))
+    .filter((result): result is { success: true; data: AgentProvider } => result.success)
+    .map((result) => result.data);
+  const uniqueProviders = [...new Set(providers)];
+
+  return uniqueProviders.length > 0 ? uniqueProviders : [...AGENT_PROVIDERS];
 }
 
 export async function pickFreeHighPort(): Promise<number> {

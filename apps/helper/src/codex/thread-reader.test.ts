@@ -32,8 +32,11 @@ describe('Codex thread reader', () => {
 
     expect(mapped).toEqual({
       threadId: 'thread-1',
+      provider: 'codex',
+      providerThreadId: 'thread-1',
       title: 'Fix billing page',
       workspace: 'BillingApp',
+      workspacePath: '/Users/me/projects/BillingApp',
       status: 'idle',
       lastActivityAt: '2026-04-25T16:19:50.620Z',
       lastTurnSummary: ''
@@ -340,7 +343,8 @@ describe('Codex thread reader', () => {
       {
         projectId: projectIdForPath('/Users/me/projects/Vellum'),
         name: 'Vellum',
-        path: '/Users/me/projects/Vellum'
+        path: '/Users/me/projects/Vellum',
+        providers: ['codex']
       }
     ]);
   });

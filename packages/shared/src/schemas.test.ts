@@ -145,10 +145,21 @@ describe('shared schemas', () => {
 
   it('allows a new thread request from a saved project or a folder path', () => {
     expect(ThreadCreateRequestSchema.parse({ projectId: 'project-codexpulse' })).toEqual({
+      provider: 'codex',
       projectId: 'project-codexpulse'
     });
     expect(ThreadCreateRequestSchema.parse({ cwd: '  /Users/me/projects/CodexPulse  ' })).toEqual({
+      provider: 'codex',
       cwd: '/Users/me/projects/CodexPulse'
+    });
+    expect(
+      ThreadCreateRequestSchema.parse({
+        provider: 'claude-code',
+        projectId: 'project-codexpulse'
+      })
+    ).toEqual({
+      provider: 'claude-code',
+      projectId: 'project-codexpulse'
     });
     expect(() => ThreadCreateRequestSchema.parse({})).toThrow();
     expect(() =>

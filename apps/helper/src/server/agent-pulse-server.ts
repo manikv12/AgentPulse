@@ -25,6 +25,7 @@ import {
   PairResponseSchema,
   ProjectFilesResponseSchema,
   ProjectListResponseSchema,
+  ProjectSchema,
   RemoteActivityLogEntrySchema,
   RemoteAccessProtocolSchema,
   RemoteAccessSettingsSchema,
@@ -46,6 +47,7 @@ import {
   SeenThreadActivityResponseSchema,
   resolveThreadStatus,
   type CollaborationModeKind,
+  type AgentProvider,
   type ChatAttachment,
   type CatalogModel,
   type HelperHealth,
@@ -64,12 +66,13 @@ import { Hono, type Context } from 'hono';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AdminAuth } from '../auth/admin';
 import { RateLimiter, type DeviceRegistry, type PairingManager } from '../auth/pairing';
+import { isClaudeThreadId } from '../claude/claude-code';
 import { SendBlockedError } from '../codex/app-server-chat';
 import type { CatalogReader } from '../codex/catalog';
 import type { createThreadOpener } from '../codex/thread-opener';
 import { debugLog } from '../debug';
 import type { SeenThreadStore } from './seen-thread-store';
-import type { HelperSettings, HelperSettingsStore } from './settings';
+import { normalizeEnabledProviders, type HelperSettings, type HelperSettingsStore } from './settings';
 import { createTabletDevProxy, type TabletDevProxy } from './tablet-dev-proxy';
 
 type ThreadOpener = ReturnType<typeof createThreadOpener>;
@@ -165,6 +168,33 @@ export type CodexMirrorBridge = {
   waitForOwnership?(threadId: string, timeoutMs: number): Promise<boolean>;
 };
 
+export type ClaudeCodeBridge = {
+  listThreads(): Promise<Thread[]>;
+  listProjects(): Promise<Project[]>;
+  readTranscript(threadId: string): Promise<ThreadTranscript>;
+  readFullTranscript?(threadId: string): Promise<ThreadTranscript>;
+  sendMessage(
+    threadId: string,
+    text: string,
+    options?: { model?: string; effort?: string; collaborationMode?: CollaborationModeKind }
+  ): Promise<ThreadMessageResponse>;
+  startThread?(cwd: string, options?: { model?: string; reasoningEffort?: string }): Promise<Thread>;
+  interruptTurn?(threadId: string): Promise<void>;
+  respondToApproval?(
+    threadId: string,
+    requestId: string,
+    method: string,
+    response: unknown
+  ): Promise<void>;
+  getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
+  isThreadStreaming?(threadId: string): boolean;
+  isThreadWaitingForApproval?(threadId: string): boolean;
+  onLiveEvent?(listener: (event: LiveEvent) => void): () => void;
+  onLiveStateChange?(listener: (threadId: string) => void): () => void;
+  listModels?(): Promise<CatalogModel[]>;
+  setModel?(threadId: string, modelSlug: string, reasoningEffort?: string): Promise<void>;
+};
+
 export type AgentPulseServerOptions = {
   settings: HelperSettings;
   settingsStore: HelperSettingsStore;
@@ -175,6 +205,7 @@ export type AgentPulseServerOptions = {
   opener: ThreadOpener;
   appServer?: AppServerChatBridge;
   mirror?: CodexMirrorBridge;
+  claudeCode?: ClaudeCodeBridge;
   catalog?: CatalogReader;
   seenThreadStore?: SeenThreadStore;
   usageProvider?: (threadId: string) => Promise<import('@agent-pulse/shared').ThreadUsage | undefined>;
@@ -298,6 +329,15 @@ function createApp(
   let autoDesktopRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let autoDesktopRefreshInFlight = false;
   let currentSettings = options.settings;
+  const isProviderEnabled = (provider: AgentProvider): boolean =>
+    normalizeEnabledProviders(currentSettings.enabledProviders).includes(provider);
+  const providerForThreadId = (threadId: string): AgentProvider =>
+    isClaudeThreadId(threadId) ? 'claude-code' : 'codex';
+  const disabledProviderResponse = (context: Context, provider: AgentProvider) =>
+    context.json(
+      { error: `${provider === 'claude-code' ? 'Claude' : 'Codex'} is turned off in Agent Pulse settings.` },
+      403
+    );
   const remoteActivity: RemoteActivityLogEntry[] = [];
   const recordRemoteActivity = (
     input: Omit<RemoteActivityLogEntry, 'id' | 'createdAt'>
@@ -494,6 +534,30 @@ function createApp(
     if (pendingAutoDesktopRefresh?.threadId === threadId) {
       pendingAutoDesktopRefresh = undefined;
     }
+  };
+  const listCodexThreads = async (): Promise<Thread[]> =>
+    mergeDraftThreads(
+      await reconcileThreadStatuses(
+        await options.threadProvider.listThreads(),
+        options.appServer,
+        options.mirror,
+        transformTranscript
+      ),
+      draftThreads
+    );
+  const listAllThreads = async (): Promise<Thread[]> => {
+    const [codexThreads, claudeThreads] = await Promise.all([
+      isProviderEnabled('codex') ? listCodexThreads() : Promise.resolve([]),
+      isProviderEnabled('claude-code') ? options.claudeCode?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([])
+    ]);
+    return [...codexThreads, ...claudeThreads];
+  };
+  const listAllProjects = async (): Promise<Project[]> => {
+    const [codexProjects, claudeProjects] = await Promise.all([
+      isProviderEnabled('codex') ? listProjects(options.threadProvider) : Promise.resolve([]),
+      isProviderEnabled('claude-code') ? options.claudeCode?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([])
+    ]);
+    return mergeProjectsByPath([...codexProjects, ...claudeProjects]);
   };
   const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
     if (!options.appServer?.readTranscript) {
@@ -876,6 +940,22 @@ function createApp(
     return context.json({ ok: true, settings: nextSettings });
   });
 
+  app.post('/settings/providers', async (context) => {
+    if (!isAdminRequest(context.req.raw, options.adminAuth)) {
+      return adminForbidden(context);
+    }
+
+    const body = (await context.req.json().catch(() => ({}))) as { enabledProviders?: unknown };
+    const enabledProviders = normalizeEnabledProviders(body.enabledProviders);
+    const nextSettings: HelperSettings = {
+      ...currentSettings,
+      enabledProviders
+    };
+    currentSettings = nextSettings;
+    await options.settingsStore.save(nextSettings);
+    return context.json({ ok: true, settings: nextSettings });
+  });
+
   app.post('/settings/device/revoke', async (context) => {
     if (!isAdminRequest(context.req.raw, options.adminAuth)) {
       return adminForbidden(context);
@@ -899,15 +979,7 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    const threads = mergeDraftThreads(
-      await reconcileThreadStatuses(
-        await options.threadProvider.listThreads(),
-        options.appServer,
-        options.mirror,
-        transformTranscript
-      ),
-      draftThreads
-    );
+    const threads = await listAllThreads();
     return context.json(ThreadListResponseSchema.parse({ threads }));
   });
 
@@ -918,7 +990,7 @@ function createApp(
     }
 
     return context.json(ProjectListResponseSchema.parse({
-      projects: await listProjects(options.threadProvider)
+      projects: await listAllProjects()
     }));
   });
 
@@ -975,14 +1047,20 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    if (!options.appServer?.startThread) {
+    const parsed = ThreadCreateRequestSchema.parse(await context.req.json());
+    if (!isProviderEnabled(parsed.provider)) {
+      return disabledProviderResponse(context, parsed.provider);
+    }
+    if (parsed.provider === 'codex' && !options.appServer?.startThread) {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
+    if (parsed.provider === 'claude-code' && !options.claudeCode?.startThread) {
+      return context.json({ error: 'Claude Code connection unavailable.' }, 503);
+    }
 
-    const parsed = ThreadCreateRequestSchema.parse(await context.req.json());
     let cwd: string;
     if (parsed.projectId) {
-      const projects = await listProjects(options.threadProvider);
+      const projects = await listAllProjects();
       const project = projects.find((candidate) => candidate.projectId === parsed.projectId);
       if (!project) {
         return context.json({ error: 'Project is not available.' }, 404);
@@ -1009,20 +1087,23 @@ function createApp(
     }
 
     try {
-      const thread = await options.appServer.startThread(cwd, {
+      const starter = parsed.provider === 'claude-code' ? options.claudeCode! : options.appServer!;
+      const thread = await starter.startThread!(cwd, {
         ...(parsed.modelSlug ? { model: parsed.modelSlug } : {}),
         ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
       });
-      draftThreads.set(thread.threadId, thread);
+      if (parsed.provider === 'codex') {
+        draftThreads.set(thread.threadId, thread);
+      }
       hub.broadcast({ type: 'thread/upsert', payload: thread });
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
 
       return context.json(ThreadCreateResponseSchema.parse({ thread }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.error('[agent-pulse] app-server startThread failed', { cwd, error: detail });
+      console.error('[agent-pulse] startThread failed', { provider: parsed.provider, cwd, error: detail });
       return context.json(
-        { error: `Codex could not start a new thread in ${cwd}: ${detail}` },
+        { error: `${parsed.provider === 'claude-code' ? 'Claude Code' : 'Codex'} could not start a new thread in ${cwd}: ${detail}` },
         503
       );
     }
@@ -1034,12 +1115,29 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
+    const threadId = context.req.param('threadId');
+    const messageLimit = parseTranscriptMessageLimit(context.req.query('limit'));
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    if (isClaudeThreadId(threadId)) {
+      if (!options.claudeCode) {
+        return context.json({ error: 'Claude Code connection unavailable.' }, 503);
+      }
+      try {
+        const transcript = await options.claudeCode.readTranscript(threadId);
+        return context.json(
+          ThreadTranscriptSchema.parse(limitTranscriptMessages(transcript, messageLimit))
+        );
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: `Claude Code transcript unavailable: ${detail}` }, 503);
+      }
+    }
+
     if (!options.appServer) {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
-
-    const threadId = context.req.param('threadId');
-    const messageLimit = parseTranscriptMessageLimit(context.req.query('limit'));
 
     await settleWithin(ensureAppServerLiveSubscription(threadId), 750);
 
@@ -1107,10 +1205,6 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    if (!options.appServer) {
-      return context.json({ error: 'Codex connection unavailable.' }, 503);
-    }
-
     const before = context.req.query('before');
     if (!before) {
       return context.json({ error: 'Missing required `before` query param.' }, 400);
@@ -1118,7 +1212,35 @@ function createApp(
 
     try {
       const threadId = context.req.param('threadId');
+      if (!isProviderEnabled(providerForThreadId(threadId))) {
+        return disabledProviderResponse(context, providerForThreadId(threadId));
+      }
       const limit = parseTranscriptMessageLimit(context.req.query('limit')) ?? 40;
+      if (isClaudeThreadId(threadId)) {
+        if (!options.claudeCode) {
+          return context.json({ error: 'Claude Code connection unavailable.' }, 503);
+        }
+        const transcript = await (options.claudeCode.readFullTranscript?.(threadId) ??
+          options.claudeCode.readTranscript(threadId));
+        const beforeIndex = transcript.messages.findIndex((message) => message.id === before);
+        if (beforeIndex <= 0) {
+          return context.json(
+            OlderThreadMessagesResponseSchema.parse({ threadId, messages: [], hasMore: false })
+          );
+        }
+        const sliceStart = Math.max(0, beforeIndex - limit);
+        return context.json(
+          OlderThreadMessagesResponseSchema.parse({
+            threadId,
+            messages: transcript.messages.slice(sliceStart, beforeIndex),
+            hasMore: sliceStart > 0
+          })
+        );
+      }
+
+      if (!options.appServer) {
+        return context.json({ error: 'Codex connection unavailable.' }, 503);
+      }
 
       // Same fallback strategy as the main transcript route — race the live read against
       // a short timeout, fall back to cache. Older history rarely changes, so a cached
@@ -1197,19 +1319,41 @@ function createApp(
       return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
     }
 
-    await options.appServer?.ensureConnected?.().catch(() => undefined);
-    const mirrorReady = options.mirror?.isConnected() === true;
-    if (!mirrorReady) {
-      return context.json(
-        { error: 'Codex desktop is not connected. Open Codex on this Mac to send.' },
-        503
-      );
-    }
-
     const parsed = ThreadMessageRequestSchema.parse(await context.req.json());
 
     try {
       const threadId = context.req.param('threadId');
+      if (!isProviderEnabled(providerForThreadId(threadId))) {
+        return disabledProviderResponse(context, providerForThreadId(threadId));
+      }
+      if (isClaudeThreadId(threadId)) {
+        if (!options.claudeCode) {
+          return context.json({ error: 'Claude Code connection unavailable.' }, 503);
+        }
+        const override = pendingModelOverrides.get(threadId);
+        const result = ThreadMessageResponseSchema.parse(
+          await options.claudeCode.sendMessage(threadId, parsed.text, {
+            ...(override ? { model: override.model } : {}),
+            ...(override?.effort ? { effort: override.effort } : {}),
+            ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
+          })
+        );
+        if (override) {
+          pendingModelOverrides.delete(threadId);
+        }
+        hub.broadcast({ type: 'thread/transcript/changed', payload: result.transcript });
+        hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+        return context.json(result);
+      }
+
+      await options.appServer?.ensureConnected?.().catch(() => undefined);
+      const mirrorReady = options.mirror?.isConnected() === true;
+      if (!mirrorReady) {
+        return context.json(
+          { error: 'Codex desktop is not connected. Open Codex on this Mac to send.' },
+          503
+        );
+      }
 
       // Slash commands the Codex desktop intercepts client-side. Sending the
       // raw text "/compact" as a turn would just be a literal user message;
@@ -1296,12 +1440,24 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
+    const threadId = context.req.param('threadId');
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    if (isClaudeThreadId(threadId)) {
+      if (!options.claudeCode?.interruptTurn) {
+        return context.json({ error: 'Claude Code connection unavailable.' }, 503);
+      }
+      await options.claudeCode.interruptTurn(threadId);
+      hub.broadcast({ type: 'thread/streaming-changed', payload: { threadId, isStreaming: false } });
+      hub.broadcast({ type: 'thread/status/changed', payload: { threadId, status: 'idle' } });
+      return context.json(ThreadStopResponseSchema.parse({ ok: true }));
+    }
+
     await options.appServer?.ensureConnected?.().catch(() => undefined);
     if (!options.appServer?.isConnected() || !options.appServer.interruptTurn) {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
-
-    const threadId = context.req.param('threadId');
 
     // If Codex is currently waiting on a user-input or approval request, the
     // turn is "active but blocked" — turn/interrupt would either no-op or get
@@ -1383,12 +1539,19 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
+    const threadId = context.req.param('threadId');
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    if (isClaudeThreadId(threadId)) {
+      return context.json({ error: 'Deleting Claude Code history is not supported yet.' }, 405);
+    }
+
     await options.appServer?.ensureConnected?.().catch(() => undefined);
     if (!options.appServer?.isConnected() || !options.appServer.archiveThread) {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
     }
 
-    const threadId = context.req.param('threadId');
     try {
       // archiveThread emits a `thread/remove` live event; the appServer
       // onLiveEvent listener (set up below) re-broadcasts that to clients,
@@ -1409,6 +1572,12 @@ function createApp(
     }
 
     const parsed = ThreadOpenRequestSchema.parse(await context.req.json());
+    if (!isProviderEnabled(providerForThreadId(parsed.threadId))) {
+      return context.json({ ok: false, error: `${providerForThreadId(parsed.threadId) === 'claude-code' ? 'Claude' : 'Codex'} is turned off in Agent Pulse settings.` }, 403);
+    }
+    if (isClaudeThreadId(parsed.threadId)) {
+      return context.json({ ok: false, error: 'Claude Code chats are controlled directly in Agent Pulse.' }, 405);
+    }
     const result = await openThreadWithMiniRefresh(parsed.threadId);
     if (!result.ok) {
       return context.json(result, 503);
@@ -1518,7 +1687,17 @@ function createApp(
       appServerModels.length > 0
         ? mergeModelCatalogMetadata(appServerModels, catalogModels)
         : catalogModels;
-    return context.json(CatalogModelsResponseSchema.parse({ models }));
+    const claudeModels = options.claudeCode?.listModels
+      ? await options.claudeCode.listModels().catch(() => [])
+      : [];
+    return context.json(
+      CatalogModelsResponseSchema.parse({
+        models: [
+          ...(isProviderEnabled('codex') ? models : []),
+          ...(isProviderEnabled('claude-code') ? claudeModels : [])
+        ]
+      })
+    );
   });
 
   app.get('/projects/:projectId/files', async (context) => {
@@ -1529,7 +1708,7 @@ function createApp(
     if (!options.catalog) {
       return context.json(ProjectFilesResponseSchema.parse({ files: [], truncated: false }));
     }
-    const projects = await listProjects(options.threadProvider);
+    const projects = await listAllProjects();
     const project = projects.find(
       (candidate) => candidate.projectId === context.req.param('projectId')
     );
@@ -1556,7 +1735,12 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
     const threadId = context.req.param('threadId');
-    const requests = options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    const requests = isClaudeThreadId(threadId)
+      ? options.claudeCode?.getPendingApprovalRequests?.(threadId) ?? []
+      : options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
     return context.json({ threadId, requests });
   });
 
@@ -1565,15 +1749,30 @@ function createApp(
     if (!auth.ok) {
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
+    const parsed = ApprovalDecisionRequestSchema.parse(await context.req.json());
+    const threadId = context.req.param('threadId');
+    const requestId = context.req.param('requestId');
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    if (isClaudeThreadId(threadId)) {
+      if (!options.claudeCode?.respondToApproval) {
+        return context.json({ error: 'Claude Code is not available to respond to approvals.' }, 503);
+      }
+      try {
+        await options.claudeCode.respondToApproval(threadId, requestId, parsed.method, parsed.decision);
+        return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: `Could not record Claude approval: ${detail}` }, 503);
+      }
+    }
     if (!options.mirror?.respondToApproval || !options.mirror.isConnected()) {
       return context.json(
         { error: 'Codex desktop IPC is not available to respond to approvals.' },
         503
       );
     }
-    const parsed = ApprovalDecisionRequestSchema.parse(await context.req.json());
-    const threadId = context.req.param('threadId');
-    const requestId = context.req.param('requestId');
     try {
       await runWithFollowerOwnership(
         () =>
@@ -1602,6 +1801,32 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
     const parsed = ThreadModelUpdateRequestSchema.parse(await context.req.json());
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    if (isClaudeThreadId(threadId)) {
+      try {
+        if (options.claudeCode?.setModel) {
+          await options.claudeCode.setModel(threadId, parsed.modelSlug, parsed.reasoningEffort);
+          pendingModelOverrides.delete(threadId);
+        } else {
+          pendingModelOverrides.set(threadId, {
+            model: parsed.modelSlug,
+            ...(parsed.reasoningEffort ? { effort: parsed.reasoningEffort } : {})
+          });
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: detail }, detail.includes('still working') ? 409 : 503);
+      }
+      return context.json(
+        ThreadModelUpdateResponseSchema.parse({
+          ok: true,
+          modelSlug: parsed.modelSlug,
+          ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+        })
+      );
+    }
 
     // Single source of truth: drive the change through the IPC follower so
     // the desktop window shows the same "GPT-5.5 -> {selected}" model picker
@@ -1716,12 +1941,35 @@ function createApp(
   };
 
   const detachAppServerLiveEvent = options.appServer?.onLiveEvent?.((event) => {
+    if (!isProviderEnabled('codex')) {
+      return;
+    }
+    hub.broadcast(event);
+  });
+  const detachClaudeLiveEvent = options.claudeCode?.onLiveEvent?.((event) => {
+    if (!isProviderEnabled('claude-code')) {
+      return;
+    }
     hub.broadcast(event);
   });
   const detachAppServerLiveState = options.appServer?.onLiveStateChange?.((threadId) => {
+    if (!isProviderEnabled('codex')) {
+      return;
+    }
     const cached = transcriptCache.get(threadId) ?? emptyDraftTranscript(threadId);
     const visible = transformTranscript(cached, threadId);
     hub.broadcast({ type: 'thread/transcript/changed', payload: visible });
+  });
+  const detachClaudeLiveState = options.claudeCode?.onLiveStateChange?.((threadId) => {
+    if (!isProviderEnabled('claude-code')) {
+      return;
+    }
+    void options.claudeCode?.readTranscript(threadId)
+      .then((transcript) => {
+        const visible = transformTranscript(transcript, threadId);
+        hub.broadcast({ type: 'thread/transcript/changed', payload: visible });
+      })
+      .catch(() => undefined);
   });
   const detachAppServerTurnCompleted = options.appServer?.onTurnCompleted?.((event) => {
     handleAppServerTurnCompleted(event);
@@ -1764,7 +2012,9 @@ function createApp(
         autoDesktopRefreshTimer = undefined;
       }
       detachAppServerLiveEvent?.();
+      detachClaudeLiveEvent?.();
       detachAppServerLiveState?.();
+      detachClaudeLiveState?.();
       detachAppServerTurnCompleted?.();
       detachAppServerConnection?.();
       detachMirrorPendingApprovals?.();
@@ -1776,6 +2026,23 @@ async function listProjects(
   threadProvider: AgentPulseServerOptions['threadProvider']
 ): Promise<Project[]> {
   return threadProvider.listProjects ? threadProvider.listProjects() : [];
+}
+
+function mergeProjectsByPath(projects: Project[]): Project[] {
+  const byPath = new Map<string, Project>();
+  for (const project of projects) {
+    const key = path.normalize(project.path);
+    const existing = byPath.get(key);
+    if (!existing) {
+      byPath.set(key, ProjectSchema.parse(project));
+      continue;
+    }
+    byPath.set(key, ProjectSchema.parse({
+      ...existing,
+      providers: [...new Set([...(existing.providers ?? ['codex']), ...(project.providers ?? ['codex'])])]
+    }));
+  }
+  return [...byPath.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function normalizeRequestedCwd(value: string): string {

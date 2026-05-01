@@ -44,6 +44,14 @@ import remarkGfm from 'remark-gfm';
 import { TranscriptFetchTimeoutError, type FetchThreadTranscriptOptions } from './api';
 import { CodexMark } from './CodexMark';
 import { MentionPicker, type MentionItem, type MentionTrigger } from './MentionPicker';
+import {
+  normalizeProviderModelSlug,
+  providerForModel,
+  providerForThread,
+  providerLabel,
+  providerTone,
+  type ProviderTone
+} from './providers';
 import { Spinner } from './Spinner';
 
 const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 40;
@@ -88,6 +96,8 @@ export type ApprovalMethodForUi =
   | 'item/permissions/requestApproval'
   | 'execCommandApproval'
   | 'applyPatchApproval'
+  | 'claudeCode/canUseTool'
+  | 'claudeCode/elicitation'
   | 'item/tool/requestUserInput'
   | 'item/plan/requestImplementation'
   | 'mcpServer/elicitation/request';
@@ -200,6 +210,17 @@ function formatCommandSummary(text: string): string {
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 type ActivityKind = ChatMessage['kind'];
+type WorkSummaryKind =
+  | 'browser'
+  | 'command'
+  | 'file'
+  | 'message'
+  | 'plan'
+  | 'reasoning'
+  | 'search'
+  | 'status'
+  | 'subagent'
+  | 'tool';
 
 const ACTIVITY_ICONS: Record<ActivityKind, LucideIcon> = {
   message: Info,
@@ -273,14 +294,24 @@ function buildRenderableEntries(messages: ChatMessage[]): RenderableEntry[] {
 function findFinalResponseIndex(messages: ChatMessage[]): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!;
-    if (message.role === 'assistant' && message.phase === 'final_answer' && message.text.trim()) {
+    if (
+      message.role === 'assistant' &&
+      message.kind === 'message' &&
+      message.phase === 'final_answer' &&
+      message.text.trim()
+    ) {
       return index;
     }
   }
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!;
-    if (message.role === 'assistant' && message.phase !== 'commentary' && message.text.trim()) {
+    if (
+      message.role === 'assistant' &&
+      message.kind === 'message' &&
+      message.phase !== 'commentary' &&
+      message.text.trim()
+    ) {
       return index;
     }
   }
@@ -591,6 +622,7 @@ function WorkGroup({
   startedAt,
   endedAt,
   plugins = [],
+  providerToneName = 'codex',
   isLatest = false,
   isAgentWorking = false
 }: {
@@ -598,6 +630,7 @@ function WorkGroup({
   startedAt?: string;
   endedAt?: string;
   plugins?: CatalogPlugin[];
+  providerToneName?: ProviderTone;
   isLatest?: boolean;
   isAgentWorking?: boolean;
 }) {
@@ -632,19 +665,19 @@ function WorkGroup({
   const imageCount = messages.reduce((count, message) => count + (message.attachments?.length ?? 0), 0);
 
   return (
-    <section className={`codex-work-group ${expanded ? 'is-open' : ''}`}>
+    <section className={`codex-work-group provider-${providerToneName} ${expanded ? 'is-open' : ''}`}>
       <button
         type="button"
         className="codex-work-toggle"
         onClick={handleToggle}
         aria-expanded={expanded}
       >
-        <span>{label}</span>
         <ChevronDown
           size={14}
           className={`codex-work-chevron ${expanded ? 'is-open' : ''}`}
           aria-hidden="true"
         />
+        <span>{label}</span>
         {imageCount > 0 ? (
           <span className="codex-work-meta">
             {imageCount} screenshot{imageCount === 1 ? '' : 's'}
@@ -663,6 +696,61 @@ function WorkGroup({
 }
 
 function formatWorkLabel(messages: ChatMessage[], startedAt?: string, endedAt?: string): string {
+  const counts = messages.reduce<Record<WorkSummaryKind, number>>(
+    (acc, message) => {
+      const kind = classifyWorkMessage(message);
+      acc[kind] += 1;
+      return acc;
+    },
+    {
+      browser: 0,
+      command: 0,
+      file: 0,
+      message: 0,
+      plan: 0,
+      reasoning: 0,
+      search: 0,
+      status: 0,
+      subagent: 0,
+      tool: 0
+    }
+  );
+
+  const fragments: string[] = [];
+  if (counts.command > 0) {
+    fragments.push('explored the workspace');
+  }
+  if (counts.file > 0) {
+    fragments.push('edited the workspace');
+  }
+  if (counts.search > 0) {
+    fragments.push(`ran ${counts.search} search${counts.search === 1 ? '' : 'es'}`);
+  }
+  if (counts.browser > 0) {
+    fragments.push(`used the browser${counts.browser > 1 ? ` ${counts.browser} times` : ''}`);
+  }
+  if (counts.subagent > 0) {
+    fragments.push(`used ${counts.subagent} subagent step${counts.subagent === 1 ? '' : 's'}`);
+  }
+  if (counts.tool > 0) {
+    fragments.push(`used ${counts.tool} tool${counts.tool === 1 ? '' : 's'}`);
+  }
+
+  if (fragments.length > 0) {
+    const joined = fragments.slice(0, 3).join(', ');
+    return joined.charAt(0).toUpperCase() + joined.slice(1);
+  }
+
+  if (counts.reasoning > 0) {
+    return 'Thought through the task';
+  }
+  if (counts.plan > 0) {
+    return 'Planned the work';
+  }
+  if (counts.message > 0) {
+    return 'Shared progress';
+  }
+
   const first = Date.parse(startedAt ?? messages[0]?.createdAt ?? '');
   const last = Date.parse(endedAt ?? messages[messages.length - 1]?.createdAt ?? '');
   if (Number.isFinite(first) && Number.isFinite(last) && last > first) {
@@ -675,6 +763,50 @@ function formatWorkLabel(messages: ChatMessage[], startedAt?: string, endedAt?: 
     return `Worked for ${seconds}s`;
   }
   return `Agent work · ${messages.length} update${messages.length === 1 ? '' : 's'}`;
+}
+
+function classifyWorkMessage(message: ChatMessage): WorkSummaryKind {
+  switch (message.kind) {
+    case 'command':
+      return 'command';
+    case 'file':
+      return 'file';
+    case 'reasoning':
+      return 'reasoning';
+    case 'plan':
+      return 'plan';
+    case 'status':
+      return 'status';
+    case 'message':
+      return message.phase === 'commentary' ? 'reasoning' : 'message';
+    case 'tool': {
+      const text = message.text.toLowerCase();
+      if (
+        text.includes('web_search') ||
+        text.includes('web.search') ||
+        text.includes('web search') ||
+        text.includes('search_query') ||
+        text.includes('image_query')
+      ) {
+        return 'search';
+      }
+      if (
+        text.includes('browser') ||
+        text.includes('playwright') ||
+        text.includes('screenshot') ||
+        text.includes('computer_use') ||
+        text.includes('computer use')
+      ) {
+        return 'browser';
+      }
+      if (text.includes('spawn_agent') || text.includes('subagent')) {
+        return 'subagent';
+      }
+      return 'tool';
+    }
+    default:
+      return 'status';
+  }
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -763,6 +895,25 @@ export function ThreadView({
   // first message the user sends would incorrectly be treated as pre-existing
   // history and excluded from the visible tail.
   const sessionBaselineSeededRef = useRef(false);
+  const provider = providerForThread(thread.provider);
+  const providerName = providerLabel(provider);
+  const providerWorkingLabel = `${providerName} is working`;
+  const effectiveModelName = modelName || thread.model;
+  const providerModels = useMemo(
+    () => models.filter((model) => providerForModel(model) === provider),
+    [models, provider]
+  );
+  const normalizedSelectedModelSlug = normalizeProviderModelSlug(
+    provider,
+    selectedModelSlug ?? effectiveModelName
+  );
+  const canChangeModel = providerModels.length > 0;
+
+  useEffect(() => {
+    if (!canChangeModel && modelPickerOpen) {
+      setModelPickerOpen(false);
+    }
+  }, [canChangeModel, modelPickerOpen]);
 
   const applyTranscriptWindow = (nextTranscript: ThreadTranscript) => {
     // Seed the session baseline from the *first* transcript we ever see for this
@@ -814,22 +965,22 @@ export function ThreadView({
   const isWaitingForApproval = hasPendingRequest || threadSaysWaitingApproval;
   const pendingRequestStatus = hasPendingRequest
     ? hasPendingPermissionRequest
-      ? 'Codex needs permission'
+      ? `${providerName} needs permission`
       : pendingRequests.some((request) => request.kind === 'question')
-        ? 'Codex needs an answer'
-        : 'Codex needs approval'
+        ? `${providerName} needs an answer`
+        : `${providerName} needs approval`
     : null;
   const transcriptSaysMirrorWorking = Boolean(
     transcript &&
       !isHardSendBlock &&
       (transcript.activeTurnId?.startsWith(MIRROR_STREAMING_TURN_PREFIX) ||
         (transcript.sendState.reason === 'thread_changed' &&
-          transcript.sendState.label === 'Codex is working'))
+          transcript.sendState.label.endsWith(' is working')))
   );
   const waitingApprovalStatus = pendingRequestStatus
     ? pendingRequestStatus
     : threadSaysWaitingApproval
-      ? 'Codex is waiting for approval'
+      ? `${providerName} is waiting for approval`
       : null;
   const isCodexActive =
     forceWorking || transcriptSaysMirrorWorking || threadSaysWaitingApproval || isCompacting;
@@ -841,7 +992,7 @@ export function ThreadView({
       (transcript?.sendState.canSend || (isCodexActive && !isHardSendBlock))
   );
   const canSend = Boolean(canUseComposer && trimmedDraft);
-  const effectiveModelName = modelName || thread.model;
+  const displayedModelName = effectiveModelName ? formatModelName(effectiveModelName) : providerName;
   const latestPlanMessage = useMemo(
     () =>
       [...(transcript?.messages ?? [])]
@@ -859,10 +1010,10 @@ export function ThreadView({
   );
 
   // Status bar text logic:
-  // - When sending: "Sending to Codex..."
+  // - When sending: "Sending to {provider}..."
   // - When sendState blocks sending: show the explicit reason (e.g. "Approve on Mac to continue")
   //   only for hard blocks that really require the user to wait or use the Mac.
-  // - Else when app-server says the thread is active: "Codex is working"
+  // - Else when the provider says the thread is active: "{provider} is working"
   // - Otherwise: sendState.label (which may be "Ready", "Mobile sending is off on the Mac.", etc.)
   // - If loading and no transcript yet: "Loading conversation..."
   const sendBlockedLabel =
@@ -870,7 +1021,7 @@ export function ThreadView({
       ? transcript.sendState.label
       : null;
   const statusText = sending
-    ? 'Sending to Codex...'
+    ? `Sending to ${providerName}...`
     : waitingApprovalStatus
       ? waitingApprovalStatus
       : isCompacting
@@ -880,8 +1031,8 @@ export function ThreadView({
       : sendBlockedLabel
         ? sendBlockedLabel
         : isAgentWorking
-          ? 'Codex is working'
-          : transcript?.sendState.label === 'Codex is working'
+          ? providerWorkingLabel
+          : transcript?.sendState.label.endsWith(' is working')
             ? 'Ready'
             : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
 
@@ -1322,6 +1473,10 @@ export function ThreadView({
     if (!openThreadInCodex || openingCodex) {
       return;
     }
+    if (provider !== 'codex') {
+      setError(`${providerName} chats are controlled directly in Agent Pulse.`);
+      return;
+    }
 
     setOpeningCodex(true);
     setError('');
@@ -1329,7 +1484,7 @@ export function ThreadView({
       await openThreadInCodex(thread.threadId);
     } catch (openError) {
       setError(
-        openError instanceof Error ? openError.message : 'Could not open this thread in Codex.'
+        openError instanceof Error ? openError.message : `Could not open this thread in ${providerName}.`
       );
     } finally {
       setOpeningCodex(false);
@@ -1362,7 +1517,7 @@ export function ThreadView({
           : current
       );
     } catch (stopError) {
-      setError(stopError instanceof Error ? stopError.message : 'Could not stop Codex.');
+      setError(stopError instanceof Error ? stopError.message : `Could not stop ${providerName}.`);
     } finally {
       setStopping(false);
     }
@@ -1373,7 +1528,9 @@ export function ThreadView({
       return;
     }
     const confirmed = window.confirm(
-      'Delete this thread from Codex history? You cannot undo this from Agent Pulse.'
+      provider === 'codex'
+        ? 'Delete this thread from Codex history? You cannot undo this from Agent Pulse.'
+        : `${providerName} history deletion is not supported yet.`
     );
     if (!confirmed) {
       return;
@@ -1424,13 +1581,17 @@ export function ThreadView({
           ) : null}
           <h2 className="codex-thread-title">{thread.title}</h2>
           <span className="codex-thread-workspace">{thread.workspace}</span>
+          <span className={`codex-thread-provider provider-${providerTone(thread.provider)}`}>
+            <span className="provider-inline-dot" aria-hidden="true" />
+            <span className="provider-inline-text">{providerLabel(thread.provider)}</span>
+          </span>
         </div>
         {waitingApprovalStatus ? (
           <span
             className="codex-thread-working-badge is-attention"
             role="status"
             aria-live="polite"
-            aria-label="Codex needs approval"
+            aria-label={`${providerName} needs approval`}
           >
             <span>{hasPendingPermissionRequest ? 'Permission' : 'Approval'}</span>
           </span>
@@ -1439,7 +1600,7 @@ export function ThreadView({
             className="codex-thread-working-badge is-compacting"
             role="status"
             aria-live="polite"
-            aria-label="Codex is compacting context"
+            aria-label={`${providerName} is compacting context`}
           >
             <span className="codex-thread-working-dots" aria-hidden="true">
               <span />
@@ -1465,7 +1626,7 @@ export function ThreadView({
         ) : null}
 
         <div className="codex-thread-actions">
-          {openThreadInCodex ? (
+          {openThreadInCodex && provider === 'codex' ? (
             <button
               className="codex-thread-open"
               type="button"
@@ -1477,7 +1638,7 @@ export function ThreadView({
               <span>{openingCodex ? 'Opening' : 'Open Codex'}</span>
             </button>
           ) : null}
-          {deleteThread ? (
+          {deleteThread && provider === 'codex' ? (
             <button
               className="codex-thread-delete"
               type="button"
@@ -1548,6 +1709,7 @@ export function ThreadView({
                 startedAt={entry.startedAt}
                 endedAt={entry.endedAt}
                 plugins={plugins}
+                providerToneName={providerTone(provider)}
                 isLatest={entry.id === latestWorkGroupId}
                 isAgentWorking={isAgentWorking}
               />
@@ -1588,7 +1750,10 @@ export function ThreadView({
               </div>
               <div className="codex-message-body">
                 <span className="codex-message-tag codex-message-tag--assistant">
-                  {formatModelName(effectiveModelName)}
+                  <span className={`provider-inline-name provider-${providerTone(provider)}`}>
+                    <span className="provider-inline-dot" aria-hidden="true" />
+                    <span className="provider-inline-text">{providerName}</span>
+                  </span>
                 </span>
                 <MessageAttachments attachments={message.attachments} />
                 <article className="codex-prose">
@@ -1670,13 +1835,13 @@ export function ThreadView({
             />
           ) : null}
           <label className="sr-only" htmlFor={`message-${thread.threadId}`}>
-            Message Codex
+            Message {providerName}
           </label>
           <textarea
             id={`message-${thread.threadId}`}
             ref={textareaRef}
             className="codex-composer-input"
-            placeholder="Ask Codex anything"
+            placeholder={`Ask ${providerName} anything`}
             rows={1}
             value={draft}
             onChange={(event) => onDraftChange(event.target.value, event.target.selectionStart ?? 0)}
@@ -1729,15 +1894,16 @@ export function ThreadView({
                 <Plus size={16} />
               </button>
               <ModelChip
-                models={models}
-                selectedModelSlug={selectedModelSlug ?? effectiveModelName}
+                providerName={providerName}
+                models={canChangeModel ? providerModels : []}
+                selectedModelSlug={normalizedSelectedModelSlug}
                 selectedReasoningEffort={selectedReasoningEffort}
-                fallbackLabel={formatModelName(effectiveModelName)}
+                fallbackLabel={displayedModelName}
                 isOpen={modelPickerOpen}
                 onOpen={() => setModelPickerOpen(true)}
                 onClose={() => setModelPickerOpen(false)}
-                onChangeModel={onChangeModel}
-                disabled={modelUpdating || !onChangeModel}
+                onChangeModel={canChangeModel ? onChangeModel : undefined}
+                disabled={modelUpdating || !onChangeModel || !canChangeModel}
                 setUpdating={setModelUpdating}
               />
               <button
@@ -1747,7 +1913,7 @@ export function ThreadView({
                 title={
                   collaborationMode === 'plan'
                     ? 'Plan mode is on for the next message'
-                    : 'Ask Codex to make a plan first'
+                    : `Ask ${providerName} to make a plan first`
                 }
                 onClick={() =>
                   setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))
@@ -1765,7 +1931,7 @@ export function ThreadView({
                   type="button"
                   onClick={() => void handleStopWork()}
                   disabled={stopping}
-                  aria-label="Stop Codex"
+                  aria-label={`Stop ${providerName}`}
                 >
                   <Square size={13} />
                   <span>{stopping ? 'Stopping' : 'Stop'}</span>
@@ -1795,6 +1961,7 @@ export function ThreadView({
 }
 
 function ModelChip({
+  providerName,
   models,
   selectedModelSlug,
   selectedReasoningEffort,
@@ -1806,6 +1973,7 @@ function ModelChip({
   disabled,
   setUpdating
 }: {
+  providerName: string;
   models: CatalogModel[];
   selectedModelSlug?: string;
   selectedReasoningEffort?: string;
@@ -1827,7 +1995,7 @@ function ModelChip({
 
   if (!onChangeModel || models.length === 0) {
     return (
-      <span className="codex-composer-model" aria-label="Current Codex model">
+      <span className="codex-composer-model" aria-label={`Current ${providerName} model`}>
         {label}
         {reasoningLabel ? <span className="codex-composer-model-effort">{reasoningLabel}</span> : null}
       </span>
@@ -1855,7 +2023,9 @@ function ModelChip({
               key={model.slug}
               model={model}
               selectedReasoningEffort={
-                model.slug === selectedModelSlug ? selectedReasoningEffort : undefined
+                model.slug === selectedModelSlug
+                  ? selectedReasoningEffort ?? model.defaultReasoningLevel
+                  : undefined
               }
               isSelected={model.slug === selectedModelSlug}
               onPick={async (effort) => {
@@ -1904,7 +2074,7 @@ function ModelMenuRow({
           className="codex-composer-model-effort-pick"
           onClick={() => void onPick(undefined)}
         >
-          Use default
+          {isSelected ? 'Selected' : 'Use model'}
         </button>
       ) : (
         <div className="codex-composer-model-effort-list">
@@ -1936,6 +2106,8 @@ const APPROVAL_METHODS_FOR_UI = new Set<ApprovalMethodForUi>([
   'item/permissions/requestApproval',
   'execCommandApproval',
   'applyPatchApproval',
+  'claudeCode/canUseTool',
+  'claudeCode/elicitation',
   'item/tool/requestUserInput',
   'item/plan/requestImplementation',
   'mcpServer/elicitation/request'

@@ -12,6 +12,10 @@ export const THREAD_STATUSES = [
 
 export type ThreadStatus = (typeof THREAD_STATUSES)[number];
 
+export const AGENT_PROVIDERS = ['codex', 'claude-code'] as const;
+
+export type AgentProvider = (typeof AGENT_PROVIDERS)[number];
+
 export const THREAD_STATUS_PRIORITY = [
   'error',
   'connection',
@@ -29,11 +33,15 @@ const isoUtcTimestamp = z
   });
 
 export const ThreadStatusSchema = z.enum(THREAD_STATUSES);
+export const AgentProviderSchema = z.enum(AGENT_PROVIDERS);
 
 export const ThreadSchema = z.object({
   threadId: z.string().min(1),
+  provider: AgentProviderSchema.default('codex'),
+  providerThreadId: z.string().min(1).optional(),
   title: z.string().min(1),
   workspace: z.string().min(1),
+  workspacePath: z.string().min(1).optional(),
   status: ThreadStatusSchema,
   lastActivityAt: isoUtcTimestamp,
   lastTurnSummary: z.string(),
@@ -41,15 +49,16 @@ export const ThreadSchema = z.object({
   reasoningEffort: z.string().optional()
 });
 
-export type Thread = z.infer<typeof ThreadSchema>;
+export type Thread = z.input<typeof ThreadSchema>;
 
 export const ProjectSchema = z.object({
   projectId: z.string().min(1),
   name: z.string().min(1),
-  path: z.string().min(1)
+  path: z.string().min(1),
+  providers: z.array(AgentProviderSchema).default(['codex'])
 });
 
-export type Project = z.infer<typeof ProjectSchema>;
+export type Project = z.input<typeof ProjectSchema>;
 
 export const HelperHealthSchema = z.object({
   status: z.enum(['ok', 'degraded', 'down']),
@@ -195,6 +204,7 @@ export const ThreadOpenRequestSchema = z.object({
 
 export const ThreadCreateRequestSchema = z
   .object({
+    provider: AgentProviderSchema.default('codex'),
     projectId: z.string().trim().min(1).optional(),
     cwd: z.string().trim().min(1).optional(),
     modelSlug: z.string().trim().min(1).optional(),
@@ -276,6 +286,8 @@ export type ThreadUsage = z.infer<typeof ThreadUsageSchema>;
 
 export const ThreadTranscriptSchema = z.object({
   threadId: z.string().min(1),
+  provider: AgentProviderSchema.default('codex'),
+  providerThreadId: z.string().min(1).optional(),
   activeTurnId: z.string().min(1).nullable(),
   sendState: ThreadSendStateSchema,
   messages: z.array(ChatMessageSchema),
@@ -287,7 +299,7 @@ export const ThreadTranscriptSchema = z.object({
   reasoningEffort: z.string().min(1).optional()
 });
 
-export type ThreadTranscript = z.infer<typeof ThreadTranscriptSchema>;
+export type ThreadTranscript = z.input<typeof ThreadTranscriptSchema>;
 
 // Response shape for the "load older messages" endpoint. Distinct from a full
 // transcript fetch because it only carries a window of messages and a flag
@@ -316,7 +328,7 @@ export const ThreadMessageResponseSchema = z.object({
   transcript: ThreadTranscriptSchema
 });
 
-export type ThreadMessageResponse = z.infer<typeof ThreadMessageResponseSchema>;
+export type ThreadMessageResponse = z.input<typeof ThreadMessageResponseSchema>;
 
 export const ThreadStopResponseSchema = z.object({
   ok: z.literal(true)
@@ -392,6 +404,7 @@ export const CatalogReasoningEffortSchema = z.object({
 export const CatalogModelSchema = z.object({
   slug: z.string().min(1),
   displayName: z.string().min(1),
+  provider: AgentProviderSchema.optional(),
   description: z.string().optional(),
   defaultReasoningLevel: z.string().optional(),
   supportedReasoningLevels: z.array(CatalogReasoningEffortSchema).optional(),
@@ -442,7 +455,9 @@ export const APPROVAL_METHODS = [
   'applyPatchApproval',
   'item/tool/requestUserInput',
   'item/plan/requestImplementation',
-  'mcpServer/elicitation/request'
+  'mcpServer/elicitation/request',
+  'claudeCode/canUseTool',
+  'claudeCode/elicitation'
 ] as const;
 
 export const ApprovalDecisionRequestSchema = z.object({
@@ -555,7 +570,7 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
   })
 ]);
 
-export type LiveEvent = z.infer<typeof LiveEventSchema>;
+export type LiveEvent = z.input<typeof LiveEventSchema>;
 
 export function resolveThreadStatus(signals: Iterable<ThreadStatus>): ThreadStatus {
   const signalSet = new Set(signals);

@@ -2052,6 +2052,165 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.queryByText('Medium')).not.toBeInTheDocument();
   });
 
+  it('shows the Claude Code model picker with only Claude models', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      close(): void {}
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'claude-code:thread-model',
+                  provider: 'claude-code',
+                  providerThreadId: 'thread-model',
+                  title: 'Fix Claude chip',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-04-27T18:10:00Z',
+                  lastTurnSummary: '',
+                  model: 'claude-opus-4-7'
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return {
+            ok: true,
+            json: async () => ({
+              models: [
+                {
+                  slug: 'gpt-5.5',
+                  displayName: 'GPT-5.5',
+                  provider: 'codex',
+                  defaultReasoningLevel: 'medium',
+                  supportedReasoningLevels: [
+                    { effort: 'medium', description: 'Medium' },
+                    { effort: 'high', description: 'High' }
+                  ],
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'opus',
+                  displayName: 'Claude Opus',
+                  provider: 'claude-code',
+                  description: 'Higher-capability Claude Code model alias.',
+                  defaultReasoningLevel: 'medium',
+                  supportedReasoningLevels: [
+                    { effort: 'low', description: 'Fastest Claude Code reasoning.' },
+                    { effort: 'medium', description: 'Balanced Claude Code reasoning.' },
+                    { effort: 'high', description: 'Deeper Claude Code reasoning.' },
+                    { effort: 'xhigh', description: 'Extra-deep Claude Code reasoning.' },
+                    { effort: 'max', description: 'Maximum Claude Code reasoning.' }
+                  ],
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'sonnet',
+                  displayName: 'Claude Sonnet',
+                  provider: 'claude-code',
+                  description: 'Balanced Claude Code model alias.',
+                  defaultReasoningLevel: 'medium',
+                  supportedReasoningLevels: [
+                    { effort: 'low', description: 'Fastest Claude Code reasoning.' },
+                    { effort: 'medium', description: 'Balanced Claude Code reasoning.' },
+                    { effort: 'high', description: 'Deeper Claude Code reasoning.' },
+                    { effort: 'xhigh', description: 'Extra-deep Claude Code reasoning.' },
+                    { effort: 'max', description: 'Maximum Claude Code reasoning.' }
+                  ],
+                  visibility: 'visible'
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/threads/claude-code%3Athread-model/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'claude-code:thread-model',
+              provider: 'claude-code',
+              providerThreadId: 'thread-model',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: [],
+              model: 'claude-opus-4-7'
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Claude chip/ }));
+
+    const modelChip = await screen.findByRole('button', { name: /Claude Opus/ });
+    fireEvent.click(modelChip);
+
+    expect(await screen.findByText('Claude Sonnet')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /High/ }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('button', { name: /Max/ }).length).toBeGreaterThan(0);
+    expect(screen.queryByText('GPT-5.5')).not.toBeInTheDocument();
+  });
+
   it('lets the remote client stop a running Codex turn', async () => {
     localStorage.setItem(
       'agent-pulse-session',
@@ -4032,11 +4191,11 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.getByAltText('User screenshot preview')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Close screenshot preview' }));
     expect(screen.getByText('I fixed it.')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Worked for 6m 55s/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Explored the workspace, used the browser/ })).toBeInTheDocument();
     expect(screen.queryByText(/Detailed private progress/)).not.toBeInTheDocument();
     expect(screen.queryByText('browser.screenshot completed')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: /Worked for 6m 55s/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Explored the workspace, used the browser/ }));
 
     const progressRow = screen.getByRole('button', { name: /I will inspect the screenshot/ });
     expect(progressRow).toBeInTheDocument();
@@ -4123,10 +4282,71 @@ describe('Agent Pulse tablet UI', () => {
     expect(await screen.findByText('Please check this.')).toBeInTheDocument();
     // Live work (commentary + tool) is grouped under a collapsible "Agent work" toggle
     // until a non-commentary final answer arrives, mirroring the desktop UI.
-    const workToggle = screen.getByRole('button', { name: /Agent work|Worked for/ });
+    const workToggle = screen.getByRole('button', { name: /Used the browser/ });
     expect(workToggle).toBeInTheDocument();
     fireEvent.click(workToggle);
     expect(await screen.findByRole('button', { name: /browser.screenshot completed/ })).toBeInTheDocument();
+  });
+
+  it('summarizes hidden exploration and searches like OpenAssist', async () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Check how this works.',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'cmd-1',
+          role: 'activity',
+          kind: 'command',
+          text: 'rg -n "streaming" Sources',
+          createdAt: '2026-04-25T16:14:04Z'
+        },
+        ...[1, 2, 3, 4].map((index) => ({
+          id: `search-${index}`,
+          role: 'activity' as const,
+          kind: 'tool' as const,
+          text: `web_search completed: query ${index}`,
+          createdAt: `2026-04-25T16:14:0${index + 4}Z`
+        })),
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Here is the final answer.',
+          createdAt: '2026-04-25T16:15:00Z',
+          phase: 'final_answer'
+        } as ThreadTranscript['messages'][number]
+      ]
+    };
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Streaming behavior',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+      />
+    );
+
+    expect(screen.getByText('Here is the final answer.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Explored the workspace, ran 4 searches/ })).toBeInTheDocument();
+    expect(screen.queryByText(/web_search completed/)).not.toBeInTheDocument();
   });
 
   it('uses a project dropdown before creating a new Codex thread', async () => {
@@ -4175,7 +4395,12 @@ describe('Agent Pulse tablet UI', () => {
     expect(within(dialog).queryByLabelText('Folder path')).not.toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start thread' }));
 
-    await waitFor(() => expect(onNewThread).toHaveBeenCalledWith({ projectId: 'project-codexpulse' }));
+    await waitFor(() =>
+      expect(onNewThread).toHaveBeenCalledWith({
+        projectId: 'project-codexpulse',
+        provider: 'codex'
+      })
+    );
     expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
   });
 
@@ -4209,7 +4434,7 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(newThreadButton);
 
     const dialog = await screen.findByRole('dialog', { name: 'New thread' });
-    expect(within(dialog).getByText('No saved Codex projects are available yet.')).toBeInTheDocument();
+    expect(within(dialog).getByText('No saved projects are available yet.')).toBeInTheDocument();
     expect(within(dialog).queryByLabelText('Folder path')).not.toBeInTheDocument();
     expect(within(dialog).getByRole('button', { name: 'Start thread' })).toBeDisabled();
 
