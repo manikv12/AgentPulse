@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import type { CatalogModel, Project, RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-pulse/shared';
+import type { CatalogModel, LiveEvent, Project, RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-pulse/shared';
 import { WebSocket, type RawData } from 'ws';
 import { AdminAuth } from '../auth/admin';
 import { DeviceRegistry, MemoryDeviceStore, PairingManager } from '../auth/pairing';
@@ -1160,6 +1160,137 @@ describe('Agent Pulse helper API', () => {
         screenshotBytes.byteOffset,
         screenshotBytes.byteOffset + screenshotBytes.byteLength
       ));
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('exposes Claude screenshots through helper URLs on fetch, send, and live events', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const threadId = 'claude-code:session-1';
+    const screenshotPath = path.join(mkdtempSync(path.join(tmpdir(), 'agent-pulse-claude-shot-')), 'screen.png');
+    const screenshotBytes = Buffer.from('89504e470d0a1a0a', 'hex');
+    writeFileSync(screenshotPath, screenshotBytes);
+    const transcript: ThreadTranscript = {
+      threadId,
+      provider: 'claude-code',
+      providerThreadId: 'session-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'claude-message-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Here is what Claude saw.',
+          createdAt: '2026-04-25T16:14:00Z',
+          attachments: [
+            {
+              id: 'claude-message-1-image-1',
+              kind: 'image',
+              url: 'agent-pulse-local-image:claude-message-1-image-1',
+              sourcePath: screenshotPath
+            }
+          ]
+        } as ThreadTranscript['messages'][number]
+      ]
+    };
+    let liveEventListener: ((event: LiveEvent) => void) | undefined;
+    const claudeCode = {
+      listThreads: async () => [],
+      listProjects: async () => [],
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'steer' as const,
+        turnId: 'turn-1',
+        transcript
+      })),
+      onLiveEvent: vi.fn((listener: (event: LiveEvent) => void) => {
+        liveEventListener = listener;
+        return vi.fn();
+      })
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      enabledProviders: ['claude-code' as const],
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      claudeCode,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const transcriptResponse = await fetch(`${server.url}/threads/${encodeURIComponent(threadId)}/transcript`, {
+        headers: authHeaders(token, deviceId)
+      });
+      const fetched = (await transcriptResponse.json()) as ThreadTranscript;
+      const fetchedAttachment = fetched.messages[0]?.attachments?.[0];
+
+      expect(transcriptResponse.status).toBe(200);
+      expect(fetchedAttachment?.url).toMatch(/^\/attachments\/[a-f0-9]+$/);
+      expect('sourcePath' in (fetchedAttachment ?? {})).toBe(false);
+
+      const sendResponse = await fetch(`${server.url}/threads/${encodeURIComponent(threadId)}/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Continue' })
+      });
+      const sent = (await sendResponse.json()) as { transcript: ThreadTranscript };
+      const sentAttachment = sent.transcript.messages[0]?.attachments?.[0];
+
+      expect(sendResponse.status).toBe(200);
+      expect(sentAttachment?.url).toMatch(/^\/attachments\/[a-f0-9]+$/);
+      expect('sourcePath' in (sentAttachment ?? {})).toBe(false);
+
+      const params = new URLSearchParams({
+        token,
+        deviceId,
+        fingerprint: 'fingerprint-123'
+      });
+      const websocket = new WebSocket(`${server.url.replace('http:', 'ws:')}/events?${params}`);
+      await waitForSocketOpen(websocket);
+      const changed = waitForLiveEvent(websocket, (event) => {
+        const typed = event as {
+          type?: unknown;
+          payload?: ThreadTranscript;
+        };
+        return typed.type === 'thread/transcript/changed' && typed.payload?.threadId === threadId;
+      });
+      liveEventListener?.({ type: 'thread/transcript/changed', payload: transcript });
+      const live = (await changed) as { payload: ThreadTranscript };
+      const liveAttachment = live.payload.messages[0]?.attachments?.[0];
+
+      expect(liveAttachment?.url).toMatch(/^\/attachments\/[a-f0-9]+$/);
+      expect('sourcePath' in (liveAttachment ?? {})).toBe(false);
+
+      const imageResponse = await fetch(`${server.url}${liveAttachment?.url}`);
+      expect(imageResponse.status).toBe(200);
+      expect(imageResponse.headers.get('content-type')).toBe('image/png');
+      await expect(imageResponse.arrayBuffer()).resolves.toEqual(screenshotBytes.buffer.slice(
+        screenshotBytes.byteOffset,
+        screenshotBytes.byteOffset + screenshotBytes.byteLength
+      ));
+      websocket.close();
     } finally {
       await server.stop();
     }

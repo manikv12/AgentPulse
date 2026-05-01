@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -182,7 +183,7 @@ describe('CopilotProvider', () => {
     const copilotHome = await tempCopilotHome();
     await mkdir(path.join(copilotHome, 'logs'), { recursive: true });
     const child = fakeCopilotProcess();
-    const spawnProcess = vi.fn(() => child.process);
+    const spawnProcess = vi.fn(() => child.process) as unknown as typeof import('node:child_process').spawn;
     const provider = new CopilotProvider({
       copilotHome,
       spawnProcess,
@@ -232,5 +233,5 @@ function fakeCopilotProcess() {
       return true;
     })
   });
-  return { process: process as never, stdout, stderr };
+  return { process: process as unknown as ChildProcessWithoutNullStreams, stdout, stderr };
 }

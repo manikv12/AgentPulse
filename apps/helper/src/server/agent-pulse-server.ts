@@ -1174,8 +1174,12 @@ function createApp(
       }
       try {
         const transcript = await options.claudeCode.readTranscript(threadId);
+        const visibleTranscript = transformTranscript(
+          limitTranscriptMessages(transcript, messageLimit),
+          threadId
+        );
         return context.json(
-          ThreadTranscriptSchema.parse(limitTranscriptMessages(transcript, messageLimit))
+          ThreadTranscriptSchema.parse(visibleTranscript)
         );
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
@@ -1188,8 +1192,12 @@ function createApp(
       }
       try {
         const transcript = await options.copilot.readTranscript(threadId);
+        const visibleTranscript = transformTranscript(
+          limitTranscriptMessages(transcript, messageLimit),
+          threadId
+        );
         return context.json(
-          ThreadTranscriptSchema.parse(limitTranscriptMessages(transcript, messageLimit))
+          ThreadTranscriptSchema.parse(visibleTranscript)
         );
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
@@ -1291,10 +1299,17 @@ function createApp(
           );
         }
         const sliceStart = Math.max(0, beforeIndex - limit);
+        const visibleTranscript = transformTranscript(
+          ThreadTranscriptSchema.parse({
+            ...transcript,
+            messages: transcript.messages.slice(sliceStart, beforeIndex)
+          }),
+          threadId
+        );
         return context.json(
           OlderThreadMessagesResponseSchema.parse({
             threadId,
-            messages: transcript.messages.slice(sliceStart, beforeIndex),
+            messages: visibleTranscript.messages,
             hasMore: sliceStart > 0
           })
         );
@@ -1312,10 +1327,17 @@ function createApp(
           );
         }
         const sliceStart = Math.max(0, beforeIndex - limit);
+        const visibleTranscript = transformTranscript(
+          ThreadTranscriptSchema.parse({
+            ...transcript,
+            messages: transcript.messages.slice(sliceStart, beforeIndex)
+          }),
+          threadId
+        );
         return context.json(
           OlderThreadMessagesResponseSchema.parse({
             threadId,
-            messages: transcript.messages.slice(sliceStart, beforeIndex),
+            messages: visibleTranscript.messages,
             hasMore: sliceStart > 0
           })
         );
@@ -1424,9 +1446,15 @@ function createApp(
         if (override) {
           pendingModelOverrides.delete(threadId);
         }
-        hub.broadcast({ type: 'thread/transcript/changed', payload: result.transcript });
+        const visibleTranscript = transformTranscript(result.transcript, threadId);
+        const parsedResponse = ThreadMessageResponseSchema.parse({
+          ...result,
+          transcript: visibleTranscript
+        });
+        transcriptCache.set(threadId, parsedResponse.transcript);
+        hub.broadcast({ type: 'thread/transcript/changed', payload: parsedResponse.transcript });
         hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
-        return context.json(result);
+        return context.json(parsedResponse);
       }
       if (isCopilotThreadId(threadId)) {
         if (!options.copilot) {
@@ -1442,9 +1470,15 @@ function createApp(
         if (override) {
           pendingModelOverrides.delete(threadId);
         }
-        hub.broadcast({ type: 'thread/transcript/changed', payload: result.transcript });
+        const visibleTranscript = transformTranscript(result.transcript, threadId);
+        const parsedResponse = ThreadMessageResponseSchema.parse({
+          ...result,
+          transcript: visibleTranscript
+        });
+        transcriptCache.set(threadId, parsedResponse.transcript);
+        hub.broadcast({ type: 'thread/transcript/changed', payload: parsedResponse.transcript });
         hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
-        return context.json(result);
+        return context.json(parsedResponse);
       }
 
       await options.appServer?.ensureConnected?.().catch(() => undefined);
@@ -2140,24 +2174,33 @@ function createApp(
       localAttachments
     );
   };
+  const transformLiveEvent = (event: LiveEvent): LiveEvent => {
+    if (event.type !== 'thread/transcript/changed') {
+      return event;
+    }
+    return {
+      ...event,
+      payload: transformTranscript(event.payload, event.payload.threadId)
+    };
+  };
 
   const detachAppServerLiveEvent = options.appServer?.onLiveEvent?.((event) => {
     if (!isProviderEnabled('codex')) {
       return;
     }
-    hub.broadcast(event);
+    hub.broadcast(transformLiveEvent(event));
   });
   const detachClaudeLiveEvent = options.claudeCode?.onLiveEvent?.((event) => {
     if (!isProviderEnabled('claude-code')) {
       return;
     }
-    hub.broadcast(event);
+    hub.broadcast(transformLiveEvent(event));
   });
   const detachCopilotLiveEvent = options.copilot?.onLiveEvent?.((event) => {
     if (!isProviderEnabled('copilot')) {
       return;
     }
-    hub.broadcast(event);
+    hub.broadcast(transformLiveEvent(event));
   });
   const detachAppServerLiveState = options.appServer?.onLiveStateChange?.((threadId) => {
     if (!isProviderEnabled('codex')) {

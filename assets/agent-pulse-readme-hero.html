@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Pulse README Hero</title>
+    <style>
+      :root {
+        --bg: #060607;
+        --panel: #131318;
+        --panel-2: #17171d;
+        --panel-3: #101014;
+        --border: #2a2a33;
+        --border-soft: #202027;
+        --text: #f3f3f4;
+        --muted: #9a9aa4;
+        --subtle: #6f6f78;
+        --green: #54e38b;
+        --yellow: #ffd84f;
+        --yellow-bg: #47380a;
+        --codex: #7f94ff;
+        --claude: #ff9b4a;
+        --copilot: #a973ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 1600px;
+        height: 900px;
+        min-width: 1600px;
+        min-height: 900px;
+        margin: 0;
+        overflow: hidden;
+        background:
+          radial-gradient(740px 540px at 17% 6%, rgba(127, 148, 255, 0.13), transparent 64%),
+          radial-gradient(720px 520px at 92% 92%, rgba(255, 155, 74, 0.11), transparent 62%),
+          linear-gradient(135deg, #070708 0%, #0b0b0d 46%, #050506 100%);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        background:
+          radial-gradient(740px 540px at 17% 6%, rgba(127, 148, 255, 0.13), transparent 64%),
+          radial-gradient(720px 520px at 92% 92%, rgba(255, 155, 74, 0.11), transparent 62%),
+          linear-gradient(135deg, #070708 0%, #0b0b0d 46%, #050506 100%);
+      }
+
+      .stage {
+        position: fixed;
+        inset: 0;
+        width: 1600px;
+        height: 900px;
+        display: grid;
+        place-items: center;
+        padding: 68px;
+        background:
+          radial-gradient(740px 540px at 17% 6%, rgba(127, 148, 255, 0.13), transparent 64%),
+          radial-gradient(720px 520px at 92% 92%, rgba(255, 155, 74, 0.11), transparent 62%),
+          linear-gradient(135deg, #070708 0%, #0b0b0d 46%, #050506 100%);
+      }
+
+      .app {
+        width: 1450px;
+        height: 730px;
+        border: 1px solid #30303a;
+        border-radius: 34px;
+        background: linear-gradient(135deg, #15151a, #0b0b0e 55%, #09090b);
+        box-shadow:
+          0 34px 90px rgba(0, 0, 0, 0.62),
+          0 0 0 1px rgba(255, 255, 255, 0.025) inset;
+        overflow: hidden;
+        position: relative;
+      }
+
+      .topbar {
+        height: 74px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 32px;
+        background: rgba(8, 8, 10, 0.9);
+        border-bottom: 1px solid #24242b;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 300px;
+      }
+
+      .brand-mark {
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        display: grid;
+        place-items: center;
+        background: #14141a;
+        border: 1px solid rgba(255, 216, 79, 0.74);
+        box-shadow: 0 0 26px rgba(127, 148, 255, 0.16);
+      }
+
+      .brand-mark::before {
+        content: "";
+        width: 17px;
+        height: 14px;
+        border: 2px solid var(--codex);
+        border-radius: 4px;
+        box-shadow: 0 9px 0 -7px var(--codex);
+      }
+
+      .brand-title {
+        font-size: 22px;
+        font-weight: 760;
+        letter-spacing: 0;
+      }
+
+      .connection {
+        height: 40px;
+        min-width: 360px;
+        border: 1px solid #303038;
+        border-radius: 22px;
+        background: #202025;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        color: #e7e7ea;
+        font-size: 15px;
+        font-weight: 690;
+      }
+
+      .connection .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: var(--green);
+        box-shadow: 0 0 16px rgba(84, 227, 139, 0.55);
+      }
+
+      .provider-strip {
+        display: flex;
+        justify-content: flex-end;
+        gap: 10px;
+        min-width: 360px;
+      }
+
+      .provider-chip {
+        height: 34px;
+        padding: 0 14px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        color: #dddde2;
+        background: rgba(23, 23, 29, 0.78);
+        font-size: 13px;
+        font-weight: 720;
+      }
+
+      .layout {
+        height: calc(100% - 74px);
+        display: grid;
+        grid-template-columns: 330px 1fr 318px;
+      }
+
+      .sidebar,
+      .rail {
+        background: rgba(18, 18, 23, 0.92);
+      }
+
+      .sidebar {
+        border-right: 1px solid #282830;
+        padding: 28px 28px 22px;
+      }
+
+      .rail {
+        border-left: 1px solid #282830;
+        padding: 28px 26px 22px;
+      }
+
+      .main {
+        background:
+          radial-gradient(530px 330px at 50% 8%, rgba(255, 255, 255, 0.026), transparent 70%),
+          #0b0b0d;
+        padding: 32px 56px 28px;
+      }
+
+      .new-thread {
+        height: 54px;
+        border-radius: 13px;
+        border: 1px solid #303039;
+        background: #17171e;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 16px;
+        font-size: 17px;
+        font-weight: 730;
+        margin-bottom: 28px;
+      }
+
+      .plus {
+        width: 24px;
+        height: 24px;
+        position: relative;
+      }
+
+      .plus::before,
+      .plus::after {
+        content: "";
+        position: absolute;
+        background: #eeeeef;
+        border-radius: 2px;
+      }
+
+      .plus::before {
+        width: 24px;
+        height: 2px;
+        top: 11px;
+      }
+
+      .plus::after {
+        width: 2px;
+        height: 24px;
+        left: 11px;
+      }
+
+      .section-label {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 820;
+        letter-spacing: 2.2px;
+      }
+
+      .search {
+        height: 48px;
+        border: 1px solid #303039;
+        border-radius: 10px;
+        background: #17171e;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--muted);
+        padding: 0 16px;
+        margin: 18px 0 28px;
+        font-size: 14px;
+        font-weight: 560;
+      }
+
+      .search-icon {
+        width: 15px;
+        height: 15px;
+        border: 2px solid #858590;
+        border-radius: 50%;
+        position: relative;
+      }
+
+      .search-icon::after {
+        content: "";
+        width: 9px;
+        height: 2px;
+        border-radius: 2px;
+        background: #858590;
+        position: absolute;
+        right: -8px;
+        bottom: -5px;
+        transform: rotate(45deg);
+      }
+
+      .project {
+        margin-bottom: 26px;
+      }
+
+      .project-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #e4e4e7;
+        font-size: 17px;
+        font-weight: 760;
+        margin-bottom: 16px;
+      }
+
+      .chevron {
+        width: 11px;
+        height: 11px;
+        border-right: 2px solid #8c8c95;
+        border-bottom: 2px solid #8c8c95;
+        transform: rotate(45deg) translateY(-3px);
+      }
+
+      .thread {
+        min-height: 38px;
+        display: grid;
+        grid-template-columns: 10px 14px 1fr auto;
+        align-items: center;
+        gap: 12px;
+        color: #d8d8dd;
+        font-size: 14px;
+        font-weight: 620;
+      }
+
+      .thread.dim {
+        color: #9c9ca5;
+      }
+
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--green);
+      }
+
+      .status-dot.warn {
+        background: var(--yellow);
+      }
+
+      .agent-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+      }
+
+      .codex {
+        background: linear-gradient(135deg, #6e7bd8, #8ea0ff);
+      }
+
+      .claude {
+        background: linear-gradient(135deg, #c58b5a, #ff8a3d);
+      }
+
+      .copilot {
+        background: linear-gradient(135deg, #c898fd, #8534f3);
+      }
+
+      .review {
+        padding: 5px 11px;
+        border-radius: 999px;
+        background: var(--yellow-bg);
+        color: var(--yellow);
+        font-size: 12px;
+        font-weight: 820;
+      }
+
+      .time {
+        color: var(--subtle);
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .helper-live {
+        position: absolute;
+        left: 28px;
+        right: calc(100% - 330px + 28px);
+        bottom: 22px;
+        border-top: 1px solid #292930;
+        padding-top: 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: #bdbdc4;
+        font-size: 14px;
+        font-weight: 690;
+      }
+
+      .hero-copy {
+        text-align: center;
+        margin: 0 auto 24px;
+      }
+
+      .hero-icon {
+        width: 34px;
+        height: 26px;
+        margin: 0 auto 14px;
+        opacity: 0.28;
+        border: 3px solid #3a3a42;
+        border-radius: 7px;
+        position: relative;
+      }
+
+      .hero-icon::after {
+        content: "";
+        width: 16px;
+        height: 14px;
+        border-right: 3px solid #3a3a42;
+        border-bottom: 3px solid #3a3a42;
+        position: absolute;
+        right: -16px;
+        bottom: -13px;
+      }
+
+      h1 {
+        margin: 0;
+        color: #f3f3f4;
+        font-size: 38px;
+        line-height: 1.05;
+        font-weight: 840;
+        letter-spacing: -0.01em;
+      }
+
+      .hero-copy p {
+        max-width: 610px;
+        margin: 12px auto 0;
+        color: #8a8a92;
+        font-size: 17px;
+        line-height: 1.45;
+        font-weight: 520;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 20px;
+        margin-bottom: 24px;
+      }
+
+      .stat,
+      .card {
+        border: 1px solid var(--border);
+        background: linear-gradient(145deg, rgba(25, 25, 32, 0.95), rgba(15, 15, 20, 0.96));
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.025) inset;
+      }
+
+      .stat {
+        height: 76px;
+        border-radius: 14px;
+        padding: 16px 22px;
+      }
+
+      .stat-num {
+        font-size: 34px;
+        line-height: 1;
+        font-weight: 850;
+      }
+
+      .stat-label {
+        color: #878790;
+        font-size: 14px;
+        font-weight: 650;
+        margin-top: 8px;
+      }
+
+      .card {
+        border-radius: 16px;
+        padding: 20px 24px;
+        margin-bottom: 20px;
+      }
+
+      .card-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 16px;
+      }
+
+      .mark-button {
+        height: 36px;
+        border-radius: 18px;
+        border: 1px solid #34343c;
+        background: #18181e;
+        color: #bebec5;
+        padding: 0 17px;
+        font-size: 13px;
+        font-weight: 740;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .check {
+        width: 18px;
+        height: 10px;
+        border-left: 2px solid #858590;
+        border-bottom: 2px solid #858590;
+        transform: rotate(-45deg) translateY(-2px);
+      }
+
+      .review-row,
+      .live-row {
+        display: grid;
+        grid-template-columns: 9px 14px 1fr auto auto;
+        align-items: center;
+        gap: 13px;
+        min-height: 40px;
+        color: #e4e4e8;
+        font-size: 16px;
+        font-weight: 690;
+      }
+
+      .live-row {
+        grid-template-columns: 9px 1fr;
+        font-size: 17px;
+      }
+
+      .rail-card {
+        border: 1px solid var(--border);
+        background: linear-gradient(145deg, rgba(23, 23, 29, 0.94), rgba(14, 14, 18, 0.96));
+        border-radius: 14px;
+        padding: 16px 20px;
+        margin-bottom: 16px;
+      }
+
+      .rail-title {
+        color: #aaaab3;
+        font-size: 13px;
+        font-weight: 820;
+        letter-spacing: 2.2px;
+        margin-bottom: 14px;
+      }
+
+      .rail-line {
+        min-height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        border-bottom: 1px solid #292930;
+        color: #dedee3;
+        font-size: 15px;
+        font-weight: 670;
+      }
+
+      .rail-line:last-child {
+        border-bottom: 0;
+      }
+
+      .bar-track {
+        height: 10px;
+        border-radius: 999px;
+        background: #222228;
+        overflow: hidden;
+        margin-bottom: 14px;
+      }
+
+      .bar-fill {
+        width: 78%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #54e38b, #6ff6a3);
+      }
+
+      .mini-row {
+        display: grid;
+        grid-template-columns: 12px 1fr auto;
+        align-items: center;
+        gap: 11px;
+        min-height: 34px;
+        color: #dedee3;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .mini-row span:last-child,
+      .rail-count {
+        color: var(--subtle);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .fade-bottom {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="stage">
+      <section class="app" aria-label="Agent Pulse app window preview">
+        <header class="topbar">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true"></div>
+            <div class="brand-title">Agent Pulse</div>
+          </div>
+          <div class="connection"><span class="dot"></span>Local helper live</div>
+          <div class="provider-strip" aria-label="Connected providers">
+            <div class="provider-chip"><span class="agent-dot codex"></span>Codex</div>
+            <div class="provider-chip"><span class="agent-dot claude"></span>Claude Code</div>
+            <div class="provider-chip"><span class="agent-dot copilot"></span>Copilot</div>
+          </div>
+        </header>
+
+        <div class="layout">
+          <aside class="sidebar">
+            <div class="new-thread"><span class="plus"></span>New thread</div>
+
+            <div class="section-label">THREADS</div>
+            <div class="search"><span class="search-icon"></span>Search threads or projects</div>
+
+            <section class="project">
+              <div class="project-title"><span class="chevron"></span>Product Lab</div>
+              <div class="thread">
+                <span class="status-dot warn"></span><span class="agent-dot claude"></span>
+                <span>Review agent plan</span><span class="review">Review</span>
+              </div>
+              <div class="thread dim">
+                <span></span><span class="agent-dot codex"></span>
+                <span>Inspect thread state</span><span class="time">24m</span>
+              </div>
+              <div class="thread">
+                <span class="status-dot warn"></span><span class="agent-dot copilot"></span>
+                <span>Check model picker</span><span class="review">Review</span>
+              </div>
+              <div class="thread dim">
+                <span></span><span class="agent-dot claude"></span>
+                <span>Polish settings view</span><span class="time">2h</span>
+              </div>
+            </section>
+
+            <section class="project">
+              <div class="project-title"><span class="chevron"></span>Open Workspace</div>
+              <div class="thread dim">
+                <span class="status-dot"></span><span class="agent-dot codex"></span>
+                <span>Prepare README asset</span><span></span>
+              </div>
+            </section>
+
+            <div class="helper-live"><span class="status-dot"></span>Helper live</div>
+          </aside>
+
+          <section class="main">
+            <div class="hero-copy">
+              <div class="hero-icon" aria-hidden="true"></div>
+              <h1>Agent work ready for review</h1>
+              <p>One tablet-friendly dashboard for local agent threads, live status, approvals, models, and remote access.</p>
+            </div>
+
+            <div class="stats">
+              <div class="stat">
+                <div class="stat-num" style="color: #9bc9ff">1</div>
+                <div class="stat-label">Running</div>
+              </div>
+              <div class="stat">
+                <div class="stat-num" style="color: var(--yellow)">3</div>
+                <div class="stat-label">Review</div>
+              </div>
+              <div class="stat">
+                <div class="stat-num" style="color: var(--green)">12</div>
+                <div class="stat-label">Recent</div>
+              </div>
+            </div>
+
+            <article class="card">
+              <div class="card-head">
+                <div class="section-label">NEEDS REVIEW</div>
+                <div class="mark-button"><span class="check"></span>Mark all reviewed</div>
+              </div>
+              <div class="review-row">
+                <span class="status-dot"></span><span class="agent-dot claude"></span>
+                <span>Review dashboard changes</span><span class="review">Review</span><span class="time">12m</span>
+              </div>
+              <div class="review-row">
+                <span class="status-dot"></span><span class="agent-dot codex"></span>
+                <span>Check provider badges</span><span class="review">Review</span><span class="time">18m</span>
+              </div>
+              <div class="review-row">
+                <span class="status-dot"></span><span class="agent-dot copilot"></span>
+                <span>Validate remote workflow</span><span class="review">Review</span><span class="time">1h</span>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="section-label" style="margin-bottom: 18px">LIVE CONTROL</div>
+              <div class="live-row">
+                <span class="status-dot"></span>
+                <span>Watch progress, send follow-ups, stop work, and approve safe changes.</span>
+              </div>
+            </article>
+          </section>
+
+          <aside class="rail">
+            <section class="rail-card">
+              <div class="rail-title">HELPER</div>
+              <div class="mini-row"><span class="status-dot"></span><strong>OK</strong><span></span></div>
+            </section>
+
+            <section class="rail-card">
+              <div class="rail-title">STATUS BREAKDOWN</div>
+              <div class="bar-track"><div class="bar-fill"></div></div>
+              <div class="mini-row"><span class="status-dot"></span><span>Idle and ready</span><span>128</span></div>
+            </section>
+
+            <section class="rail-card">
+              <div class="rail-title">WORKSPACES</div>
+              <div class="rail-line"><span>Personal tools</span><span class="rail-count">6</span></div>
+              <div class="rail-line"><span>Open apps</span><span class="rail-count">4</span></div>
+              <div class="rail-line"><span>Client work</span><span class="rail-count">3</span></div>
+            </section>
+
+            <section class="rail-card">
+              <div class="rail-title">RECENT ACTIVITY</div>
+              <div class="mini-row"><span class="agent-dot claude"></span><span>Plan ready for review</span><span>Idle</span></div>
+              <div class="mini-row"><span class="agent-dot codex"></span><span>Thread updated</span><span>Idle</span></div>
+              <div class="mini-row"><span class="agent-dot copilot"></span><span>Model changed</span><span>Ready</span></div>
+            </section>
+
+            <section class="rail-card">
+              <div class="rail-title">MODELS</div>
+              <div class="rail-line"><span>gpt-5.5</span><span class="rail-count">8</span></div>
+              <div class="rail-line"><span>sonnet</span><span class="rail-count">5</span></div>
+            </section>
+          </aside>
+        </div>
+        <div class="fade-bottom"></div>
+      </section>
+    </main>
+  </body>
+</html>

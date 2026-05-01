@@ -8,6 +8,8 @@ Agent Pulse is a browser-based control surface for local coding agents running o
 
 It gives you one live dashboard for active agent work, recent threads, approvals, transcripts, models, and health. Open it on an iPad, Android tablet, phone, or desktop browser so you can watch and steer work even when you are not sitting next to your computer.
 
+![Agent Pulse dashboard preview](assets/agent-pulse-readme-hero.png)
+
 Agent Pulse is local-first with optional remote access: the helper runs on your Mac, reads local agent state, and serves a paired web app to trusted devices. When remote access is enabled, the helper can expose that same paired web app through a Cloudflare Tunnel.
 
 ## Supported Providers
