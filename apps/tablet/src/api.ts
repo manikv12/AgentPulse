@@ -14,6 +14,7 @@ import {
   SeenThreadActivityResponseSchema,
   type SeenThreadActivityMap,
   ThreadCreateResponseSchema,
+  ThreadDeleteResponseSchema,
   ThreadMessageResponseSchema,
   ThreadModelUpdateResponseSchema,
   ThreadStopResponseSchema,
@@ -33,6 +34,7 @@ import {
   type RemoteAccessSettings,
   type Thread,
   type ThreadMessageResponse,
+  type ThreadDeleteResponse,
   type ThreadStopResponse,
   type ThreadTranscript,
   type OlderThreadMessagesResponse
@@ -502,6 +504,21 @@ export async function stopThreadWork(
   }
 
   return ThreadStopResponseSchema.parse(await response.json());
+}
+
+export async function deleteThread(
+  session: AgentPulseSession,
+  threadId: string
+): Promise<ThreadDeleteResponse> {
+  const response = await authedFetch(`/threads/${encodeURIComponent(threadId)}`, session, {
+    method: 'DELETE'
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not delete this thread.'));
+  }
+
+  return ThreadDeleteResponseSchema.parse(await response.json());
 }
 
 export async function fetchCatalogPlugins(session: AgentPulseSession): Promise<CatalogPlugin[]> {

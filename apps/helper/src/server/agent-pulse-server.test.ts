@@ -1702,7 +1702,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('uses the app-server approval state when Codex is waiting for permission', async () => {
+  it('uses the IPC mirror approval state when Codex is waiting for permission', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const thread: Thread = {
@@ -1727,20 +1727,14 @@ describe('Agent Pulse helper API', () => {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
       sendMessage: vi.fn(),
-      applyLiveState: (raw: ThreadTranscript, threadId: string) =>
-        threadId === 'thread-approval'
-          ? {
-              ...raw,
-              activeTurnId: 'app-server-live:thread-approval',
-              sendState: {
-                canSend: false,
-                reason: 'waiting_on_approval' as const,
-                label: 'Codex is waiting for approval'
-              }
-            }
-          : raw,
-      isThreadStreaming: (threadId: string) => threadId === 'thread-approval',
-      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval'
+      isThreadStreaming: (threadId: string) => threadId === 'thread-approval'
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval',
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const settings = {
       port: await pickFreeHighPort(),
@@ -1767,6 +1761,7 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [thread] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -1778,7 +1773,7 @@ describe('Agent Pulse helper API', () => {
       expect(transcriptResponse.status).toBe(200);
       await expect(transcriptResponse.json()).resolves.toMatchObject({
         threadId: 'thread-approval',
-        activeTurnId: 'app-server-live:thread-approval',
+        activeTurnId: 'mirror-approval:thread-approval',
         sendState: {
           canSend: false,
           reason: 'waiting_on_approval',
@@ -1803,7 +1798,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('returns pending approval payloads from the app-server live state', async () => {
+  it('returns pending approval payloads from the IPC mirror live state', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const thread: Thread = {
@@ -1823,9 +1818,15 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn()
+    };
+    const mirror = {
+      isConnected: () => true,
       sendMessage: vi.fn(),
       getPendingApprovalRequests: (threadId: string) =>
-        threadId === 'thread-approval' ? [pendingApproval] : []
+        threadId === 'thread-approval' ? [pendingApproval] : [],
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
     };
     const pendingApproval = {
       id: 'permission-request-1',
@@ -1861,6 +1862,7 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [thread] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -1880,21 +1882,21 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('records approval decisions through app-server', async () => {
+  it('records approval decisions through the IPC mirror', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(),
       sendMessage: vi.fn(),
-      respondToApproval: vi.fn(async () => undefined)
+      respondToApproval: vi.fn(async () => {
+        throw new Error('app-server should not be used for approval decisions.');
+      })
     };
     const mirror = {
       isConnected: () => true,
       sendMessage: vi.fn(),
-      respondToApproval: vi.fn(async () => {
-        throw new Error('IPC mirror should not be used for approval decisions.');
-      }),
+      respondToApproval: vi.fn(async () => undefined),
       isThreadOwned: () => true,
       waitForOwnership: async () => true
     };
@@ -1923,6 +1925,7 @@ describe('Agent Pulse helper API', () => {
       threadProvider: { listThreads: async () => [] },
       opener,
       appServer,
+      mirror,
       version: '0.1.0'
     });
 
@@ -1945,13 +1948,13 @@ describe('Agent Pulse helper API', () => {
 
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({ ok: true });
-      expect(appServer.respondToApproval).toHaveBeenCalledWith(
+      expect(mirror.respondToApproval).toHaveBeenCalledWith(
         'thread-approval',
         'request-1',
         'item/fileChange/requestApproval',
         'accept'
       );
-      expect(mirror.respondToApproval).not.toHaveBeenCalled();
+      expect(appServer.respondToApproval).not.toHaveBeenCalled();
       expect(opener.openThread).not.toHaveBeenCalled();
     } finally {
       await server.stop();
@@ -3484,6 +3487,66 @@ describe('Agent Pulse helper API', () => {
         undefined
       );
       expect(appServer.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('deletes a thread by archiving it through Codex app-server', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const thread: Thread = {
+      threadId: 'thread-delete',
+      title: 'Old thread',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-30T12:00:00Z',
+      lastTurnSummary: 'Ready'
+    };
+    const appServer = {
+      isConnected: () => true,
+      ensureConnected: vi.fn(async () => undefined),
+      archiveThread: vi.fn(async () => undefined),
+      readTranscript: vi.fn(async (): Promise<ThreadTranscript> => ({
+        threadId: 'thread-delete',
+        activeTurnId: null,
+        sendState: {
+          canSend: true,
+          reason: 'ready',
+          label: 'Ready'
+        },
+        messages: []
+      })),
+      sendMessage: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/threads/thread-delete`, {
+        method: 'DELETE',
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ ok: true });
+      expect(appServer.archiveThread).toHaveBeenCalledWith('thread-delete');
     } finally {
       await server.stop();
     }

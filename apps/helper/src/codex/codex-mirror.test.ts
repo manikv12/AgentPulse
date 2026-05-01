@@ -350,6 +350,20 @@ describe('codex mirror', () => {
       })
     ]);
 
+    const lateListener = vi.fn();
+    const detachLateListener = mirror.onPendingApprovalsChange(lateListener);
+    expect(lateListener).toHaveBeenCalledWith({
+      threadId: 'thread-approval',
+      requests: [
+        expect.objectContaining({
+          id: 'permission-request-1',
+          method: 'item/permissions/requestApproval',
+          turnId: 'turn-7'
+        })
+      ]
+    });
+    detachLateListener();
+
     // Once Codex marks the request completed, the helper should fire an empty
     // change and the getter should return [] — that's how the tablet learns
     // to clear the approval card.
@@ -373,6 +387,99 @@ describe('codex mirror', () => {
       requests: []
     });
     expect(mirror.getPendingApprovalRequests('thread-approval')).toEqual([]);
+    mirror.dispose();
+  });
+
+  it('normalizes numeric approval ids for UI but preserves the numeric IPC response id', async () => {
+    const { ipc, setReady, emitBroadcast, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({ ok: true });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onPendingApprovalsChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onPendingApprovalsChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-approval',
+      change: {
+        type: 'snapshot',
+        conversationState: {
+          requests: [
+            {
+              id: 4,
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: 'thread-approval',
+                turnId: 'turn-7',
+                itemId: 'call-1',
+                command: "/bin/zsh -lc 'pnpm test'",
+                reason: 'Allow tests.'
+              }
+            }
+          ],
+          turns: [],
+          threadRuntimeStatus: { type: 'notLoaded' }
+        }
+      }
+    });
+
+    expect(mirror.getPendingApprovalRequests('thread-approval')).toEqual([
+      {
+        id: '4',
+        method: 'item/commandExecution/requestApproval',
+        params: {
+          threadId: 'thread-approval',
+          turnId: 'turn-7',
+          itemId: 'call-1',
+          command: "/bin/zsh -lc 'pnpm test'",
+          reason: 'Allow tests.'
+        },
+        itemId: 'call-1',
+        turnId: 'turn-7'
+      }
+    ]);
+    expect(onPendingApprovalsChange).toHaveBeenCalledWith({
+      threadId: 'thread-approval',
+      requests: [
+        expect.objectContaining({
+          id: '4',
+          method: 'item/commandExecution/requestApproval'
+        })
+      ]
+    });
+    await mirror.respondToApproval(
+      'thread-approval',
+      '4',
+      'item/commandExecution/requestApproval',
+      'accept'
+    );
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-command-approval-decision', {
+      conversationId: 'thread-approval',
+      requestId: 4,
+      decision: 'accept'
+    });
+    mirror.dispose();
+  });
+
+  it('sends numeric approval route ids back to IPC as numbers after reconnect', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({ ok: true });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await mirror.respondToApproval(
+      'thread-approval',
+      '4',
+      'item/commandExecution/requestApproval',
+      'accept'
+    );
+
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-command-approval-decision', {
+      conversationId: 'thread-approval',
+      requestId: 4,
+      decision: 'accept'
+    });
     mirror.dispose();
   });
 

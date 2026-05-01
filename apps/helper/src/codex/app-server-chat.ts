@@ -507,6 +507,14 @@ export class CodexAppServerChat {
     this.emitThreadStateChanged(threadId);
   }
 
+  async archiveThread(threadId: string): Promise<void> {
+    await this.transport.request('thread/archive', { threadId });
+    this.liveThreads.delete(threadId);
+    this.threadExecutionSettings.delete(threadId);
+    this.emitLiveEvent({ type: 'thread/remove', payload: { threadId } });
+    this.emitLiveStateChange(threadId);
+  }
+
   // Kick off Codex's automated reviewer for the active branch. The response
   // shape mirrors turn/start — Codex emits the same item/started + item/completed
   // stream, so the tablet's existing transcript machinery picks the review up
@@ -976,6 +984,14 @@ export class CodexAppServerChat {
     if (notification.method === 'thread/compacted') {
       state.isCompacting = false;
       this.emitThreadStateChanged(threadId);
+      return;
+    }
+
+    if (notification.method === 'thread/archived') {
+      this.liveThreads.delete(threadId);
+      this.threadExecutionSettings.delete(threadId);
+      this.emitLiveEvent({ type: 'thread/remove', payload: { threadId } });
+      this.emitLiveStateChange(threadId);
       return;
     }
 

@@ -933,6 +933,40 @@ describe('Codex App Server same-thread chat', () => {
     expect(transcript.messages[0]).toMatchObject({ id: 'assistant-1', text: 'Message 1' });
     expect(transcript.messages[13]).toMatchObject({ id: 'assistant-14', text: 'Message 14' });
   });
+
+  it('archives a thread through app-server and emits a remove event', async () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+    const liveEvents: unknown[] = [];
+    chat.onLiveEvent((event) => liveEvents.push(event));
+
+    await chat.archiveThread('thread-1');
+
+    expect(transport.calls).toEqual([
+      { method: 'thread/archive', params: { threadId: 'thread-1' } }
+    ]);
+    expect(liveEvents).toContainEqual({
+      type: 'thread/remove',
+      payload: { threadId: 'thread-1' }
+    });
+  });
+
+  it('maps app-server thread archived notifications to tablet remove events', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+    const liveEvents: unknown[] = [];
+    chat.onLiveEvent((event) => liveEvents.push(event));
+
+    transport.emitNotification({
+      method: 'thread/archived',
+      params: { threadId: 'thread-1' }
+    });
+
+    expect(liveEvents).toContainEqual({
+      type: 'thread/remove',
+      payload: { threadId: 'thread-1' }
+    });
+  });
 });
 
 function fakeTransport(results: unknown[]): CodexAppServerTransport & { calls: RequestCall[] } {

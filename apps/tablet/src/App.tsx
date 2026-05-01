@@ -60,6 +60,7 @@ import {
   fetchThreads,
   importSeenThreadActivity,
   markThreadSeenOnHelper,
+  deleteThread,
   getFingerprint,
   liveEventsUrl,
   loadAdminToken,
@@ -1977,6 +1978,38 @@ export function App() {
     [session]
   );
 
+  const handleDeleteThread = useCallback(
+    async (threadId: string) => {
+      if (!session) {
+        return Promise.reject(new Error('Not connected.'));
+      }
+      await deleteThread(session, threadId);
+      setThreads((current) => current.filter((thread) => thread.threadId !== threadId));
+      setTranscripts((current) => removeTranscriptCache(current, threadId));
+      setThreadPendingRequests((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setThreadModels((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setThreadReasoningEfforts((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setActiveThreadId((current) => (current === threadId ? undefined : current));
+      setMessage('Thread deleted from Codex.');
+    },
+    [session]
+  );
+
   const visibleScreen = useMemo(() => {
     if (screen === 'settings') {
       if (!adminToken) {
@@ -2053,6 +2086,7 @@ export function App() {
           projects={projects}
           onNewThread={handleNewThread}
           onOpenThreadInCodex={handleOpenThreadInCodex}
+          onDeleteThread={handleDeleteThread}
           onOpenSettings={handleOpenAdmin}
           fetchTranscript={handleFetchTranscript}
           sendMessage={handleSendMessage}
@@ -2144,6 +2178,7 @@ export function App() {
     handleSendMessage,
     handleStopWork,
     handleOpenThreadInCodex,
+    handleDeleteThread,
     health,
     message,
     models,

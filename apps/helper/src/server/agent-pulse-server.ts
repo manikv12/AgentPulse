@@ -30,6 +30,7 @@ import {
   RemoteAccessSettingsSchema,
   ThreadCreateRequestSchema,
   ThreadCreateResponseSchema,
+  ThreadDeleteResponseSchema,
   ThreadMessageRequestSchema,
   ThreadMessageResponseSchema,
   ThreadListResponseSchema,
@@ -109,6 +110,7 @@ export type AppServerChatBridge = {
   ): Promise<Thread>;
   interruptTurn?(threadId: string): Promise<void>;
   compactThread?(threadId: string): Promise<void>;
+  archiveThread?(threadId: string): Promise<void>;
   startReview?(threadId: string): Promise<void>;
   respondToApproval?(
     threadId: string,
@@ -148,6 +150,17 @@ export type CodexMirrorBridge = {
     modelSlug: string,
     reasoningEffort?: string
   ): Promise<void>;
+  respondToApproval?(
+    threadId: string,
+    requestId: string,
+    method: string,
+    response: unknown
+  ): Promise<void>;
+  getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
+  isThreadWaitingForApproval?(threadId: string): boolean;
+  onPendingApprovalsChange?(
+    listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
+  ): () => void;
   isThreadOwned?(threadId: string): boolean;
   waitForOwnership?(threadId: string, timeoutMs: number): Promise<boolean>;
 };
@@ -221,6 +234,7 @@ export async function startAgentPulseServer(
     options.threadProvider,
     hub,
     options.appServer,
+    options.mirror,
     transformTranscript,
     options.seenThreadStore
   );
@@ -453,6 +467,33 @@ function createApp(
     }
     completedDesktopRefreshTurnKeys.add(key);
     scheduleAutoDesktopRefresh(candidate);
+  };
+  const forgetThread = (threadId: string): void => {
+    transcriptCache.delete(threadId);
+    liveSubscribedThreadIds.delete(threadId);
+    draftThreads.delete(threadId);
+    desktopInterestUntilByThread.delete(threadId);
+    lastManualOpenAtByThread.delete(threadId);
+    lastAutoRefreshAtByThread.delete(threadId);
+    pendingModelOverrides.delete(threadId);
+    for (const key of [...agentPulseOwnedTurnKeys]) {
+      if (key.startsWith(`${threadId}:`)) {
+        agentPulseOwnedTurnKeys.delete(key);
+      }
+    }
+    for (const key of [...completedDesktopRefreshTurnKeys]) {
+      if (key.startsWith(`${threadId}:`)) {
+        completedDesktopRefreshTurnKeys.delete(key);
+      }
+    }
+    for (const key of [...completedTranscriptTurnKeys]) {
+      if (key.startsWith(`${threadId}:`)) {
+        completedTranscriptTurnKeys.delete(key);
+      }
+    }
+    if (pendingAutoDesktopRefresh?.threadId === threadId) {
+      pendingAutoDesktopRefresh = undefined;
+    }
   };
   const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
     if (!options.appServer?.readTranscript) {
@@ -862,6 +903,7 @@ function createApp(
       await reconcileThreadStatuses(
         await options.threadProvider.listThreads(),
         options.appServer,
+        options.mirror,
         transformTranscript
       ),
       draftThreads
@@ -1266,23 +1308,23 @@ function createApp(
     // queued behind the response. Decline the pending requests first so Codex
     // unblocks itself; this is enough to put a `requestUserInput` thread back
     // into idle. Best-effort: failures here don't prevent the interrupt.
-    if (options.appServer.getPendingApprovalRequests && options.appServer.respondToApproval) {
-      const pending = options.appServer.getPendingApprovalRequests(threadId);
+    if (options.mirror?.getPendingApprovalRequests && options.mirror.respondToApproval) {
+      const pending = options.mirror.getPendingApprovalRequests(threadId);
       for (const request of pending) {
         try {
           if (request.method === 'item/tool/requestUserInput') {
             // Empty answers map = "user skipped"; Codex aborts the turn cleanly.
-            await options.appServer.respondToApproval(threadId, request.id, request.method, {
+            await options.mirror.respondToApproval(threadId, request.id, request.method, {
               answers: {}
             });
           } else if (request.method === 'mcpServer/elicitation/request') {
-            await options.appServer.respondToApproval(threadId, request.id, request.method, {
+            await options.mirror.respondToApproval(threadId, request.id, request.method, {
               action: 'cancel',
               content: null,
               _meta: null
             });
           } else {
-            await options.appServer.respondToApproval(
+            await options.mirror.respondToApproval(
               threadId,
               request.id,
               request.method,
@@ -1326,6 +1368,29 @@ function createApp(
         return context.json({ error: error.message, reason: error.reason }, 409);
       }
       return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+  });
+
+  app.delete('/threads/:threadId', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    await options.appServer?.ensureConnected?.().catch(() => undefined);
+    if (!options.appServer?.isConnected() || !options.appServer.archiveThread) {
+      return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+
+    const threadId = context.req.param('threadId');
+    try {
+      await options.appServer.archiveThread(threadId);
+      forgetThread(threadId);
+      hub.broadcast({ type: 'thread/remove', payload: { threadId } });
+      return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return context.json({ error: `Codex could not delete this thread: ${detail}` }, 503);
     }
   });
 
@@ -1475,16 +1540,15 @@ function createApp(
     }
   });
 
-  // GET the current set of approval requests Codex app-server is waiting on for a thread.
-  // The tablet hits this after reconnects so it can rebuild the approval card from the
-  // app-server request store rather than from Codex desktop IPC.
+  // GET the current set of approval requests the Codex desktop IPC mirror sees.
+  // This is the same source that renders the approval card in the actual Codex chat.
   app.get('/threads/:threadId/pending-approvals', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
     const threadId = context.req.param('threadId');
-    const requests = options.appServer?.getPendingApprovalRequests?.(threadId) ?? [];
+    const requests = options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
     return context.json({ threadId, requests });
   });
 
@@ -1493,10 +1557,9 @@ function createApp(
     if (!auth.ok) {
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
-    await options.appServer?.ensureConnected?.().catch(() => undefined);
-    if (!options.appServer?.respondToApproval || !options.appServer.isConnected()) {
+    if (!options.mirror?.respondToApproval || !options.mirror.isConnected()) {
       return context.json(
-        { error: 'Codex app-server is not available to respond to approvals.' },
+        { error: 'Codex desktop IPC is not available to respond to approvals.' },
         503
       );
     }
@@ -1504,11 +1567,17 @@ function createApp(
     const threadId = context.req.param('threadId');
     const requestId = context.req.param('requestId');
     try {
-      await options.appServer.respondToApproval(
+      await runWithFollowerOwnership(
+        () =>
+          options.mirror!.respondToApproval!(
+            threadId,
+            requestId,
+            parsed.method,
+            parsed.decision
+          ),
+        options.opener,
         threadId,
-        requestId,
-        parsed.method,
-        parsed.decision
+        options.mirror
       );
       return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
     } catch (error) {
@@ -1623,8 +1692,13 @@ function createApp(
   const transformTranscript = (transcript: ThreadTranscript, threadId: string): ThreadTranscript => {
     // The poller hands us a fresh transcript on every successful reconcile — cache it so
     // the HTTP fallback path always has a recent copy to serve when a live read times out.
-    const realtimeTranscript =
+    const appServerTranscript =
       options.appServer?.applyLiveState?.(transcript, threadId) ?? transcript;
+    const realtimeTranscript = applyMirrorApprovalState(
+      appServerTranscript,
+      threadId,
+      options.mirror
+    );
     transcriptCache.set(threadId, realtimeTranscript);
     return exposeLocalAttachments(
       applyMobileSendState(realtimeTranscript, currentSettings),
@@ -1648,6 +1722,15 @@ function createApp(
     liveSubscribedThreadIds.clear();
     hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
   });
+  const detachMirrorPendingApprovals = options.mirror?.onPendingApprovalsChange?.((event) => {
+    hub.broadcast({ type: 'thread/pending-approvals/changed', payload: event });
+    if (event.requests.length > 0) {
+      hub.broadcast({
+        type: 'thread/status/changed',
+        payload: { threadId: event.threadId, status: 'waiting_approval' }
+      });
+    }
+  });
   void options.appServer?.ensureConnected?.()
     .catch(() => undefined)
     .finally(() => {
@@ -1666,6 +1749,7 @@ function createApp(
       detachAppServerLiveState?.();
       detachAppServerTurnCompleted?.();
       detachAppServerConnection?.();
+      detachMirrorPendingApprovals?.();
     }
   };
 }
@@ -2112,6 +2196,7 @@ function startThreadPolling(
   threadProvider: { listThreads(): Promise<Thread[]> },
   hub: LiveEventHub,
   appServer: AppServerChatBridge | undefined,
+  mirror: CodexMirrorBridge | undefined,
   transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript,
   seenThreadStore?: SeenThreadStore
 ) {
@@ -2140,7 +2225,7 @@ function startThreadPolling(
           ? new Set(loadedThreadIds.keys())
           : loadedThreadIds;
       const threads = (await threadProvider.listThreads()).map((thread) =>
-        applyAppServerLiveThreadStatus(thread, appServer, liveStatuses)
+        applyAppServerLiveThreadStatus(thread, appServer, mirror, liveStatuses)
       );
       const toReconcile = threads.filter((thread) =>
         shouldReconcileThread(thread, fullSweep, loadedIdsSet)
@@ -2239,11 +2324,12 @@ function reconciledThreadStatus(thread: Thread, transcript: ThreadTranscript): T
 async function reconcileThreadStatuses(
   threads: Thread[],
   appServer: AppServerChatBridge | undefined,
+  mirror: CodexMirrorBridge | undefined,
   transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ): Promise<Thread[]> {
   const liveStatuses = await appServer?.listLoadedThreadStatuses?.().catch(() => undefined);
   const liveThreads = threads.map((thread) =>
-    applyAppServerLiveThreadStatus(thread, appServer, liveStatuses)
+    applyAppServerLiveThreadStatus(thread, appServer, mirror, liveStatuses)
   );
   const loadedThreadIds =
     liveStatuses ?? (await appServer?.listLoadedThreadIds?.().catch(() => undefined));
@@ -2260,11 +2346,12 @@ async function reconcileThreadStatuses(
 function applyAppServerLiveThreadStatus(
   thread: Thread,
   appServer: AppServerChatBridge | undefined,
+  mirror: CodexMirrorBridge | undefined,
   liveStatuses?: Map<string, Thread['status']>
 ): Thread {
   // Live notification-derived state from in-memory flags (notifications are
   // pushed in real time and beat the snapshot returned by thread/loaded/list).
-  const inMemoryStatus = appServer?.isThreadWaitingForApproval?.(thread.threadId)
+  const inMemoryStatus = mirror?.isThreadWaitingForApproval?.(thread.threadId)
     ? 'waiting_approval'
     : appServer?.isThreadCompacting?.(thread.threadId)
       ? 'compacting'
@@ -2423,6 +2510,25 @@ function slashCommandAckResponse(threadId: string, command: string, originalText
       activeTurnId: null,
       sendState: { canSend: true, reason: 'ready', label: 'Ready' },
       messages: [syntheticMessage]
+    }
+  });
+}
+
+function applyMirrorApprovalState(
+  transcript: ThreadTranscript,
+  threadId: string,
+  mirror: CodexMirrorBridge | undefined
+): ThreadTranscript {
+  if (!mirror?.isThreadWaitingForApproval?.(threadId)) {
+    return transcript;
+  }
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    activeTurnId: transcript.activeTurnId ?? `mirror-approval:${threadId}`,
+    sendState: {
+      canSend: false,
+      reason: 'waiting_on_approval',
+      label: 'Codex is waiting for approval'
     }
   });
 }

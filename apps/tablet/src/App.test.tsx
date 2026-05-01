@@ -242,6 +242,40 @@ describe('Agent Pulse tablet UI', () => {
     );
   });
 
+  it('confirms before deleting a thread from the thread header', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-live',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    }));
+    const deleteThread = vi.fn(async () => undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-live',
+          title: 'Old chat',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-30T12:00:00Z',
+          lastTurnSummary: 'Ready'
+        }}
+        fetchTranscript={fetchTranscript}
+        deleteThread={deleteThread}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete thread' }));
+
+    await waitFor(() => expect(deleteThread).toHaveBeenCalledWith('thread-live'));
+  });
+
   it('turns off auto-capitalization for admin and pairing inputs', async () => {
     vi.stubGlobal(
       'fetch',
