@@ -1311,26 +1311,32 @@ function createApp(
     if (options.mirror?.getPendingApprovalRequests && options.mirror.respondToApproval) {
       const pending = options.mirror.getPendingApprovalRequests(threadId);
       for (const request of pending) {
+        // Empty answers map / cancel / decline — these all tell Codex "the user
+        // is opting out", which lets it abort the turn cleanly.
+        const declineResponse: unknown =
+          request.method === 'item/tool/requestUserInput'
+            ? { answers: {} }
+            : request.method === 'mcpServer/elicitation/request'
+              ? { action: 'cancel', content: null, _meta: null }
+              : 'decline';
         try {
-          if (request.method === 'item/tool/requestUserInput') {
-            // Empty answers map = "user skipped"; Codex aborts the turn cleanly.
-            await options.mirror.respondToApproval(threadId, request.id, request.method, {
-              answers: {}
-            });
-          } else if (request.method === 'mcpServer/elicitation/request') {
-            await options.mirror.respondToApproval(threadId, request.id, request.method, {
-              action: 'cancel',
-              content: null,
-              _meta: null
-            });
-          } else {
-            await options.mirror.respondToApproval(
-              threadId,
-              request.id,
-              request.method,
-              'decline'
-            );
-          }
+          // Wrap in runWithFollowerOwnership so the helper opens / waits for
+          // desktop ownership of the thread before sending the decline. Without
+          // this, follower IPC fails with `thread_unavailable` for unowned
+          // threads, the pre-decline is skipped, and turn/interrupt then queues
+          // behind the unresolved approval — leaving Stop ineffective.
+          await runWithFollowerOwnership(
+            () =>
+              options.mirror!.respondToApproval!(
+                threadId,
+                request.id,
+                request.method,
+                declineResponse
+              ),
+            options.opener,
+            threadId,
+            options.mirror
+          );
         } catch (declineError) {
           debugLog('[stop] failed to decline pending request before interrupting', {
             threadId,
@@ -1384,9 +1390,11 @@ function createApp(
 
     const threadId = context.req.param('threadId');
     try {
+      // archiveThread emits a `thread/remove` live event; the appServer
+      // onLiveEvent listener (set up below) re-broadcasts that to clients,
+      // so we don't broadcast it explicitly here to avoid duplicate events.
       await options.appServer.archiveThread(threadId);
       forgetThread(threadId);
-      hub.broadcast({ type: 'thread/remove', payload: { threadId } });
       return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -1724,12 +1732,22 @@ function createApp(
   });
   const detachMirrorPendingApprovals = options.mirror?.onPendingApprovalsChange?.((event) => {
     hub.broadcast({ type: 'thread/pending-approvals/changed', payload: event });
-    if (event.requests.length > 0) {
-      hub.broadcast({
-        type: 'thread/status/changed',
-        payload: { threadId: event.threadId, status: 'waiting_approval' }
-      });
-    }
+    // Always emit a status update — when approvals clear we have to actively
+    // move the thread out of `waiting_approval`, otherwise the tablet keeps
+    // showing the badge until the next poll. Use the same in-memory live
+    // signals that applyAppServerLiveThreadStatus uses on reconcile.
+    const status: Thread['status'] =
+      event.requests.length > 0
+        ? 'waiting_approval'
+        : options.appServer?.isThreadCompacting?.(event.threadId)
+          ? 'compacting'
+          : options.appServer?.isThreadStreaming?.(event.threadId)
+            ? 'running'
+            : 'idle';
+    hub.broadcast({
+      type: 'thread/status/changed',
+      payload: { threadId: event.threadId, status }
+    });
   });
   void options.appServer?.ensureConnected?.()
     .catch(() => undefined)
@@ -2519,7 +2537,11 @@ function applyMirrorApprovalState(
   threadId: string,
   mirror: CodexMirrorBridge | undefined
 ): ThreadTranscript {
-  if (!mirror?.isThreadWaitingForApproval?.(threadId)) {
+  // Only trust mirror approval state when the IPC mirror is currently
+  // connected. The mirror's in-memory map only clears on dispose, so after a
+  // desktop disconnect a stale entry could otherwise pin the transcript to
+  // `waiting_on_approval` even though Codex has long since moved on.
+  if (!mirror?.isConnected() || !mirror.isThreadWaitingForApproval?.(threadId)) {
     return transcript;
   }
   return ThreadTranscriptSchema.parse({

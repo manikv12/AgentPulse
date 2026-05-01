@@ -254,7 +254,7 @@ describe('Agent Pulse tablet UI', () => {
       messages: []
     }));
     const deleteThread = vi.fn(async () => undefined);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(
       <ThreadView
@@ -274,6 +274,7 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Delete thread' }));
 
     await waitFor(() => expect(deleteThread).toHaveBeenCalledWith('thread-live'));
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/delete this thread/i));
   });
 
   it('turns off auto-capitalization for admin and pairing inputs', async () => {
