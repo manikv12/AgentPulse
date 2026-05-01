@@ -1,4 +1,6 @@
 import {
+  AGENT_PROVIDERS,
+  HelperHealthSchema,
   LiveEventSchema,
   ThreadSchema,
   ThreadTranscriptSchema,
@@ -7,6 +9,7 @@ import {
   type CatalogPlugin,
   type CatalogSkill,
   type CollaborationModeKind,
+  type AgentProvider,
   type HelperHealth,
   type LiveEvent,
   type PairingDeviceOption,
@@ -18,6 +21,7 @@ import {
 } from '@agent-pulse/shared';
 import {
   AlertTriangle,
+  Bot,
   CheckCircle2,
   Cloud,
   Copy,
@@ -75,12 +79,14 @@ import {
   startThread,
   stopThreadWork,
   updateRemoteAccess,
+  updateEnabledProviders,
   updateThreadModel,
   AgentPulseApiError,
   type AgentPulseSession
 } from './api';
-import { CodexMark } from './CodexMark';
+import { AppMark } from './AppMark';
 import { Dashboard, type NewThreadTarget } from './Dashboard';
+import { providerLabel, providerTone } from './providers';
 import { useThemePreference, type ThemePreference } from './theme';
 
 type AppScreen =
@@ -172,7 +178,7 @@ function transcriptShowsLiveActive(transcript: ThreadTranscript): boolean {
   if (
     transcript.activeTurnId?.startsWith(MIRROR_STREAMING_TURN_PREFIX) ||
     (transcript.sendState.reason === 'thread_changed' &&
-      transcript.sendState.label === 'Codex is working')
+      transcript.sendState.label.endsWith(' is working'))
   ) {
     return true;
   }
@@ -484,6 +490,36 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
       turnId: stringField(params, 'turnId')
     };
   }
+  if (method === 'claudeCode/canUseTool') {
+    const params = recordFromUnknown(req.params) ?? {};
+    const toolName = stringField(params, 'toolName');
+    return {
+      id,
+      method,
+      kind: 'commandApproval',
+      title: stringField(params, 'title') ?? (toolName ? `Allow ${toolName}?` : 'Claude needs approval'),
+      body: describeClaudeToolApproval(params),
+      availableDecisions: optionalArrayField(params, 'availableDecisions'),
+      itemId: stringField(params, 'toolUseId'),
+      turnId: stringField(params, 'turnId')
+    };
+  }
+  if (method === 'claudeCode/elicitation') {
+    const params = recordFromUnknown(req.params) ?? {};
+    const title =
+      stringField(params, 'message') ??
+      stringField(params, 'title') ??
+      'Claude needs more information';
+    return {
+      id,
+      method,
+      kind: 'mcpElicitationApproval',
+      title,
+      body: describeClaudeElicitation(params),
+      availableDecisions: optionalArrayField(params, 'availableDecisions'),
+      turnId: stringField(params, 'turnId')
+    };
+  }
   if (method === 'mcpServer/elicitation/request') {
     const params = recordFromUnknown(req.params) ?? {};
     const title = stringField(params, 'message')?.trim() || 'Codex needs approval';
@@ -552,6 +588,45 @@ function describeApplyPatchApproval(params: Record<string, unknown>): string | u
   return lines.length > 0 ? lines.join('\n') : undefined;
 }
 
+function describeClaudeToolApproval(params: Record<string, unknown>): string | undefined {
+  const lines: string[] = [];
+  const toolName = stringField(params, 'toolName') ?? stringField(params, 'title');
+  if (toolName) {
+    lines.push(`Tool: ${toolName}`);
+  }
+  const message = stringField(params, 'message');
+  if (message) {
+    lines.push(`Reason: ${message}`);
+  }
+  const mode = stringField(params, 'mode');
+  if (mode) {
+    lines.push(`Mode: ${mode}`);
+  }
+  const input = recordFromUnknown(params.input);
+  if (input && Object.keys(input).length > 0) {
+    lines.push(`Input:\n${compactJSON(input)}`);
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined;
+}
+
+function describeClaudeElicitation(params: Record<string, unknown>): string | undefined {
+  const lines: string[] = [];
+  const title = stringField(params, 'title');
+  const message = stringField(params, 'message');
+  if (title && title !== message) {
+    lines.push(title);
+  }
+  const url = stringField(params, 'url');
+  if (url) {
+    lines.push(`URL: ${url}`);
+  }
+  const schema = recordFromUnknown(params.requestedSchema);
+  if (schema && Object.keys(schema).length > 0) {
+    lines.push(`Requested input:\n${compactJSON(schema)}`);
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined;
+}
+
 function describeMcpElicitation(params: Record<string, unknown>): string | undefined {
   const metadata = recordFromUnknown(params._meta);
   const toolParams = recordFromUnknown(metadata?.tool_params);
@@ -583,6 +658,15 @@ function humanizeIdentifier(value: string | undefined): string | undefined {
     return undefined;
   }
   return cleaned.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function compactJSON(value: unknown): string {
+  try {
+    const text = JSON.stringify(value, null, 2);
+    return text.length > 1200 ? `${text.slice(0, 1197)}...` : text;
+  } catch {
+    return String(value);
+  }
 }
 
 function applyPendingRequestPatches(
@@ -1230,16 +1314,11 @@ export function App() {
         return;
       }
 
-      markThreadReady(transcript.threadId);
-      setThreads((current) =>
-        current.map((thread) =>
-          thread.threadId === transcript.threadId && threadStatusLooksWorking(thread.status)
-            ? { ...thread, status: 'idle' as const }
-            : thread
-        )
-      );
+      // A plain ready transcript can be stale while Codex is still running.
+      // OpenAssist keeps active-turn state separate from transcript reads; do
+      // the same here and let explicit status/stream completion clear working.
     },
-    [markThreadReady, markThreadWorking]
+    [markThreadWorking]
   );
 
   const syncWorkingStateFromThreads = useCallback((nextThreads: Thread[]) => {
@@ -1649,7 +1728,7 @@ export function App() {
         const liveEvent = parsed.data as LiveEvent;
 
         if (liveEvent.type === 'health/changed') {
-          setHealth(liveEvent.payload);
+          setHealth(HelperHealthSchema.parse(liveEvent.payload));
         }
 
         if (liveEvent.type === 'thread/upsert') {
@@ -2005,7 +2084,7 @@ export function App() {
         return next;
       });
       setActiveThreadId((current) => (current === threadId ? undefined : current));
-      setMessage('Thread deleted from Codex.');
+      setMessage('Thread removed.');
     },
     [session]
   );
@@ -2119,6 +2198,13 @@ export function App() {
           onChangeThreadModel={
             session
               ? async (threadId: string, modelSlug: string, reasoningEffort?: string) => {
+                  const previousModel = threadModels[threadId];
+                  const hadPreviousModel = Object.prototype.hasOwnProperty.call(threadModels, threadId);
+                  const previousReasoningEffort = threadReasoningEfforts[threadId];
+                  const hadPreviousReasoningEffort = Object.prototype.hasOwnProperty.call(
+                    threadReasoningEfforts,
+                    threadId
+                  );
                   // Record the pick BEFORE the network call so any transcript broadcast that
                   // races back doesn't briefly flip the chip back to the old selection.
                   userModelPicksRef.current.set(threadId, {
@@ -2140,7 +2226,30 @@ export function App() {
                       return next;
                     });
                   }
-                  await updateThreadModel(session, threadId, modelSlug, reasoningEffort);
+                  try {
+                    await updateThreadModel(session, threadId, modelSlug, reasoningEffort);
+                  } catch (error) {
+                    userModelPicksRef.current.delete(threadId);
+                    setThreadModels((current) => {
+                      const next = { ...current };
+                      if (hadPreviousModel && previousModel) {
+                        next[threadId] = previousModel;
+                      } else {
+                        delete next[threadId];
+                      }
+                      return next;
+                    });
+                    setThreadReasoningEfforts((current) => {
+                      const next = { ...current };
+                      if (hadPreviousReasoningEffort && previousReasoningEffort) {
+                        next[threadId] = previousReasoningEffort;
+                      } else {
+                        delete next[threadId];
+                      }
+                      return next;
+                    });
+                    throw error;
+                  }
                 }
               : undefined
           }
@@ -2212,7 +2321,7 @@ function ChooserScreen({
   return (
     <main className="shell centered-shell">
       <div className="surface-panel chooser-panel">
-        <CodexMark size="lg" />
+        <AppMark size="lg" />
         <p className="eyebrow">Agent Pulse</p>
         <h1>How will you use this?</h1>
         <p className="simple-copy">
@@ -2298,7 +2407,7 @@ function PairingScreen({
   return (
     <main className="shell centered-shell">
       <div className="surface-panel pairing-panel">
-        <CodexMark size="lg" />
+        <AppMark size="lg" />
         <p className="eyebrow">Connect a device</p>
         <h1>Pair this display</h1>
         <p className="simple-copy">Enter the PIN shown in admin mode on your Mac.</p>
@@ -2403,7 +2512,7 @@ function AdminLoginScreen({
   return (
     <main className="shell centered-shell">
       <div className="surface-panel pairing-panel">
-        <CodexMark size="lg" />
+        <AppMark size="lg" />
         <p className="eyebrow">Admin mode</p>
         <h1>Enter passcode</h1>
         <p className="simple-copy">
@@ -2502,6 +2611,7 @@ function SettingsScreen({
   const [pinExpiresAt, setPinExpiresAt] = useState<string | undefined>();
   const [lanEnabled, setLanEnabled] = useState(false);
   const [mobileSendEnabled, setMobileSendEnabled] = useState(false);
+  const [enabledProviders, setEnabledProviders] = useState<AgentProvider[]>(() => [...AGENT_PROVIDERS]);
   const [remoteAccess, setRemoteAccess] = useState<RemoteAccessSettings>(() => defaultRemoteAccess());
   const [devices, setDevices] = useState<AdminDevice[]>([]);
   const [selectedPairDeviceId, setSelectedPairDeviceId] = useState('');
@@ -2520,6 +2630,7 @@ function SettingsScreen({
       .then((payload) => {
         setLanEnabled(Boolean(payload.settings?.lanEnabled));
         setMobileSendEnabled(Boolean(payload.settings?.mobileSendEnabled));
+        setEnabledProviders(normalizeEnabledProvidersForUi(payload.settings?.enabledProviders));
         const nextRemote = payload.settings?.remoteAccess ?? defaultRemoteAccess();
         setRemoteAccess(nextRemote);
         const activeDevices = activeAdminDevices(payload.devices ?? []);
@@ -2582,6 +2693,21 @@ function SettingsScreen({
     });
   };
 
+  const toggleProvider = async (provider: AgentProvider) => {
+    const isEnabled = enabledProviders.includes(provider);
+    const nextProviders = isEnabled
+      ? enabledProviders.filter((candidate) => candidate !== provider)
+      : [...enabledProviders, provider];
+    const normalized = normalizeEnabledProvidersForUi(nextProviders);
+    setEnabledProviders(normalized);
+    try {
+      const nextSettings = await updateEnabledProviders(adminToken, normalized);
+      setEnabledProviders(normalizeEnabledProvidersForUi(nextSettings.enabledProviders));
+    } catch {
+      setEnabledProviders(enabledProviders);
+    }
+  };
+
   const refreshRemoteAccess = async () => {
     const next = await checkRemoteAccess(adminToken);
     setRemoteAccess(next);
@@ -2625,7 +2751,7 @@ function SettingsScreen({
     <main className="shell settings-shell">
       <header className="topbar">
         <div className="brand-lockup">
-          <CodexMark size="md" />
+          <AppMark size="md" />
           <div>
             <p className="eyebrow">Admin mode</p>
             <h1>Agent Pulse settings</h1>
@@ -2676,7 +2802,7 @@ function SettingsScreen({
           />
           <SettingRow
             title="Mobile chat"
-            description="Let paired devices send text into existing Codex threads."
+            description="Let paired devices send text into existing agent threads."
             status={mobileSendEnabled ? 'Enabled' : 'Off'}
             tone={mobileSendEnabled ? 'blue' : 'gray'}
             action={
@@ -2695,6 +2821,10 @@ function SettingsScreen({
                 {remoteAccess.enabled ? 'Turn off remote access' : 'Turn on remote access'}
               </button>
             }
+          />
+          <AgentProviderSettings
+            enabledProviders={enabledProviders}
+            onToggle={(provider) => void toggleProvider(provider)}
           />
         </section>
 
@@ -3119,6 +3249,49 @@ function SettingRow({
   );
 }
 
+function AgentProviderSettings({
+  enabledProviders,
+  onToggle
+}: {
+  enabledProviders: AgentProvider[];
+  onToggle: (provider: AgentProvider) => void;
+}) {
+  return (
+    <div className="agent-provider-settings">
+      <div className="setting-row-title">
+        <h3>Enabled agents</h3>
+        <span className="status-chip tone-blue">{enabledProviders.length} active</span>
+      </div>
+      <p>Choose which agents appear in folders, thread lists, and model menus.</p>
+      <div className="agent-provider-toggle-row">
+        {AGENT_PROVIDERS.map((provider) => {
+          const enabled = enabledProviders.includes(provider);
+          const lockedOn = enabled && enabledProviders.length === 1;
+          return (
+            <button
+              key={provider}
+              className={`agent-provider-toggle provider-${providerTone(provider)} ${enabled ? 'is-enabled' : ''}`}
+              type="button"
+              onClick={() => onToggle(provider)}
+              disabled={lockedOn}
+              aria-pressed={enabled}
+              title={lockedOn ? 'At least one agent must stay on' : undefined}
+            >
+              <span className="agent-provider-toggle-icon">
+                <Bot size={16} />
+              </span>
+              <span>
+                <strong>{providerLabel(provider)}</strong>
+                <small>{enabled ? 'On' : 'Off'}</small>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function SettingsStat({
   label,
   value,
@@ -3134,6 +3307,17 @@ function SettingsStat({
       <strong>{value}</strong>
     </div>
   );
+}
+
+function normalizeEnabledProvidersForUi(input: unknown): AgentProvider[] {
+  if (!Array.isArray(input)) {
+    return [...AGENT_PROVIDERS];
+  }
+  const providers = input.filter((provider): provider is AgentProvider =>
+    (AGENT_PROVIDERS as readonly string[]).includes(String(provider))
+  );
+  const uniqueProviders = [...new Set(providers)];
+  return uniqueProviders.length > 0 ? uniqueProviders : [...AGENT_PROVIDERS];
 }
 
 function activeAdminDevices(devices: AdminDevice[]): AdminDevice[] {

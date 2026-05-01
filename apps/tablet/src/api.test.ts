@@ -5,6 +5,7 @@ import {
   fetchProjects,
   checkRemoteAccess,
   updateRemoteAccess,
+  updateEnabledProviders,
   fetchThreadTranscript,
   getFingerprint,
   deleteThread,
@@ -136,6 +137,29 @@ describe('tablet API helpers', () => {
     expect(JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string)).toMatchObject({
       enabled: true,
       tunnelProtocol: 'http2'
+    });
+  });
+
+  it('updates enabled agent providers through admin routes', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe('/settings/providers');
+      expect(JSON.parse(init?.body as string)).toEqual({ enabledProviders: ['claude-code'] });
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          settings: {
+            enabledProviders: ['claude-code'],
+            lanEnabled: false,
+            mobileSendEnabled: true
+          }
+        })
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(updateEnabledProviders('admin-token', ['claude-code'])).resolves.toMatchObject({
+      enabledProviders: ['claude-code']
     });
   });
 

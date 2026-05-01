@@ -19,6 +19,7 @@ import {
   ChevronUp,
   ExternalLink,
   FileEdit,
+  ImagePlus,
   Info,
   ListChecks,
   Menu,
@@ -42,9 +43,24 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { TranscriptFetchTimeoutError, type FetchThreadTranscriptOptions } from './api';
-import { CodexMark } from './CodexMark';
 import { MentionPicker, type MentionItem, type MentionTrigger } from './MentionPicker';
+import { ProviderMark } from './ProviderMark';
+import {
+  groupModelsForPicker,
+  normalizeProviderModelSlug,
+  providerForModel,
+  providerForThread,
+  providerLabel,
+  providerTone,
+  type ProviderTone
+} from './providers';
 import { Spinner } from './Spinner';
+import {
+  buildRenderableEntries,
+  type ActivityDetailSection as ActivityDetailSectionModel,
+  type ActivityGroup,
+  type ActivityGroupItem
+} from './threadRendering';
 
 const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 40;
 const VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT = 2;
@@ -88,6 +104,8 @@ export type ApprovalMethodForUi =
   | 'item/permissions/requestApproval'
   | 'execCommandApproval'
   | 'applyPatchApproval'
+  | 'claudeCode/canUseTool'
+  | 'claudeCode/elicitation'
   | 'item/tool/requestUserInput'
   | 'item/plan/requestImplementation'
   | 'mcpServer/elicitation/request';
@@ -189,14 +207,6 @@ function truncate(input: string, max: number): string {
   return input.length > max ? `${input.slice(0, max - 1).trimEnd()}…` : input;
 }
 
-function formatCommandSummary(text: string): string {
-  const oneLine = text.replace(/\s+/g, ' ').trim();
-  const stripped = oneLine
-    .replace(/^\/bin\/(?:ba|z)?sh\s+-l?c\s+/, '')
-    .replace(/^["']|["']$/g, '');
-  return truncate(stripped, 90);
-}
-
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 type ActivityKind = ChatMessage['kind'];
@@ -210,83 +220,6 @@ const ACTIVITY_ICONS: Record<ActivityKind, LucideIcon> = {
   tool: Wrench,
   status: Info
 };
-
-type RenderableEntry =
-  | { type: 'message'; message: ChatMessage }
-  | { type: 'event'; message: ChatMessage }
-  | {
-      type: 'work';
-      id: string;
-      messages: ChatMessage[];
-      startedAt?: string;
-      endedAt?: string;
-    };
-
-function buildRenderableEntries(messages: ChatMessage[]): RenderableEntry[] {
-  const result: RenderableEntry[] = [];
-  let turnBuffer: ChatMessage[] = [];
-
-  const flushTurn = () => {
-    if (turnBuffer.length === 0) {
-      return;
-    }
-
-    const finalIndex = findFinalResponseIndex(turnBuffer);
-    const finalMessage = finalIndex >= 0 ? turnBuffer[finalIndex]! : null;
-    const workMessages = finalMessage
-      ? turnBuffer.filter((_, index) => index !== finalIndex)
-      : turnBuffer.slice();
-
-    if (workMessages.length > 0) {
-      const startedAt = workMessages[0]?.createdAt;
-      const endedAt = finalMessage?.createdAt ?? workMessages[workMessages.length - 1]?.createdAt;
-      result.push({
-        type: 'work',
-        id: `work-${workMessages[0]?.id ?? result.length}`,
-        messages: workMessages,
-        startedAt,
-        endedAt
-      });
-    }
-
-    if (finalMessage) {
-      result.push({ type: 'message', message: finalMessage });
-    }
-
-    turnBuffer = [];
-  };
-
-  for (const message of messages) {
-    if (message.role === 'user') {
-      flushTurn();
-      result.push({ type: 'message', message });
-      continue;
-    }
-
-    turnBuffer.push(message);
-  }
-
-  flushTurn();
-  return result;
-}
-
-function findFinalResponseIndex(messages: ChatMessage[]): number {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]!;
-    if (message.role === 'assistant' && message.phase === 'final_answer' && message.text.trim()) {
-      return index;
-    }
-  }
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]!;
-    if (message.role === 'assistant' && message.phase !== 'commentary' && message.text.trim()) {
-      return index;
-    }
-  }
-
-  return -1;
-}
 
 function splitTranscriptForScrollback(
   transcript: ThreadTranscript,
@@ -364,6 +297,39 @@ function mergeMessagesById(current: ChatMessage[], additions: ChatMessage[]): Ch
     next.push(message);
   }
   return next;
+}
+
+function captureScrollAnchor(node: HTMLDivElement): { element: HTMLElement; top: number } | null {
+  const containerTop = node.getBoundingClientRect().top;
+  const anchors = node.querySelectorAll<HTMLElement>('[data-scroll-anchor="true"]');
+  let closestBelowTop: { element: HTMLElement; top: number } | null = null;
+
+  for (const element of anchors) {
+    const rect = element.getBoundingClientRect();
+    if (rect.bottom < containerTop) {
+      continue;
+    }
+    if (rect.top >= containerTop) {
+      return { element, top: rect.top };
+    }
+    closestBelowTop = { element, top: rect.top };
+  }
+
+  return closestBelowTop;
+}
+
+function restoreScrollAnchor(
+  node: HTMLDivElement,
+  anchor: { element: HTMLElement; top: number } | null,
+  fallbackScrollHeightMinusTop: number
+) {
+  if (anchor && node.contains(anchor.element)) {
+    const nextTop = anchor.element.getBoundingClientRect().top;
+    node.scrollTop += nextTop - anchor.top;
+    return;
+  }
+
+  node.scrollTop = node.scrollHeight - fallbackScrollHeightMinusTop;
 }
 
 type PendingChatMessage = ChatMessage & {
@@ -500,85 +466,97 @@ function MessageAttachments({
   );
 }
 
-function EventRow({
-  message,
-  plugins = []
+function ActivityDetailSections({ sections }: { sections: ActivityDetailSectionModel[] }) {
+  if (sections.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="codex-activity-detail-sections">
+      {sections.map((section) => (
+        <section key={section.id} className="codex-activity-detail-section">
+          <h4>{section.title}</h4>
+          {section.code ? (
+            <pre className="codex-activity-detail-code">{section.body}</pre>
+          ) : (
+            <MessageMarkdown text={section.body} />
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function ActivityRow({
+  item,
+  plugins = [],
+  isLatestRunningActivity = false
 }: {
-  message: ChatMessage;
+  item: ActivityGroupItem;
   plugins?: CatalogPlugin[];
+  isLatestRunningActivity?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const Icon = ACTIVITY_ICONS[message.kind];
+  const message = item.message;
+  const Icon = ACTIVITY_ICONS[message.kind] ?? Info;
   const matchedPlugin = useMemo(() => {
     if (message.kind !== 'tool') {
       return undefined;
     }
     return matchPluginFromToolText(message.text, plugins);
   }, [message.kind, message.text, plugins]);
+  const hasAttachments = Boolean(message.attachments?.length);
+  const canExpand = item.detailSections.length > 0 || hasAttachments;
+  const isRunning = item.status === 'running' && isLatestRunningActivity;
 
-  const labelNode = useMemo(() => {
-    switch (message.kind) {
-      case 'command': {
-        const summary = formatCommandSummary(message.text);
-        return <code>{summary}</code>;
-      }
-      case 'file':
-      case 'tool':
-      case 'status': {
-        return <span>{truncate(message.text.replace(/\s+/g, ' ').trim(), 90)}</span>;
-      }
-      case 'message': {
-        const firstLine = message.text.split('\n').find((l) => l.trim().length > 0) ?? '';
-        return <span>{truncate(firstLine.trim(), 90) || 'Agent update'}</span>;
-      }
-      case 'reasoning': {
-        const firstLine = message.text.split('\n').find((l) => l.trim().length > 0) ?? '';
-        return <span>{truncate(firstLine.trim(), 80) || 'Thought'}</span>;
-      }
-      default: {
-        return <span>{truncate(message.text.replace(/\s+/g, ' ').trim(), 90)}</span>;
-      }
-    }
-  }, [message.kind, message.text]);
-
-  return (
-    <div className="codex-event">
-      <button
-        type="button"
-        className="codex-event-row"
-        onClick={() => setExpanded((prev) => !prev)}
-        aria-expanded={expanded}
-      >
-        <span className="codex-event-icon" aria-hidden="true">
-          {matchedPlugin?.iconUrl ? (
-            <img
-              className="codex-event-plugin-icon"
-              src={matchedPlugin.iconUrl}
-              alt=""
-            />
-          ) : (
-            <Icon size={13} />
-          )}
-        </span>
-        <span className="codex-event-text">
-          {matchedPlugin ? (
-            <span className="codex-event-plugin-name">{matchedPlugin.displayName}</span>
+  const rowContent = (
+    <>
+      <span className={`codex-activity-icon kind-${item.kind}`} aria-hidden="true">
+        {matchedPlugin?.iconUrl ? (
+          <img className="codex-activity-plugin-icon" src={matchedPlugin.iconUrl} alt="" />
+        ) : (
+          <Icon size={14} />
+        )}
+      </span>
+      <span className="codex-activity-copy">
+        <span className="codex-activity-title-line">
+          <span className="codex-activity-title">{matchedPlugin?.displayName ?? item.title}</span>
+          {matchedPlugin?.displayName && item.title !== 'Used tool' ? (
+            <span className="codex-activity-target-pill">{item.title}</span>
           ) : null}
-          {labelNode}
         </span>
+        {item.detail ? <span className="codex-activity-detail">{item.detail}</span> : null}
+      </span>
+      {item.statusLabel ? (
+        <span className={`codex-activity-status is-${item.status}`}>{item.statusLabel}</span>
+      ) : null}
+      {canExpand ? (
         <ChevronDown
-          size={12}
-          className={`codex-event-chevron ${expanded ? 'is-open' : ''}`}
+          size={13}
+          className={`codex-activity-row-chevron ${expanded ? 'is-open' : ''}`}
           aria-hidden="true"
         />
-      </button>
+      ) : null}
+    </>
+  );
+
+  return (
+    <div className={`codex-activity-row-wrap ${expanded ? 'is-expanded' : ''}`}>
+      {canExpand ? (
+        <button
+          type="button"
+          className={`codex-activity-row ${isRunning ? 'is-running' : ''}`}
+          onClick={() => setExpanded((current) => !current)}
+          aria-expanded={expanded}
+        >
+          {rowContent}
+        </button>
+      ) : (
+        <div className={`codex-activity-row ${isRunning ? 'is-running' : ''}`}>{rowContent}</div>
+      )}
       {expanded ? (
-        <div className="codex-event-detail">
-          {message.kind === 'message' ? (
-            <MessageMarkdown text={message.text} />
-          ) : (
-            <pre className="codex-event-body">{message.text}</pre>
-          )}
+        <div className="codex-activity-row-details">
+          <ActivityDetailSections sections={item.detailSections} />
           <MessageAttachments attachments={message.attachments} compact />
         </div>
       ) : null}
@@ -586,95 +564,117 @@ function EventRow({
   );
 }
 
-function WorkGroup({
-  messages,
-  startedAt,
-  endedAt,
-  plugins = [],
-  isLatest = false,
-  isAgentWorking = false
+function ActivitySummaryRow({
+  group,
+  expanded,
+  isLive,
+  onToggle
 }: {
-  messages: ChatMessage[];
-  startedAt?: string;
-  endedAt?: string;
-  plugins?: CatalogPlugin[];
-  isLatest?: boolean;
-  isAgentWorking?: boolean;
+  group: ActivityGroup;
+  expanded: boolean;
+  isLive: boolean;
+  onToggle: () => void;
 }) {
-  // Auto-expand the latest work group while the agent is actively working so the user
-  // can watch progress without having to click. Once the turn finishes (or this stops
-  // being the latest group because a new turn started), auto-collapse it.
-  //
-  // Manual-override sticky: once the user clicks the toggle, their choice wins for the
-  // rest of this component's lifetime. Without this, the auto-expand effect would slam
-  // the group back open each render if the user collapsed it mid-turn.
-  const autoExpand = isLatest && isAgentWorking;
-  const [expanded, setExpanded] = useState(autoExpand);
+  return (
+    <button
+      type="button"
+      className={`codex-activity-summary-toggle ${isLive ? 'is-live' : ''}`}
+      onClick={onToggle}
+      aria-expanded={expanded}
+    >
+      <ChevronDown
+        size={14}
+        className={`codex-activity-summary-chevron ${expanded ? 'is-open' : ''}`}
+        aria-hidden="true"
+      />
+      <span className="codex-activity-summary-text">{group.title}</span>
+      {group.durationLabel && group.durationLabel !== group.title ? (
+        <span className="codex-activity-summary-meta">{group.durationLabel}</span>
+      ) : null}
+      {group.imageCount > 0 ? (
+        <span className="codex-activity-summary-meta">
+          {group.imageCount} screenshot{group.imageCount === 1 ? '' : 's'}
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
+function ActivityGroupRow({
+  group,
+  plugins = [],
+  providerToneName = 'codex',
+  isLatest = false
+}: {
+  group: ActivityGroup;
+  plugins?: CatalogPlugin[];
+  providerToneName?: ProviderTone;
+  isLatest?: boolean;
+}) {
+  const isLive = group.status === 'running' && isLatest;
+  const [expanded, setExpanded] = useState(isLive);
   const userToggledRef = useRef(false);
+  const lastStatusRef = useRef(group.status);
 
   useEffect(() => {
-    if (userToggledRef.current) {
+    if (lastStatusRef.current !== group.status) {
+      userToggledRef.current = false;
+      lastStatusRef.current = group.status;
+    }
+
+    if (isLive) {
+      setExpanded(true);
       return;
     }
-    setExpanded(autoExpand);
-  }, [autoExpand]);
+
+    if (!userToggledRef.current) {
+      setExpanded(false);
+    }
+  }, [group.id, group.status, isLive]);
 
   const handleToggle = () => {
-    userToggledRef.current = true;
+    if (!isLive) {
+      userToggledRef.current = true;
+    }
     setExpanded((previous) => !previous);
   };
 
-  const label = useMemo(() => formatWorkLabel(messages, startedAt, endedAt), [
-    endedAt,
-    messages,
-    startedAt
-  ]);
-  const imageCount = messages.reduce((count, message) => count + (message.attachments?.length ?? 0), 0);
+  const latestRunningItemId = useMemo(() => {
+    for (let index = group.items.length - 1; index >= 0; index -= 1) {
+      const item = group.items[index]!;
+      if (item.status === 'running') {
+        return item.id;
+      }
+    }
+    return undefined;
+  }, [group.items]);
 
   return (
-    <section className={`codex-work-group ${expanded ? 'is-open' : ''}`}>
-      <button
-        type="button"
-        className="codex-work-toggle"
-        onClick={handleToggle}
-        aria-expanded={expanded}
-      >
-        <span>{label}</span>
-        <ChevronDown
-          size={14}
-          className={`codex-work-chevron ${expanded ? 'is-open' : ''}`}
-          aria-hidden="true"
-        />
-        {imageCount > 0 ? (
-          <span className="codex-work-meta">
-            {imageCount} screenshot{imageCount === 1 ? '' : 's'}
-          </span>
-        ) : null}
-      </button>
+    <section
+      className={`codex-activity-group provider-${providerToneName} ${expanded ? 'is-expanded' : ''} ${isLive ? 'is-live' : ''}`}
+      data-activity-status={group.status}
+      data-scroll-anchor="true"
+    >
+      <ActivitySummaryRow
+        group={group}
+        expanded={expanded}
+        isLive={isLive}
+        onToggle={handleToggle}
+      />
       {expanded ? (
-        <div className="codex-work-body">
-          {messages.map((message) => (
-            <EventRow key={message.id} message={message} plugins={plugins} />
+        <div className="codex-activity-group-items">
+          {group.items.map((item) => (
+            <ActivityRow
+              key={item.id}
+              item={item}
+              plugins={plugins}
+              isLatestRunningActivity={isLive && item.id === latestRunningItemId}
+            />
           ))}
         </div>
       ) : null}
     </section>
   );
-}
-
-function formatWorkLabel(messages: ChatMessage[], startedAt?: string, endedAt?: string): string {
-  const first = Date.parse(startedAt ?? messages[0]?.createdAt ?? '');
-  const last = Date.parse(endedAt ?? messages[messages.length - 1]?.createdAt ?? '');
-  if (Number.isFinite(first) && Number.isFinite(last) && last > first) {
-    const seconds = Math.round((last - first) / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    if (minutes > 0) {
-      return `Worked for ${minutes}m ${remainingSeconds}s`;
-    }
-    return `Worked for ${seconds}s`;
-  }
-  return `Agent work · ${messages.length} update${messages.length === 1 ? '' : 's'}`;
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -719,6 +719,7 @@ export function ThreadView({
   const [modelUpdating, setModelUpdating] = useState(false);
   const [collaborationMode, setCollaborationMode] =
     useState<CollaborationModeKind>('default');
+  const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   // Optimistic local copies of just-sent user messages. These get merged into `renderable`
   // immediately on send so the chat shows the bubble without waiting for the round-trip
   // transcript fetch (which can lag several seconds while Codex is streaming the reply).
@@ -742,10 +743,8 @@ export function ThreadView({
   const loadingOlderRef = useRef(false);
   const olderWheelPullRef = useRef(0);
   const olderTouchStartYRef = useRef<number | null>(null);
-  // After the first transcript paint for a thread, we scroll the latest user message to
-  // the top of the viewport so the user sees their question, the agent work group, and
-  // the final response in reading order. This ref guards that one-shot positioning so
-  // later transcript updates (live streams, polls) don't yank the scroll back.
+  // After the first transcript paint for a thread, we pin to the bottom like OpenAssist.
+  // Later stream updates only follow when the user is still near the bottom.
   const hasPositionedInitialRef = useRef(false);
   // Pending bubbles change on every send/confirm. We track them in a ref so
   // applyTranscriptWindow can ask "is there a pending message that the transcript
@@ -763,6 +762,27 @@ export function ThreadView({
   // first message the user sends would incorrectly be treated as pre-existing
   // history and excluded from the visible tail.
   const sessionBaselineSeededRef = useRef(false);
+  const provider = providerForThread(thread.provider);
+  const providerName = providerLabel(provider);
+  const composerPlugins = provider === 'codex' ? plugins : [];
+  const composerSkills = provider === 'codex' ? skills : [];
+  const composerCommands = provider === 'codex' ? commands : [];
+  const effectiveModelName = modelName || thread.model;
+  const providerModels = useMemo(
+    () => models.filter((model) => providerForModel(model) === provider && model.visibility !== 'hidden'),
+    [models, provider]
+  );
+  const normalizedSelectedModelSlug = normalizeProviderModelSlug(
+    provider,
+    selectedModelSlug ?? effectiveModelName
+  );
+  const canChangeModel = providerModels.length > 0;
+
+  useEffect(() => {
+    if (!canChangeModel && modelPickerOpen) {
+      setModelPickerOpen(false);
+    }
+  }, [canChangeModel, modelPickerOpen]);
 
   const applyTranscriptWindow = (nextTranscript: ThreadTranscript) => {
     // Seed the session baseline from the *first* transcript we ever see for this
@@ -807,6 +827,7 @@ export function ThreadView({
   const hasPendingPermissionRequest = pendingRequests.some(
     (request) => request.kind === 'permissionsApproval'
   );
+  const showContextBar = Boolean(transcript?.usage || provider);
   const threadSaysWaitingApproval =
     thread.status === 'waiting_approval' || sendBlockReason === 'waiting_on_approval';
   const isCompacting =
@@ -814,26 +835,27 @@ export function ThreadView({
   const isWaitingForApproval = hasPendingRequest || threadSaysWaitingApproval;
   const pendingRequestStatus = hasPendingRequest
     ? hasPendingPermissionRequest
-      ? 'Codex needs permission'
+      ? `${providerName} needs permission`
       : pendingRequests.some((request) => request.kind === 'question')
-        ? 'Codex needs an answer'
-        : 'Codex needs approval'
+        ? `${providerName} needs an answer`
+        : `${providerName} needs approval`
     : null;
   const transcriptSaysMirrorWorking = Boolean(
     transcript &&
       !isHardSendBlock &&
       (transcript.activeTurnId?.startsWith(MIRROR_STREAMING_TURN_PREFIX) ||
         (transcript.sendState.reason === 'thread_changed' &&
-          transcript.sendState.label === 'Codex is working'))
+          transcript.sendState.label.endsWith(' is working')))
   );
   const waitingApprovalStatus = pendingRequestStatus
     ? pendingRequestStatus
     : threadSaysWaitingApproval
-      ? 'Codex is waiting for approval'
+      ? `${providerName} is waiting for approval`
       : null;
   const isCodexActive =
     forceWorking || transcriptSaysMirrorWorking || threadSaysWaitingApproval || isCompacting;
   const isAgentWorking = isCodexActive && !isWaitingForApproval;
+  const showStopComposerAction = Boolean(stopWork && isAgentWorking);
   const canUseComposer = Boolean(
     sendMessage &&
       !sending &&
@@ -841,7 +863,7 @@ export function ThreadView({
       (transcript?.sendState.canSend || (isCodexActive && !isHardSendBlock))
   );
   const canSend = Boolean(canUseComposer && trimmedDraft);
-  const effectiveModelName = modelName || thread.model;
+  const displayedModelName = effectiveModelName ? formatModelName(effectiveModelName) : providerName;
   const latestPlanMessage = useMemo(
     () =>
       [...(transcript?.messages ?? [])]
@@ -859,10 +881,10 @@ export function ThreadView({
   );
 
   // Status bar text logic:
-  // - When sending: "Sending to Codex..."
+  // - When sending: "Sending to {provider}..."
   // - When sendState blocks sending: show the explicit reason (e.g. "Approve on Mac to continue")
   //   only for hard blocks that really require the user to wait or use the Mac.
-  // - Else when app-server says the thread is active: "Codex is working"
+  // - Else when the provider says the thread is active: "{provider} is working"
   // - Otherwise: sendState.label (which may be "Ready", "Mobile sending is off on the Mac.", etc.)
   // - If loading and no transcript yet: "Loading conversation..."
   const sendBlockedLabel =
@@ -870,7 +892,7 @@ export function ThreadView({
       ? transcript.sendState.label
       : null;
   const statusText = sending
-    ? 'Sending to Codex...'
+    ? `Sending to ${providerName}...`
     : waitingApprovalStatus
       ? waitingApprovalStatus
       : isCompacting
@@ -880,10 +902,11 @@ export function ThreadView({
       : sendBlockedLabel
         ? sendBlockedLabel
         : isAgentWorking
-          ? 'Codex is working'
-          : transcript?.sendState.label === 'Codex is working'
+          ? ''
+          : transcript?.sendState.label.endsWith(' is working')
             ? 'Ready'
             : transcript?.sendState.label ?? (loading ? 'Loading conversation...' : '');
+  const showStatusText = statusText.trim().length > 0;
 
   const renderable = useMemo(() => {
     const tail = transcript?.messages ?? [];
@@ -907,14 +930,13 @@ export function ThreadView({
     }
     return buildRenderableEntries(combined);
   }, [transcript?.messages, olderMessages, pendingMessages]);
-  // Identify the most recent work group so we can auto-expand it while the agent is
-  // working. Only the latest one — older work groups stay collapsed even when a new
-  // turn fires.
-  const latestWorkGroupId = useMemo(() => {
+  // Identify the latest activity group so live work can stay expanded while older work
+  // stays as a compact OpenAssist-style summary.
+  const latestActivityGroupId = useMemo(() => {
     for (let i = renderable.length - 1; i >= 0; i -= 1) {
       const entry = renderable[i]!;
-      if (entry.type === 'work') {
-        return entry.id;
+      if (entry.type === 'activityGroup') {
+        return entry.group.id;
       }
     }
     return undefined;
@@ -934,8 +956,6 @@ export function ThreadView({
     }
     return total;
   }, [transcript?.messages]);
-  const previousLastMessageIdRef = useRef<string | undefined>(undefined);
-
   // Mirror pendingMessages into a ref so applyTranscriptWindow can read the current
   // pending state without being recreated on every push/confirm.
   useEffect(() => {
@@ -971,17 +991,12 @@ export function ThreadView({
   }, [thread.threadId]);
 
 
-  // Initial-paint positioning + auto-scroll on new messages.
+  // Initial-paint positioning + pinned-bottom live scrolling.
   //
-  // First paint for a thread: scroll the latest user message to the top of the viewport
-  // so the user sees their question, the agent work group, and the final response in
-  // reading order without having to scroll up. Without this, the previous behavior
-  // jumped to the bottom and pushed the user message off-screen on long turns (e.g. a
-  // turn with 179 activity updates).
-  //
-  // After that initial positioning, only auto-scroll to the bottom when the user is
-  // already pinned there — so a streamed token doesn't yank them back down while they
-  // read history.
+  // OpenAssist behavior:
+  // - first paint starts at the bottom;
+  // - live updates keep following only while the user is already near the bottom;
+  // - if the user scrolls up, streamed progress and final collapse do not yank them.
   useEffect(() => {
     const node = messagesRef.current;
     if (!node) {
@@ -992,39 +1007,19 @@ export function ThreadView({
     }
 
     if (!hasPositionedInitialRef.current) {
-      // Find the last user message in the rendered DOM and align it to the top of the
-      // scroll container. Fall back to scrolling to the bottom if there's no user
-      // message yet (empty thread).
-      const userNodes = node.querySelectorAll<HTMLElement>('[data-role="user-message"]');
-      const lastUser = userNodes.length > 0 ? userNodes[userNodes.length - 1]! : null;
-      if (lastUser) {
-        const containerTop = node.getBoundingClientRect().top;
-        const messageTop = lastUser.getBoundingClientRect().top;
-        node.scrollTop = node.scrollTop + (messageTop - containerTop);
-        // The user is reading from the top of their question — they aren't pinned to
-        // the bottom, so live streams shouldn't drag them down.
-        pinnedToBottomRef.current = false;
-      } else {
-        node.scrollTop = node.scrollHeight;
-      }
+      node.scrollTop = node.scrollHeight;
+      pinnedToBottomRef.current = true;
       hasPositionedInitialRef.current = true;
-      previousLastMessageIdRef.current = transcript?.messages.at(-1)?.id;
       return;
     }
 
-    // When a brand-new message lands at the end of the transcript, treat it as
-    // "user just sent / agent just started a new turn" and re-pin to the bottom
-    // so the streaming reply follows the viewport. The scroll handler will flip
-    // pinnedToBottomRef back to false the moment the user scrolls away, so this
-    // doesn't yank them around while they're reading history.
-    const latestId = transcript?.messages.at(-1)?.id;
-    if (latestId && latestId !== previousLastMessageIdRef.current) {
-      pinnedToBottomRef.current = true;
-      previousLastMessageIdRef.current = latestId;
-    }
-
     if (pinnedToBottomRef.current) {
-      node.scrollTop = node.scrollHeight;
+      requestAnimationFrame(() => {
+        const current = messagesRef.current;
+        if (current && pinnedToBottomRef.current) {
+          current.scrollTop = current.scrollHeight;
+        }
+      });
     }
   }, [
     transcriptMessageIds,
@@ -1122,6 +1117,10 @@ export function ThreadView({
 
   const updateMentionFromCursor = (value: string, caret: number) => {
     const detected = detectMentionAtCaret(value, caret);
+    if (detected?.trigger === '/' && provider !== 'codex') {
+      setMention(undefined);
+      return;
+    }
     setMention(detected ?? undefined);
   };
 
@@ -1172,6 +1171,7 @@ export function ThreadView({
     };
     setPendingMessages((current) => [...current, optimistic]);
     setDraft('');
+    setComposerMenuOpen(false);
     setSending(true);
     setError('');
     // The user just sent a new message — re-pin to the bottom so their new bubble and
@@ -1215,14 +1215,17 @@ export function ThreadView({
     setOlderError('');
 
     const node = messagesRef.current;
-    // Anchor the user's scroll position by remembering how far they were from the bottom.
-    // After the prepend we restore that distance so the content they were reading stays
-    // put visually.
-    const distanceFromBottom = node ? node.scrollHeight - node.scrollTop : 0;
+    // Anchor the visible row itself. This is smoother than scroll-height math because
+    // loading spinners and collapsed activity rows can change height during the same
+    // render pass.
+    const anchor = node ? captureScrollAnchor(node) : null;
+    const scrollHeightMinusTop = node ? node.scrollHeight - node.scrollTop : 0;
+    let shouldRestoreAnchor = false;
 
     try {
       const response = await fetchOlderMessages(oldestMessageId, OLDER_MESSAGES_PAGE_SIZE);
       if (response.messages.length > 0) {
+        shouldRestoreAnchor = true;
         setOlderMessages((current) => {
           const seen = new Set(current.map((m) => m.id));
           const additions = response.messages.filter((m) => !seen.has(m.id));
@@ -1230,16 +1233,6 @@ export function ThreadView({
         });
       }
       setHasMoreOlder(response.hasMore);
-
-      // Restore scroll position after the DOM grows. requestAnimationFrame fires after
-      // React commits but before the browser paints, which is when the new scrollHeight
-      // is observable.
-      requestAnimationFrame(() => {
-        const current = messagesRef.current;
-        if (current) {
-          current.scrollTop = current.scrollHeight - distanceFromBottom;
-        }
-      });
     } catch (loadError) {
       setOlderError(
         loadError instanceof Error ? loadError.message : 'Could not load older messages.'
@@ -1247,6 +1240,15 @@ export function ThreadView({
     } finally {
       loadingOlderRef.current = false;
       setLoadingOlder(false);
+      if (shouldRestoreAnchor) {
+        requestAnimationFrame(() => {
+          const current = messagesRef.current;
+          if (current) {
+            restoreScrollAnchor(current, anchor, scrollHeightMinusTop);
+            pinnedToBottomRef.current = false;
+          }
+        });
+      }
     }
   };
 
@@ -1322,6 +1324,10 @@ export function ThreadView({
     if (!openThreadInCodex || openingCodex) {
       return;
     }
+    if (provider !== 'codex') {
+      setError(`${providerName} chats are controlled directly in Agent Pulse.`);
+      return;
+    }
 
     setOpeningCodex(true);
     setError('');
@@ -1329,7 +1335,7 @@ export function ThreadView({
       await openThreadInCodex(thread.threadId);
     } catch (openError) {
       setError(
-        openError instanceof Error ? openError.message : 'Could not open this thread in Codex.'
+        openError instanceof Error ? openError.message : `Could not open this thread in ${providerName}.`
       );
     } finally {
       setOpeningCodex(false);
@@ -1362,7 +1368,7 @@ export function ThreadView({
           : current
       );
     } catch (stopError) {
-      setError(stopError instanceof Error ? stopError.message : 'Could not stop Codex.');
+      setError(stopError instanceof Error ? stopError.message : `Could not stop ${providerName}.`);
     } finally {
       setStopping(false);
     }
@@ -1373,7 +1379,9 @@ export function ThreadView({
       return;
     }
     const confirmed = window.confirm(
-      'Delete this thread from Codex history? You cannot undo this from Agent Pulse.'
+      provider === 'codex'
+        ? 'Delete this thread from Codex history? You cannot undo this from Agent Pulse.'
+        : `Delete this thread from local ${providerName} history? You cannot undo this from Agent Pulse.`
     );
     if (!confirmed) {
       return;
@@ -1430,7 +1438,7 @@ export function ThreadView({
             className="codex-thread-working-badge is-attention"
             role="status"
             aria-live="polite"
-            aria-label="Codex needs approval"
+            aria-label={`${providerName} needs approval`}
           >
             <span>{hasPendingPermissionRequest ? 'Permission' : 'Approval'}</span>
           </span>
@@ -1439,7 +1447,7 @@ export function ThreadView({
             className="codex-thread-working-badge is-compacting"
             role="status"
             aria-live="polite"
-            aria-label="Codex is compacting context"
+            aria-label={`${providerName} is compacting context`}
           >
             <span className="codex-thread-working-dots" aria-hidden="true">
               <span />
@@ -1448,24 +1456,10 @@ export function ThreadView({
             </span>
             <span>Compacting</span>
           </span>
-        ) : isAgentWorking ? (
-          <span
-            className="codex-thread-working-badge"
-            role="status"
-            aria-live="polite"
-            aria-label="Agent is working"
-          >
-            <span className="codex-thread-working-dots" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </span>
-            <span>Working</span>
-          </span>
         ) : null}
 
         <div className="codex-thread-actions">
-          {openThreadInCodex ? (
+          {openThreadInCodex && provider === 'codex' ? (
             <button
               className="codex-thread-open"
               type="button"
@@ -1483,11 +1477,10 @@ export function ThreadView({
               type="button"
               onClick={() => void handleDeleteThread()}
               disabled={deletingThread}
-              aria-label="Delete thread"
-              title="Delete thread"
+              aria-label={deletingThread ? 'Deleting thread' : 'Delete thread'}
+              title={deletingThread ? 'Deleting thread' : 'Delete thread'}
             >
               <Trash2 size={14} />
-              <span>{deletingThread ? 'Deleting' : 'Delete'}</span>
             </button>
           ) : null}
           {onClose ? (
@@ -1503,9 +1496,11 @@ export function ThreadView({
         </div>
       </header>
 
-      <div className="codex-thread-status">
-        <span>{statusText}</span>
-      </div>
+      {showStatusText ? (
+        <div className="codex-thread-status">
+          <span>{statusText}</span>
+        </div>
+      ) : null}
 
       <div
         className="codex-thread-messages"
@@ -1540,25 +1535,15 @@ export function ThreadView({
         ) : null}
 
         {renderable.map((entry) => {
-          if (entry.type === 'work') {
+          if (entry.type === 'activityGroup') {
             return (
-              <WorkGroup
-                key={entry.id}
-                messages={entry.messages}
-                startedAt={entry.startedAt}
-                endedAt={entry.endedAt}
+              <ActivityGroupRow
+                key={entry.group.id}
+                group={entry.group}
                 plugins={plugins}
-                isLatest={entry.id === latestWorkGroupId}
-                isAgentWorking={isAgentWorking}
+                providerToneName={providerTone(provider)}
+                isLatest={entry.group.id === latestActivityGroupId}
               />
-            );
-          }
-
-          if (entry.type === 'event') {
-            return (
-              <div key={entry.message.id} className="codex-live-event">
-                <EventRow message={entry.message} plugins={plugins} />
-              </div>
             );
           }
 
@@ -1571,6 +1556,7 @@ export function ThreadView({
                 className="codex-message codex-message--user"
                 data-role="user-message"
                 data-message-id={message.id}
+                data-scroll-anchor="true"
               >
                 <MessageAttachments attachments={message.attachments} />
                 <article className="codex-bubble codex-bubble--user">
@@ -1582,14 +1568,16 @@ export function ThreadView({
           }
 
           return (
-            <div key={message.id} className="codex-message codex-message--assistant">
-              <div className="codex-message-avatar" aria-hidden="true">
-                <CodexMark size="sm" />
+            <div
+              key={message.id}
+              className="codex-message codex-message--assistant"
+              data-message-id={message.id}
+              data-scroll-anchor="true"
+            >
+              <div className={`codex-message-avatar provider-${providerTone(provider)}`} aria-hidden="true">
+                <ProviderMark provider={provider} size="sm" />
               </div>
               <div className="codex-message-body">
-                <span className="codex-message-tag codex-message-tag--assistant">
-                  {formatModelName(effectiveModelName)}
-                </span>
                 <MessageAttachments attachments={message.attachments} />
                 <article className="codex-prose">
                   {message.text.trim() ? <MessageMarkdown text={message.text} /> : null}
@@ -1600,6 +1588,7 @@ export function ThreadView({
         })}
       </div>
 
+      <div className="codex-thread-bottom-panel">
       {pendingRequests.length > 0 ? (
         <div className="codex-pending-requests" role="region" aria-label="Codex needs input">
           {pendingRequests.map((request) => (
@@ -1660,9 +1649,9 @@ export function ThreadView({
             <MentionPicker
               trigger={mention.trigger}
               query={mention.query}
-              plugins={plugins}
-              skills={skills}
-              commands={commands}
+              plugins={composerPlugins}
+              skills={composerSkills}
+              commands={composerCommands}
               files={files}
               filesLoading={filesLoading}
               onSelect={insertMention}
@@ -1670,13 +1659,13 @@ export function ThreadView({
             />
           ) : null}
           <label className="sr-only" htmlFor={`message-${thread.threadId}`}>
-            Message Codex
+            Message {providerName}
           </label>
           <textarea
             id={`message-${thread.threadId}`}
             ref={textareaRef}
             className="codex-composer-input"
-            placeholder="Ask Codex anything"
+            placeholder={`Ask ${providerName} anything`}
             rows={1}
             value={draft}
             onChange={(event) => onDraftChange(event.target.value, event.target.selectionStart ?? 0)}
@@ -1713,6 +1702,9 @@ export function ThreadView({
               }
               if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
+                if (showStopComposerAction) {
+                  return;
+                }
                 void handleSend();
               }
             }}
@@ -1720,81 +1712,127 @@ export function ThreadView({
           />
           <div className="codex-composer-row">
             <div className="codex-composer-row-left">
-              <button
-                className="codex-composer-add"
-                type="button"
-                aria-label="Add attachment"
-                disabled
-              >
-                <Plus size={16} />
-              </button>
+              <div className={`codex-composer-add-menu ${composerMenuOpen ? 'is-open' : ''}`}>
+                <button
+                  className="codex-composer-add"
+                  type="button"
+                  aria-label="Open composer options"
+                  aria-expanded={composerMenuOpen}
+                  onClick={() => setComposerMenuOpen((open) => !open)}
+                  disabled={!sendMessage}
+                >
+                  <Plus size={16} />
+                </button>
+                {composerMenuOpen ? (
+                  <div className="codex-composer-menu" role="menu">
+                    <button
+                      type="button"
+                      className={`codex-composer-menu-item ${collaborationMode === 'plan' ? 'is-active' : ''}`}
+                      role="menuitemcheckbox"
+                      aria-checked={collaborationMode === 'plan'}
+                      onClick={() => {
+                        setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'));
+                        setComposerMenuOpen(false);
+                      }}
+                    >
+                      <ListChecks size={14} aria-hidden="true" />
+                      <span>Plan mode</span>
+                      <span className="codex-composer-menu-meta">
+                        {collaborationMode === 'plan' ? 'On' : 'Off'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="codex-composer-menu-item"
+                      role="menuitem"
+                      disabled
+                      title={`Image sending is not wired for ${providerName} yet`}
+                    >
+                      <ImagePlus size={14} aria-hidden="true" />
+                      <span>Add image</span>
+                      <span className="codex-composer-menu-meta">Soon</span>
+                    </button>
+                  </div>
+                ) : null}
+              </div>
               <ModelChip
-                models={models}
-                selectedModelSlug={selectedModelSlug ?? effectiveModelName}
+                providerName={providerName}
+                provider={provider}
+                models={canChangeModel ? providerModels : []}
+                selectedModelSlug={normalizedSelectedModelSlug}
                 selectedReasoningEffort={selectedReasoningEffort}
-                fallbackLabel={formatModelName(effectiveModelName)}
+                fallbackLabel={displayedModelName}
                 isOpen={modelPickerOpen}
                 onOpen={() => setModelPickerOpen(true)}
                 onClose={() => setModelPickerOpen(false)}
-                onChangeModel={onChangeModel}
-                disabled={modelUpdating || !onChangeModel}
+                onChangeModel={canChangeModel ? onChangeModel : undefined}
+                onError={(message) => setError(message)}
+                disabled={modelUpdating || !onChangeModel || !canChangeModel}
                 setUpdating={setModelUpdating}
               />
-              <button
-                type="button"
-                className={`codex-composer-mode ${collaborationMode === 'plan' ? 'is-active' : ''}`}
-                aria-pressed={collaborationMode === 'plan'}
-                title={
-                  collaborationMode === 'plan'
-                    ? 'Plan mode is on for the next message'
-                    : 'Ask Codex to make a plan first'
-                }
-                onClick={() =>
-                  setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))
-                }
-                disabled={!sendMessage}
-              >
-                <ListChecks size={14} />
-                <span>Plan</span>
-              </button>
+              {collaborationMode === 'plan' ? (
+                <span className="codex-composer-mode-indicator">
+                  <ListChecks size={13} aria-hidden="true" />
+                  Plan
+                </span>
+              ) : null}
             </div>
             <div className="codex-composer-actions">
-              {stopWork && isCodexActive ? (
-                <button
-                  className="codex-composer-stop"
-                  type="button"
-                  onClick={() => void handleStopWork()}
-                  disabled={stopping}
-                  aria-label="Stop Codex"
-                >
-                  <Square size={13} />
-                  <span>{stopping ? 'Stopping' : 'Stop'}</span>
-                </button>
-              ) : null}
               <button
-                className="codex-composer-send"
-                type="submit"
-                disabled={!canSend}
-                aria-label={sending ? 'Sending' : 'Send message'}
+                className={`codex-composer-send ${showStopComposerAction ? 'is-stop' : ''}`}
+                type={showStopComposerAction ? 'button' : 'submit'}
+                onClick={showStopComposerAction ? () => void handleStopWork() : undefined}
+                disabled={showStopComposerAction ? stopping : !canSend}
+                aria-label={
+                  showStopComposerAction
+                    ? stopping
+                      ? `Stopping ${providerName}`
+                      : `Stop ${providerName}`
+                    : sending
+                      ? 'Sending'
+                      : 'Send message'
+                }
+                title={
+                  showStopComposerAction
+                    ? stopping
+                      ? `Stopping ${providerName}`
+                      : `Stop ${providerName}`
+                    : 'Send message'
+                }
               >
-                {sending ? <Spinner size={16} /> : <ArrowUp size={16} />}
+                {showStopComposerAction ? (
+                  <Square size={11} fill="currentColor" />
+                ) : sending ? (
+                  <Spinner size={16} />
+                ) : (
+                  <ArrowUp size={16} />
+                )}
               </button>
             </div>
           </div>
+          {showContextBar ? (
+            <div className="codex-composer-context-bar">
+              <span
+                className={`codex-thread-usage-provider provider-${providerTone(provider)}`}
+                aria-label={`Provider: ${providerName}`}
+              >
+                <span className="provider-inline-dot" aria-hidden="true" />
+                <span className="provider-inline-text">{providerName}</span>
+              </span>
+              {transcript?.usage ? <UsageBadges usage={transcript.usage} /> : null}
+            </div>
+          ) : null}
         </div>
       </form>
-
-      {transcript?.usage ? (
-        <div className="codex-composer-context-bar">
-          <UsageBadges usage={transcript.usage} />
-        </div>
-      ) : null}
+      </div>
 
     </section>
   );
 }
 
 function ModelChip({
+  providerName,
+  provider,
   models,
   selectedModelSlug,
   selectedReasoningEffort,
@@ -1803,9 +1841,12 @@ function ModelChip({
   onOpen,
   onClose,
   onChangeModel,
+  onError,
   disabled,
   setUpdating
 }: {
+  providerName: string;
+  provider: Thread['provider'];
   models: CatalogModel[];
   selectedModelSlug?: string;
   selectedReasoningEffort?: string;
@@ -1814,10 +1855,13 @@ function ModelChip({
   onOpen: () => void;
   onClose: () => void;
   onChangeModel?: (modelSlug: string, reasoningEffort?: string) => Promise<void>;
+  onError?: (message: string) => void;
   disabled: boolean;
   setUpdating: (value: boolean) => void;
 }) {
   const selected = models.find((model) => model.slug === selectedModelSlug);
+  const modelGroups = useMemo(() => groupModelsForPicker(provider, models), [provider, models]);
+  const [expandedGroupIds, setExpandedGroupIds] = useState<string[]>([]);
   const label = selected?.displayName ?? fallbackLabel;
   const reasoningLabel = selectedReasoningEffort
     ? capitalize(selectedReasoningEffort)
@@ -1825,9 +1869,15 @@ function ModelChip({
       ? capitalize(selected.defaultReasoningLevel)
       : undefined;
 
+  useEffect(() => {
+    if (!isOpen && expandedGroupIds.length > 0) {
+      setExpandedGroupIds([]);
+    }
+  }, [expandedGroupIds.length, isOpen]);
+
   if (!onChangeModel || models.length === 0) {
     return (
-      <span className="codex-composer-model" aria-label="Current Codex model">
+      <span className="codex-composer-model" aria-label={`Current ${providerName} model`}>
         {label}
         {reasoningLabel ? <span className="codex-composer-model-effort">{reasoningLabel}</span> : null}
       </span>
@@ -1850,28 +1900,69 @@ function ModelChip({
       </button>
       {isOpen ? (
         <div className="codex-composer-model-menu" role="menu">
-          {models.map((model) => (
-            <ModelMenuRow
-              key={model.slug}
-              model={model}
-              selectedReasoningEffort={
-                model.slug === selectedModelSlug ? selectedReasoningEffort : undefined
-              }
-              isSelected={model.slug === selectedModelSlug}
-              onPick={async (effort) => {
-                onClose();
-                if (!onChangeModel) {
-                  return;
+          {modelGroups.map((group) => {
+            const expanded = expandedGroupIds.includes(group.id);
+            const rows = group.models.map((model) => (
+              <ModelMenuRow
+                key={model.slug}
+                model={model}
+                selectedReasoningEffort={
+                  model.slug === selectedModelSlug
+                    ? selectedReasoningEffort ?? model.defaultReasoningLevel
+                    : undefined
                 }
-                setUpdating(true);
-                try {
-                  await onChangeModel(model.slug, effort);
-                } finally {
-                  setUpdating(false);
-                }
-              }}
-            />
-          ))}
+                isSelected={model.slug === selectedModelSlug}
+                onPick={async (effort) => {
+                  onClose();
+                  onError?.('');
+                  if (!onChangeModel) {
+                    return;
+                  }
+                  setUpdating(true);
+                  try {
+                    await onChangeModel(model.slug, effort);
+                  } catch (error) {
+                    onError?.(
+                      error instanceof Error
+                        ? error.message
+                        : `Could not update the ${providerName} model.`
+                    );
+                  } finally {
+                    setUpdating(false);
+                  }
+                }}
+              />
+            ));
+
+            if (!group.collapsible) {
+              return rows;
+            }
+
+            return (
+              <section
+                key={group.id}
+                className={`codex-composer-model-group ${expanded ? 'is-open' : ''}`}
+              >
+                <button
+                  type="button"
+                  className="codex-composer-model-group-toggle"
+                  onClick={() =>
+                    setExpandedGroupIds((current) =>
+                      current.includes(group.id)
+                        ? current.filter((candidate) => candidate !== group.id)
+                        : [...current, group.id]
+                    )
+                  }
+                  aria-expanded={expanded}
+                >
+                  <span className="codex-composer-model-group-label">{group.label}</span>
+                  <span className="codex-composer-model-group-meta">{group.models.length}</span>
+                  {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                </button>
+                {expanded ? <div className="codex-composer-model-group-body">{rows}</div> : null}
+              </section>
+            );
+          })}
         </div>
       ) : null}
     </div>
@@ -1904,7 +1995,7 @@ function ModelMenuRow({
           className="codex-composer-model-effort-pick"
           onClick={() => void onPick(undefined)}
         >
-          Use default
+          {isSelected ? 'Selected' : 'Use model'}
         </button>
       ) : (
         <div className="codex-composer-model-effort-list">
@@ -1936,6 +2027,8 @@ const APPROVAL_METHODS_FOR_UI = new Set<ApprovalMethodForUi>([
   'item/permissions/requestApproval',
   'execCommandApproval',
   'applyPatchApproval',
+  'claudeCode/canUseTool',
+  'claudeCode/elicitation',
   'item/tool/requestUserInput',
   'item/plan/requestImplementation',
   'mcpServer/elicitation/request'
@@ -2437,36 +2530,122 @@ function normalizeSuggestion(raw: unknown): RawSuggestion | null {
 }
 
 function UsageBadges({ usage }: { usage: ThreadUsage }) {
-  const items: { label: string; value: string; tone: 'context' | 'window' }[] = [];
-  if (typeof usage.contextUsedPercent === 'number') {
-    items.push({ label: 'Context', value: `${usage.contextUsedPercent}%`, tone: 'context' });
-  }
+  const windowItems: { label: string; value: string; resetsAt?: number; minutes: number }[] = [];
   if (usage.primaryWindow) {
-    items.push({
-      label: formatWindowLabel(usage.primaryWindow.windowMinutes ?? 300),
+    const minutes = usage.primaryWindow.windowMinutes ?? 300;
+    windowItems.push({
+      label: usage.primaryWindow.label ?? formatWindowLabel(minutes),
       value: `${Math.round(usage.primaryWindow.usedPercent)}%`,
-      tone: 'window'
+      resetsAt: usage.primaryWindow.resetsAt,
+      minutes
     });
   }
   if (usage.secondaryWindow) {
-    items.push({
-      label: formatWindowLabel(usage.secondaryWindow.windowMinutes ?? 10080),
+    const minutes = usage.secondaryWindow.windowMinutes ?? 10080;
+    windowItems.push({
+      label: usage.secondaryWindow.label ?? formatWindowLabel(minutes),
       value: `${Math.round(usage.secondaryWindow.usedPercent)}%`,
-      tone: 'window'
+      resetsAt: usage.secondaryWindow.resetsAt,
+      minutes
     });
   }
-  if (items.length === 0) {
+  const hasContext = typeof usage.contextUsedPercent === 'number';
+  if (!hasContext && windowItems.length === 0) {
     return null;
   }
   return (
-    <div className="codex-thread-usage" role="status" aria-label="Codex usage">
-      {items.map((item) => (
-        <span key={`${item.label}-${item.value}`} className={`codex-thread-usage-item tone-${item.tone}`}>
-          <span className="codex-thread-usage-label">{item.label}</span>
-          <span className="codex-thread-usage-value">{item.value}</span>
-        </span>
-      ))}
+    <div className="codex-thread-usage" role="status" aria-label="Agent usage">
+      {windowItems.map((item) => {
+        const resetText = formatUsageResetText(item.resetsAt, item.minutes);
+        const tooltip = resetText
+          ? `${item.label} ${item.value} · ${resetText}`
+          : `${item.label} ${item.value}`;
+        return (
+          <button
+            key={item.label}
+            type="button"
+            className="codex-thread-usage-item tone-window"
+            aria-label={tooltip}
+            title={tooltip}
+          >
+            <span className="codex-thread-usage-label">{item.label}</span>
+            <span className="codex-thread-usage-value">{item.value}</span>
+            <span className="codex-thread-usage-ring-tooltip">
+              {resetText ?? `${item.label} ${item.value}`}
+            </span>
+          </button>
+        );
+      })}
+      {hasContext ? (
+        <UsageRing label="Context" percent={usage.contextUsedPercent as number} tone="context" />
+      ) : null}
     </div>
+  );
+}
+
+function formatUsageResetText(resetsAt: number | undefined, minutes: number): string | undefined {
+  if (!resetsAt) {
+    return undefined;
+  }
+  const date = new Date(resetsAt * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+  const longWindow = minutes >= 24 * 60;
+  const formatter = new Intl.DateTimeFormat(undefined, longWindow
+    ? { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }
+    : { hour: 'numeric', minute: '2-digit' }
+  );
+  return `Resets ${formatter.format(date)}`;
+}
+
+function UsageRing({
+  label,
+  percent,
+  tone
+}: {
+  label: string;
+  percent: number;
+  tone: 'context' | 'window';
+}) {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const rounded = Math.round(clamped);
+  const radius = 7;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - clamped / 100);
+  const tooltip = `${label} ${rounded}%`;
+  return (
+    <button
+      type="button"
+      className={`codex-thread-usage-ring tone-${tone}`}
+      aria-label={tooltip}
+      title={tooltip}
+    >
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+        <circle
+          cx="9"
+          cy="9"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          opacity="0.2"
+        />
+        <circle
+          cx="9"
+          cy="9"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform="rotate(-90 9 9)"
+        />
+      </svg>
+      <span className="codex-thread-usage-ring-tooltip">{tooltip}</span>
+    </button>
   );
 }
 

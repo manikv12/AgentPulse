@@ -145,10 +145,34 @@ describe('shared schemas', () => {
 
   it('allows a new thread request from a saved project or a folder path', () => {
     expect(ThreadCreateRequestSchema.parse({ projectId: 'project-codexpulse' })).toEqual({
+      provider: 'codex',
       projectId: 'project-codexpulse'
     });
     expect(ThreadCreateRequestSchema.parse({ cwd: '  /Users/me/projects/CodexPulse  ' })).toEqual({
+      provider: 'codex',
       cwd: '/Users/me/projects/CodexPulse'
+    });
+    expect(
+      ThreadCreateRequestSchema.parse({
+        provider: 'claude-code',
+        projectId: 'project-codexpulse'
+      })
+    ).toEqual({
+      provider: 'claude-code',
+      projectId: 'project-codexpulse'
+    });
+    expect(
+      ThreadCreateRequestSchema.parse({
+        provider: 'copilot',
+        projectId: 'project-codexpulse',
+        modelSlug: 'gpt-5.2',
+        reasoningEffort: 'high'
+      })
+    ).toEqual({
+      provider: 'copilot',
+      projectId: 'project-codexpulse',
+      modelSlug: 'gpt-5.2',
+      reasoningEffort: 'high'
     });
     expect(() => ThreadCreateRequestSchema.parse({})).toThrow();
     expect(() =>
@@ -157,6 +181,24 @@ describe('shared schemas', () => {
         cwd: '/Users/me/projects/CodexPulse'
       })
     ).toThrow();
+  });
+
+  it('accepts Copilot transcripts with named rate-limit windows', () => {
+    const transcript = ThreadTranscriptSchema.parse({
+      threadId: 'copilot:session-1',
+      provider: 'copilot',
+      providerThreadId: 'session-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Send' },
+      messages: [],
+      usage: {
+        primaryWindow: { label: 'Premium', usedPercent: 25 },
+        secondaryWindow: { label: 'Chat', usedPercent: 10 }
+      }
+    });
+
+    expect(transcript.provider).toBe('copilot');
+    expect(transcript.usage?.primaryWindow?.label).toBe('Premium');
   });
 
   it('validates pairing for a new device or a saved device', () => {

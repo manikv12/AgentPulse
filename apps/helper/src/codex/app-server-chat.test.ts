@@ -147,6 +147,52 @@ describe('Codex App Server same-thread chat', () => {
     expect(chat.isThreadStreaming('thread-1')).toBe(true);
   });
 
+  it('keeps a thread working when a stale idle status arrives before turn completion', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+    const liveEvents: unknown[] = [];
+    chat.onLiveEvent((event) => liveEvents.push(event));
+
+    transport.emitNotification({
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-1',
+        turn: turn('turn-1', 'inProgress')
+      }
+    });
+    transport.emitNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: 'thread-1',
+        status: { type: 'idle', activeFlags: [] }
+      }
+    });
+
+    expect(chat.isThreadStreaming('thread-1')).toBe(true);
+    expect(chat.applyLiveState(emptyTranscript('thread-1'), 'thread-1').sendState).toMatchObject({
+      canSend: false,
+      reason: 'thread_changed',
+      label: 'Codex is working'
+    });
+    expect(liveEvents).toContainEqual({
+      type: 'thread/status/changed',
+      payload: {
+        threadId: 'thread-1',
+        status: 'running'
+      }
+    });
+
+    transport.emitNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: turn('turn-1', 'completed')
+      }
+    });
+
+    expect(chat.isThreadStreaming('thread-1')).toBe(false);
+  });
+
   it('stores app-server approval requests and answers the same request id', async () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);

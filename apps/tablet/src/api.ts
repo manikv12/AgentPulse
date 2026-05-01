@@ -22,6 +22,8 @@ import {
   OlderThreadMessagesResponseSchema,
   ThreadListResponseSchema,
   type CollaborationModeKind,
+  type ApprovalDecisionRequest,
+  type AgentProvider,
   type CatalogCommand,
   type CatalogModel,
   type CatalogPlugin,
@@ -50,6 +52,14 @@ export type AgentPulseSession = {
 
 export type FetchThreadTranscriptOptions = {
   messageLimit?: number;
+};
+
+export type HelperSettingsSnapshot = {
+  port?: number;
+  lanEnabled?: boolean;
+  mobileSendEnabled?: boolean;
+  enabledProviders?: AgentProvider[];
+  remoteAccess?: RemoteAccessSettings;
 };
 
 // Thrown when a transcript fetch is aborted by our local timeout. Callers that already
@@ -140,6 +150,23 @@ export async function updateRemoteAccess(
   input: { enabled?: boolean; mode?: RemoteAccessSettings['mode']; tunnelProtocol?: RemoteAccessSettings['tunnelProtocol']; hostname?: string; tunnelName?: string }
 ): Promise<RemoteAccessSettings> {
   return remoteAccessPost('/settings/remote-access', token, input);
+}
+
+export async function updateEnabledProviders(
+  token: string,
+  enabledProviders: AgentProvider[]
+): Promise<HelperSettingsSnapshot> {
+  const response = await adminFetch('/settings/providers', token, {
+    method: 'POST',
+    body: JSON.stringify({ enabledProviders })
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not update enabled agents.'));
+  }
+
+  const payload = (await response.json()) as { settings?: HelperSettingsSnapshot };
+  return payload.settings ?? {};
 }
 
 export async function configureCloudflareRemoteAccess(
@@ -354,8 +381,8 @@ export async function fetchProjects(session: AgentPulseSession): Promise<Project
 
 export type StartThreadTarget =
   | string
-  | { projectId: string; modelSlug?: string; reasoningEffort?: string }
-  | { cwd: string; modelSlug?: string; reasoningEffort?: string };
+  | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
+  | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string };
 
 export async function startThread(
   session: AgentPulseSession,
@@ -598,15 +625,7 @@ export async function respondToApproval(
   session: AgentPulseSession,
   threadId: string,
   requestId: string,
-  method:
-    | 'item/commandExecution/requestApproval'
-    | 'item/fileChange/requestApproval'
-    | 'item/permissions/requestApproval'
-    | 'execCommandApproval'
-    | 'applyPatchApproval'
-    | 'item/tool/requestUserInput'
-    | 'item/plan/requestImplementation'
-    | 'mcpServer/elicitation/request',
+  method: ApprovalDecisionRequest['method'],
   decision: string | Record<string, unknown>
 ): Promise<void> {
   const response = await authedFetch(

@@ -2,11 +2,12 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import type { CatalogModel, RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-pulse/shared';
+import type { CatalogModel, Project, RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-pulse/shared';
 import { WebSocket, type RawData } from 'ws';
 import { AdminAuth } from '../auth/admin';
 import { DeviceRegistry, MemoryDeviceStore, PairingManager } from '../auth/pairing';
 import { SendBlockedError } from '../codex/app-server-chat';
+import type { CatalogReader } from '../codex/catalog';
 import { createThreadOpener } from '../codex/thread-opener';
 import { startAgentPulseServer } from './agent-pulse-server';
 import { pickFreeHighPort, type HelperSettingsStore } from './settings';
@@ -62,6 +63,7 @@ describe('Agent Pulse helper API', () => {
     const adminToken = adminAuth.issueToken().token;
     const thread: Thread = {
       threadId: 'thread-1',
+      provider: 'codex',
       title: 'Review permission request',
       workspace: 'OpenAssist',
       status: 'waiting_approval',
@@ -131,6 +133,124 @@ describe('Agent Pulse helper API', () => {
         headers: authHeaders(pairedBody.token, pairedBody.deviceId)
       });
       expect(afterRevoke.status).toBe(403);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('hides disabled providers and blocks starting them', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const codexThread: Thread = {
+      threadId: 'thread-codex',
+      provider: 'codex',
+      title: 'Codex thread',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-25T16:14:00Z',
+      lastTurnSummary: ''
+    };
+    const claudeThread: Thread = {
+      threadId: 'claude-code:thread-1',
+      provider: 'claude-code',
+      title: 'Claude thread',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-25T16:15:00Z',
+      lastTurnSummary: ''
+    };
+    const codexProject: Project = {
+      projectId: 'codex-project',
+      name: 'Codex project',
+      path: '/tmp/codex-project',
+      providers: ['codex']
+    };
+    const claudeProject: Project = {
+      projectId: 'claude-project',
+      name: 'Claude project',
+      path: '/tmp/claude-project',
+      providers: ['claude-code']
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      enabledProviders: ['claude-code' as const],
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [codexThread],
+        listProjects: async () => [codexProject]
+      },
+      claudeCode: {
+        listThreads: async () => [claudeThread],
+        listProjects: async () => [claudeProject],
+        readTranscript: vi.fn(),
+        sendMessage: vi.fn(),
+        listModels: async () => [
+          {
+            slug: 'opus',
+            displayName: 'Claude Opus',
+            provider: 'claude-code'
+          }
+        ]
+      },
+      catalog: {
+        listPlugins: async () => [],
+        listSkills: async () => [],
+        listCommands: async () => [],
+        listModels: async () => [
+          {
+            slug: 'gpt-5.5',
+            displayName: 'GPT-5.5',
+            provider: 'codex'
+          }
+        ],
+        listProjectFiles: async () => ({ files: [], truncated: false }),
+        onChange: () => () => undefined
+      } as unknown as CatalogReader,
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+
+      const threads = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      await expect(threads.json()).resolves.toEqual({ threads: [claudeThread] });
+
+      const projects = await fetch(`${server.url}/projects/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      await expect(projects.json()).resolves.toEqual({ projects: [claudeProject] });
+
+      const models = await fetch(`${server.url}/catalog/models`, {
+        headers: authHeaders(token, deviceId)
+      });
+      await expect(models.json()).resolves.toMatchObject({
+        models: [{ slug: 'opus', provider: 'claude-code' }]
+      });
+
+      const disabledStart = await fetch(`${server.url}/threads/new`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ provider: 'codex', cwd: '/tmp' })
+      });
+      expect(disabledStart.status).toBe(403);
+      await expect(disabledStart.json()).resolves.toEqual({
+        error: 'Codex is turned off in Agent Pulse settings.'
+      });
     } finally {
       await server.stop();
     }
@@ -678,6 +798,7 @@ describe('Agent Pulse helper API', () => {
     const pairing = new PairingManager(registry);
     const staleThread: Thread = {
       threadId: 'thread-paused',
+      provider: 'codex',
       title: 'Plan modern UI implementation',
       workspace: 'CodexPulse',
       status: 'running',
@@ -757,6 +878,7 @@ describe('Agent Pulse helper API', () => {
     const pairing = new PairingManager(registry);
     const oldIdleThread: Thread = {
       threadId: 'thread-old-idle',
+      provider: 'codex',
       title: 'Old idle chat',
       workspace: 'CodexPulse',
       status: 'idle',
@@ -765,6 +887,7 @@ describe('Agent Pulse helper API', () => {
     };
     const staleRunningThread: Thread = {
       threadId: 'thread-stale-running',
+      provider: 'codex',
       title: 'Stale running chat',
       workspace: 'CodexPulse',
       status: 'running',
@@ -1115,6 +1238,7 @@ describe('Agent Pulse helper API', () => {
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({
         threadId: 'thread-1',
+        provider: 'codex',
         activeTurnId: null,
         sendState: {
           canSend: true,
@@ -1369,6 +1493,7 @@ describe('Agent Pulse helper API', () => {
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
       threadId: 'thread-1',
+      provider: 'codex',
       activeTurnId: null,
       sendState: {
         canSend: true,
@@ -2067,6 +2192,7 @@ describe('Agent Pulse helper API', () => {
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
       threadId: 'thread-1',
+      provider: 'codex',
       activeTurnId: 'turn-1',
       sendState: {
         canSend: true,
@@ -2517,6 +2643,112 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('adds Claude Code models to the provider-aware model catalog', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      listModels: vi.fn(async () => [
+        {
+          slug: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          visibility: 'visible'
+        }
+      ] satisfies CatalogModel[])
+    };
+    const claudeCode = {
+      listThreads: vi.fn(async () => []),
+      listProjects: vi.fn(async () => []),
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      listModels: vi.fn(async () => [
+        {
+          slug: 'opus',
+          displayName: 'Claude Opus',
+          provider: 'claude-code' as const,
+          description: 'Higher-capability Claude Code model alias.',
+          defaultReasoningLevel: 'medium',
+          supportedReasoningLevels: [
+            { effort: 'low', description: 'Fastest Claude Code reasoning.' },
+            { effort: 'medium', description: 'Balanced Claude Code reasoning.' },
+            { effort: 'high', description: 'Deeper Claude Code reasoning.' },
+            { effort: 'xhigh', description: 'Extra-deep Claude Code reasoning.' },
+            { effort: 'max', description: 'Maximum Claude Code reasoning.' }
+          ],
+          visibility: 'visible',
+          priority: 10
+        }
+      ] satisfies CatalogModel[])
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      claudeCode,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+
+      const response = await fetch(`${server.url}/catalog/models`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        models: [
+          {
+            slug: 'gpt-5.5',
+            displayName: 'GPT-5.5',
+            visibility: 'visible'
+          },
+          {
+            slug: 'opus',
+            displayName: 'Claude Opus',
+            provider: 'claude-code',
+            description: 'Higher-capability Claude Code model alias.',
+            defaultReasoningLevel: 'medium',
+            supportedReasoningLevels: [
+              { effort: 'low', description: 'Fastest Claude Code reasoning.' },
+              { effort: 'medium', description: 'Balanced Claude Code reasoning.' },
+              { effort: 'high', description: 'Deeper Claude Code reasoning.' },
+              { effort: 'xhigh', description: 'Extra-deep Claude Code reasoning.' },
+              { effort: 'max', description: 'Maximum Claude Code reasoning.' }
+            ],
+            visibility: 'visible',
+            priority: 10
+          }
+        ]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('applies a model change live via the IPC mirror', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -2605,6 +2837,68 @@ describe('Agent Pulse helper API', () => {
       expect(sendResponse.status).toBe(200);
       expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Use the new model', undefined);
       expect(appServer.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('applies a Claude Code model change through the Claude provider', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const claudeCode = {
+      listThreads: vi.fn(async () => []),
+      listProjects: vi.fn(async () => []),
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      setModel: vi.fn(async () => undefined)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      claudeCode,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+
+      const modelResponse = await fetch(`${server.url}/threads/claude-code%3Asession-1/model`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ modelSlug: 'opus', reasoningEffort: 'high' })
+      });
+
+      expect(modelResponse.status).toBe(200);
+      expect(claudeCode.setModel).toHaveBeenCalledWith('claude-code:session-1', 'opus', 'high');
+      await expect(modelResponse.json()).resolves.toEqual({
+        ok: true,
+        modelSlug: 'opus',
+        reasoningEffort: 'high'
+      });
     } finally {
       await server.stop();
     }
@@ -3239,6 +3533,7 @@ describe('Agent Pulse helper API', () => {
     const projectPath = mkdtempSync(path.join(tmpdir(), 'agent-pulse-project-'));
     const createdThread: Thread = {
       threadId: 'thread-new',
+      provider: 'codex',
       title: 'New thread',
       workspace: 'CodexPulse',
       status: 'idle',
@@ -3279,7 +3574,8 @@ describe('Agent Pulse helper API', () => {
           {
             projectId: 'project-codexpulse',
             name: 'CodexPulse',
-            path: projectPath
+            path: projectPath,
+            providers: ['codex']
           }
         ]
       },
@@ -3300,7 +3596,8 @@ describe('Agent Pulse helper API', () => {
           {
             projectId: 'project-codexpulse',
             name: 'CodexPulse',
-            path: projectPath
+            path: projectPath,
+            providers: ['codex']
           }
         ]
       });
@@ -3352,6 +3649,7 @@ describe('Agent Pulse helper API', () => {
     const projectPath = mkdtempSync(path.join(tmpdir(), 'agent-pulse-project-'));
     const draftThread: Thread = {
       threadId: 'thread-draft',
+      provider: 'codex',
       title: 'New thread',
       workspace: 'CodexPulse',
       status: 'idle',
@@ -3463,6 +3761,7 @@ describe('Agent Pulse helper API', () => {
       expect(transcriptResponse.status).toBe(200);
       await expect(transcriptResponse.json()).resolves.toEqual({
         threadId: 'thread-draft',
+        provider: 'codex',
         activeTurnId: null,
         sendState: {
           canSend: true,
@@ -3487,6 +3786,85 @@ describe('Agent Pulse helper API', () => {
         undefined
       );
       expect(appServer.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('discards a new Codex draft thread without archiving provider history', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const projectPath = mkdtempSync(path.join(tmpdir(), 'agent-pulse-project-'));
+    const draftThread: Thread = {
+      threadId: 'thread-draft-empty',
+      provider: 'codex',
+      title: 'New thread',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-26T10:00:00Z',
+      lastTurnSummary: ''
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => {
+        throw new Error('not materialized');
+      }),
+      sendMessage: vi.fn(),
+      startThread: vi.fn(async () => draftThread),
+      archiveThread: vi.fn()
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [],
+        listProjects: async () => [
+          {
+            projectId: 'project-codexpulse',
+            name: 'CodexPulse',
+            path: projectPath,
+            providers: ['codex']
+          }
+        ]
+      },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const createResponse = await fetch(`${server.url}/threads/new`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ projectId: 'project-codexpulse' })
+      });
+      expect(createResponse.status).toBe(200);
+
+      const deleteResponse = await fetch(`${server.url}/threads/thread-draft-empty`, {
+        method: 'DELETE',
+        headers: authHeaders(token, deviceId)
+      });
+      expect(deleteResponse.status).toBe(200);
+      await expect(deleteResponse.json()).resolves.toEqual({ ok: true });
+      expect(appServer.archiveThread).not.toHaveBeenCalled();
+
+      const listResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      await expect(listResponse.json()).resolves.toEqual({ threads: [] });
     } finally {
       await server.stop();
     }
@@ -3547,6 +3925,59 @@ describe('Agent Pulse helper API', () => {
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({ ok: true });
       expect(appServer.archiveThread).toHaveBeenCalledWith('thread-delete');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('deletes a Claude Code thread through the Claude provider', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const thread: Thread = {
+      threadId: 'claude-code:thread-delete',
+      provider: 'claude-code',
+      providerThreadId: 'thread-delete',
+      title: 'Old Claude thread',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-04-30T12:00:00Z',
+      lastTurnSummary: 'Ready'
+    };
+    const claudeCode = {
+      listThreads: vi.fn(async () => [thread]),
+      listProjects: vi.fn(async () => []),
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      deleteThread: vi.fn(async () => undefined)
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      claudeCode,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/threads/${encodeURIComponent(thread.threadId)}`, {
+        method: 'DELETE',
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ ok: true });
+      expect(claudeCode.deleteThread).toHaveBeenCalledWith('claude-code:thread-delete');
     } finally {
       await server.stop();
     }

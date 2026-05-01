@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { AdminAuth } from './auth/admin';
 import { DeviceRegistry, PairingManager } from './auth/pairing';
 import { KeychainDeviceStore } from './auth/keychain-store';
+import { ClaudeCodeProvider } from './claude/claude-code';
+import { CopilotProvider } from './copilot/copilot';
 import { CodexAppServerChat } from './codex/app-server-chat';
 import { CodexAppServerClient } from './codex/app-server-client';
 import { CatalogReader } from './codex/catalog';
@@ -53,6 +55,8 @@ const usageProvider = async (threadId: string) => {
 const catalog = new CatalogReader();
 catalog.start();
 const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: app.getVersion() }));
+const claudeCode = new ClaudeCodeProvider();
+const copilot = new CopilotProvider();
 
 // IPC mirror to a running Codex desktop window. See dev-server.ts for the
 // rationale on why we don't wire onStreamingChange / onPendingApprovalsChange
@@ -96,6 +100,8 @@ async function startOrRestartServer(): Promise<RunningAgentPulseServer> {
     opener,
     appServer,
     mirror,
+    claudeCode,
+    copilot,
     catalog,
     seenThreadStore,
     usageProvider,
@@ -172,5 +178,6 @@ app.on('before-quit', async () => {
   await remoteSupervisor?.stop();
   await advertiser.stop();
   opener.dispose();
+  claudeCode.dispose();
   catalog.dispose();
 });
