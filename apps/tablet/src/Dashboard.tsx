@@ -32,6 +32,7 @@ export type DashboardProps = {
   projects?: Project[];
   onNewThread?: (target: NewThreadTarget) => Promise<Thread>;
   onOpenThreadInCodex?: (threadId: string) => Promise<void>;
+  onDeleteThread?: (threadId: string) => Promise<void>;
   onOpenSettings?: () => void;
   fetchTranscript?: (
     threadId: string,
@@ -119,6 +120,7 @@ export function Dashboard({
   projects = [],
   onNewThread,
   onOpenThreadInCodex,
+  onDeleteThread,
   onOpenSettings,
   fetchTranscript,
   sendMessage,
@@ -337,6 +339,7 @@ export function Dashboard({
             fetchTranscript={fetchTranscript}
             sendMessage={sendMessage}
             stopWork={stopWork}
+            deleteThread={onDeleteThread}
             fetchOlderMessages={
               fetchOlderMessages
                 ? (beforeMessageId: string, limit?: number) =>

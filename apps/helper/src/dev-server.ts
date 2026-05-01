@@ -48,16 +48,9 @@ catalog.start();
 const advertiser = new BonjourAdvertiser();
 const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: '0.1.0' }));
 
-// IPC mirror to a running Codex desktop window. Used by the helper's send and
-// model-change routes as the preferred transport so the desktop window mirrors
-// what the tablet does. The app-server subprocess is the fallback when no
-// desktop window owns the thread.
-//
-// Note: app-server-chat.ts already emits thread/streaming-changed and
-// thread/pending-approvals/changed live events from notification-derived state.
-// We deliberately don't wire mirror's onStreamingChange / onPendingApprovalsChange
-// here — that would double-broadcast. The mirror's role is just send + model
-// change (and ownership tracking that backs them).
+// IPC mirror to a running Codex desktop window. This is the helper's source for
+// desktop-owned actions: send, model changes, and approval requests/decisions.
+// The spawned app-server still reads transcripts and list state.
 const ipc = createIpcClient({
   clientType: 'agent-pulse',
   logger: {

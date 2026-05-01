@@ -3040,6 +3040,31 @@ dd {
   opacity: 0.75;
 }
 
+.codex-thread-delete {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--tone-red);
+  font-size: 0.78125rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.codex-thread-delete:hover {
+  background: rgba(239, 68, 68, 0.14);
+}
+
+.codex-thread-delete:disabled {
+  cursor: progress;
+  opacity: 0.75;
+}
+
 .codex-thread-sync {
   display: inline-flex;
   align-items: center;
@@ -4065,12 +4090,14 @@ button.codex-event-row:hover {
   }
 
   .codex-thread-actions .codex-thread-open span,
-  .codex-thread-actions .codex-thread-sync span {
+  .codex-thread-actions .codex-thread-sync span,
+  .codex-thread-actions .codex-thread-delete span {
     display: none;
   }
 
   .codex-thread-actions .codex-thread-open,
-  .codex-thread-actions .codex-thread-sync {
+  .codex-thread-actions .codex-thread-sync,
+  .codex-thread-actions .codex-thread-delete {
     width: 32px;
     padding: 0;
     justify-content: center;

@@ -72,6 +72,10 @@ export type CodexMirror = {
   // with their full payloads (id, method, params). Used by the server to seed
   // the tablet on reconnect via `thread/upsert`.
   getPendingApprovalRequests(threadId: string): PendingApprovalRequest[];
+  onStreamingChange(listener: (event: { threadId: string; isStreaming: boolean }) => void): () => void;
+  onPendingApprovalsChange(
+    listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
+  ): () => void;
   isThreadOwned(threadId: string): boolean;
   waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean>;
   isConnected(): boolean;
@@ -103,6 +107,10 @@ type AppThreadStreamState = {
   // The value is the full request payload — not just the id — so the helper
   // can replay it to the tablet on reconnect.
   approvalRequestsByKey: Map<string, PendingApprovalRequest>;
+  // Same keys as approvalRequestsByKey, but preserving the original JSON-RPC
+  // request id type. Codex can send numeric ids; sending "4" back when the
+  // real request id is 4 does not resolve the approval.
+  approvalResponseIdsByKey: Map<string, string | number>;
   latestTurnIndex: number | null;
   latestTurnStatus: string | null;
   runtimeStatusType: string | null;
@@ -127,6 +135,12 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   // keyed by conversation id. Used to deduplicate notifications so the helper
   // server only broadcasts when the visible-to-tablet list actually changes.
   const lastEmittedPendingApprovals = new Map<string, PendingApprovalRequest[]>();
+  const streamingListeners = new Set<
+    (event: { threadId: string; isStreaming: boolean }) => void
+  >();
+  const pendingApprovalListeners = new Set<
+    (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
+  >();
   // Threads where a Codex window currently reports streamRole.role === 'owner'.
   // Required for follower IPC methods (set-model-and-reasoning, approval decisions, etc.)
   // to pass the desktop's discovery callback `getThreadRole === 'owner'`.
@@ -157,10 +171,18 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       streamingUpdatedAtMs.delete(conversationId);
     }
     if (isStreaming !== wasStreaming) {
+      const event = { threadId: conversationId, isStreaming };
       try {
-        options.onStreamingChange?.({ threadId: conversationId, isStreaming });
+        options.onStreamingChange?.(event);
       } catch {
         // ignore listener errors
+      }
+      for (const listener of streamingListeners) {
+        try {
+          listener(event);
+        } catch {
+          // ignore listener errors
+        }
       }
     }
   }
@@ -191,10 +213,18 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     } else {
       lastEmittedPendingApprovals.set(conversationId, requests);
     }
+    const event = { threadId: conversationId, requests };
     try {
-      options.onPendingApprovalsChange?.({ threadId: conversationId, requests });
+      options.onPendingApprovalsChange?.(event);
     } catch {
       // ignore listener errors
+    }
+    for (const listener of pendingApprovalListeners) {
+      try {
+        listener(event);
+      } catch {
+        // ignore listener errors
+      }
     }
   }
 
@@ -509,10 +539,11 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     method: ApprovalMethod,
     response: ApprovalResponse
   ): Promise<void> {
+    const ipcRequestId = approvalResponseIdForRequest(threadId, requestId);
     if (method === 'item/commandExecution/requestApproval') {
       await sendFollowerRequest('thread-follower-command-approval-decision', {
         conversationId: threadId,
-        requestId,
+        requestId: ipcRequestId,
         decision: response
       });
       return;
@@ -520,7 +551,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     if (method === 'item/fileChange/requestApproval') {
       await sendFollowerRequest('thread-follower-file-approval-decision', {
         conversationId: threadId,
-        requestId,
+        requestId: ipcRequestId,
         decision: response
       });
       return;
@@ -528,7 +559,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     if (method === 'item/permissions/requestApproval') {
       await sendFollowerRequest('thread-follower-permissions-request-approval-response', {
         conversationId: threadId,
-        requestId,
+        requestId: ipcRequestId,
         response
       });
       return;
@@ -536,7 +567,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     if (method === 'mcpServer/elicitation/request') {
       await sendFollowerRequest('thread-follower-submit-mcp-server-elicitation-response', {
         conversationId: threadId,
-        requestId,
+        requestId: ipcRequestId,
         response
       });
       return;
@@ -546,6 +577,19 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
 
   function isThreadOwned(threadId: string): boolean {
     return ownedThreads.has(threadId);
+  }
+
+  function approvalResponseIdForRequest(threadId: string, requestId: string): string | number {
+    const state = appThreadStreamStates.get(threadId);
+    if (!state) {
+      return approvalResponseIdFromRouteParam(requestId);
+    }
+    for (const [key, request] of state.approvalRequestsByKey) {
+      if (request.id === requestId) {
+        return state.approvalResponseIdsByKey.get(key) ?? approvalResponseIdFromRouteParam(requestId);
+      }
+    }
+    return approvalResponseIdFromRouteParam(requestId);
   }
 
   function isThreadStreaming(threadId: string): boolean {
@@ -606,6 +650,29 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     isThreadCompacting,
     isThreadWaitingForApproval,
     getPendingApprovalRequests,
+    onStreamingChange(listener) {
+      streamingListeners.add(listener);
+      return () => {
+        streamingListeners.delete(listener);
+      };
+    },
+    onPendingApprovalsChange(listener) {
+      pendingApprovalListeners.add(listener);
+      for (const [threadId, state] of appThreadStreamStates) {
+        const requests = pendingApprovalsFromState(state);
+        if (requests.length === 0) {
+          continue;
+        }
+        try {
+          listener({ threadId, requests });
+        } catch {
+          // ignore listener errors
+        }
+      }
+      return () => {
+        pendingApprovalListeners.delete(listener);
+      };
+    },
     isThreadOwned,
     waitForOwnership,
     isConnected: () => ipc.isReady(),
@@ -621,6 +688,8 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       streamingUpdatedAtMs.clear();
       appThreadStreamStates.clear();
       lastEmittedPendingApprovals.clear();
+      streamingListeners.clear();
+      pendingApprovalListeners.clear();
       ownedThreads.clear();
       ownershipWaiters.clear();
     }
@@ -631,6 +700,7 @@ function emptyAppThreadStreamState(lastUpdatedAtMs = Date.now()): AppThreadStrea
   return {
     activeItemKeys: new Set(),
     approvalRequestsByKey: new Map(),
+    approvalResponseIdsByKey: new Map(),
     latestTurnIndex: null,
     latestTurnStatus: null,
     runtimeStatusType: null,
@@ -784,6 +854,7 @@ function applyStreamPatch(state: AppThreadStreamState, rawPatch: unknown): void 
     });
     state.activeItemKeys = rebuilt.activeItemKeys;
     state.approvalRequestsByKey = rebuilt.approvalRequestsByKey;
+    state.approvalResponseIdsByKey = rebuilt.approvalResponseIdsByKey;
     state.latestTurnIndex = rebuilt.latestTurnIndex;
     state.latestTurnStatus = rebuilt.latestTurnStatus;
     state.isCompactingContext = rebuilt.isCompactingContext;
@@ -909,6 +980,7 @@ function trackApprovalRequests(state: AppThreadStreamState, requests: unknown[])
     const summary = pendingApprovalFromRequest(request);
     if (summary) {
       state.approvalRequestsByKey.set(key, summary);
+      state.approvalResponseIdsByKey.set(key, approvalResponseIdFromRequest(request) ?? summary.id);
     }
   });
 }
@@ -941,6 +1013,7 @@ function applyApprovalRequestsPatch(
     const summary = pendingApprovalFromRequest(value);
     if (summary) {
       state.approvalRequestsByKey.set(key, summary);
+      state.approvalResponseIdsByKey.set(key, approvalResponseIdFromRequest(value) ?? summary.id);
     } else {
       deleteApprovalRequestKey(state, key);
     }
@@ -973,6 +1046,7 @@ function updateApprovalRequestKeyFromItem(
   const summary = pendingApprovalFromItem(item, turnIndex);
   if (summary) {
     state.approvalRequestsByKey.set(key, summary);
+    state.approvalResponseIdsByKey.set(key, approvalResponseIdFromItem(item) ?? summary.id);
   } else {
     deleteApprovalRequestKey(state, key);
   }
@@ -1013,12 +1087,14 @@ function removeApprovalRequestKeysWithPrefix(
   for (const key of [...state.approvalRequestsByKey.keys()]) {
     if (key.startsWith(prefix)) {
       state.approvalRequestsByKey.delete(key);
+      state.approvalResponseIdsByKey.delete(key);
     }
   }
 }
 
 function deleteApprovalRequestKey(state: AppThreadStreamState, key: string): void {
   state.approvalRequestsByKey.delete(key);
+  state.approvalResponseIdsByKey.delete(key);
 }
 
 function pendingApprovalFromRequest(request: unknown): PendingApprovalRequest | null {
@@ -1027,7 +1103,7 @@ function pendingApprovalFromRequest(request: unknown): PendingApprovalRequest | 
     return null;
   }
   const method = typeof object.method === 'string' ? object.method : null;
-  const id = typeof object.id === 'string' ? object.id : null;
+  const id = approvalRequestId(object.id);
   const isCompleted = object.isCompleted === true || object.completed === true;
   if (!method || !id || isCompleted || !APPROVAL_REQUEST_METHODS.has(method)) {
     return null;
@@ -1063,7 +1139,7 @@ function pendingApprovalFromItem(
   if (object.completed === true) {
     return null;
   }
-  const id = stringField(object, 'requestId') ?? stringField(object, 'id');
+  const id = approvalRequestId(object.requestId) ?? approvalRequestId(object.id);
   if (!id) {
     return null;
   }
@@ -1084,6 +1160,45 @@ function pendingApprovalFromItem(
     params,
     turnId: itemTurnId
   };
+}
+
+function approvalRequestId(value: unknown): string | null {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value)) {
+    return String(value);
+  }
+  return null;
+}
+
+function approvalResponseIdFromRequest(request: unknown): string | number | null {
+  return approvalResponseIdFromValue(asObject(request)?.id);
+}
+
+function approvalResponseIdFromItem(item: unknown): string | number | null {
+  const object = asObject(item);
+  return approvalResponseIdFromValue(object?.requestId) ?? approvalResponseIdFromValue(object?.id);
+}
+
+function approvalResponseIdFromValue(value: unknown): string | number | null {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value)) {
+    return value;
+  }
+  return null;
+}
+
+function approvalResponseIdFromRouteParam(requestId: string): string | number {
+  if (/^(0|[1-9]\d*)$/.test(requestId)) {
+    const parsed = Number(requestId);
+    if (Number.isSafeInteger(parsed)) {
+      return parsed;
+    }
+  }
+  return requestId;
 }
 
 function activeItemKey(turnIndex: number, itemIndex: number): string {

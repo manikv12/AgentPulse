@@ -25,6 +25,7 @@ import {
   Plus,
   Square,
   Terminal,
+  Trash2,
   Wrench,
   X
 } from 'lucide-react';
@@ -105,6 +106,7 @@ export type ThreadViewProps = {
     options?: { collaborationMode?: CollaborationModeKind }
   ) => Promise<ThreadMessageResponse>;
   stopWork?: (threadId: string) => Promise<void>;
+  deleteThread?: (threadId: string) => Promise<void>;
   fetchOlderMessages?: (
     beforeMessageId: string,
     limit?: number
@@ -684,6 +686,7 @@ export function ThreadView({
   fetchTranscript,
   sendMessage,
   stopWork,
+  deleteThread,
   fetchOlderMessages,
   openThreadInCodex,
   liveTranscript,
@@ -707,6 +710,7 @@ export function ThreadView({
   const [stopping, setStopping] = useState(false);
   const [implementingPlan, setImplementingPlan] = useState(false);
   const [openingCodex, setOpeningCodex] = useState(false);
+  const [deletingThread, setDeletingThread] = useState(false);
   const [error, setError] = useState('');
   const [mention, setMention] = useState<{ trigger: MentionTrigger; query: string; start: number; end: number } | undefined>();
   const [files, setFiles] = useState<{ path: string; relativePath: string }[]>([]);
@@ -930,7 +934,7 @@ export function ThreadView({
     }
     return total;
   }, [transcript?.messages]);
-  const previousLastMessageIdRef = useRef<string | undefined>();
+  const previousLastMessageIdRef = useRef<string | undefined>(undefined);
 
   // Mirror pendingMessages into a ref so applyTranscriptWindow can read the current
   // pending state without being recreated on every push/confirm.
@@ -1364,6 +1368,29 @@ export function ThreadView({
     }
   };
 
+  const handleDeleteThread = async () => {
+    if (!deleteThread || deletingThread) {
+      return;
+    }
+    const confirmed = window.confirm(
+      'Delete this thread from Codex history? You cannot undo this from Agent Pulse.'
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingThread(true);
+    setError('');
+    try {
+      await deleteThread(thread.threadId);
+      onClose?.();
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Could not delete this thread.');
+    } finally {
+      setDeletingThread(false);
+    }
+  };
+
   const handleImplementPlan = async () => {
     if (!sendMessage || !latestPlanMessage || !canOfferPlanImplementation) {
       return;
@@ -1448,6 +1475,19 @@ export function ThreadView({
             >
               <ExternalLink size={14} />
               <span>{openingCodex ? 'Opening' : 'Open Codex'}</span>
+            </button>
+          ) : null}
+          {deleteThread ? (
+            <button
+              className="codex-thread-delete"
+              type="button"
+              onClick={() => void handleDeleteThread()}
+              disabled={deletingThread}
+              aria-label="Delete thread"
+              title="Delete thread"
+            >
+              <Trash2 size={14} />
+              <span>{deletingThread ? 'Deleting' : 'Delete'}</span>
             </button>
           ) : null}
           {onClose ? (

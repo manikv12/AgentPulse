@@ -324,6 +324,12 @@ export const ThreadStopResponseSchema = z.object({
 
 export type ThreadStopResponse = z.infer<typeof ThreadStopResponseSchema>;
 
+export const ThreadDeleteResponseSchema = z.object({
+  ok: z.literal(true)
+});
+
+export type ThreadDeleteResponse = z.infer<typeof ThreadDeleteResponseSchema>;
+
 export const DeviceRevokeRequestSchema = z.object({
   deviceId: z.string().min(1)
 });
@@ -450,7 +456,7 @@ export const ApprovalDecisionResponseSchema = z.object({
   ok: z.literal(true)
 });
 
-// Approval request payload surfaced by the helper from Codex app-server live state.
+// Approval request payload surfaced by the helper from Codex live state.
 export const PendingApprovalRequestSchema = z.object({
   id: z.string().min(1),
   method: z.string().min(1),

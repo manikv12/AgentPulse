@@ -7,6 +7,7 @@ import {
   updateRemoteAccess,
   fetchThreadTranscript,
   getFingerprint,
+  deleteThread,
   openThreadInCodex,
   pairDevice,
   sendThreadMessage,
@@ -456,6 +457,35 @@ describe('tablet API helpers', () => {
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({ threadId: 'thread-1', mode: 'open' })
+      })
+    );
+  });
+
+  it('deletes a thread through the authenticated helper route', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/threads/thread-1') {
+        return {
+          ok: true,
+          json: async () => ({ ok: true })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+
+    await expect(deleteThread(session, 'thread-1')).resolves.toEqual({ ok: true });
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/threads/thread-1',
+      expect.objectContaining({
+        method: 'DELETE'
       })
     );
   });
