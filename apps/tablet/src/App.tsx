@@ -84,7 +84,7 @@ import {
   AgentPulseApiError,
   type AgentPulseSession
 } from './api';
-import { CodexMark } from './CodexMark';
+import { AppMark } from './AppMark';
 import { Dashboard, type NewThreadTarget } from './Dashboard';
 import { providerLabel, providerTone } from './providers';
 import { useThemePreference, type ThemePreference } from './theme';
@@ -1314,16 +1314,11 @@ export function App() {
         return;
       }
 
-      markThreadReady(transcript.threadId);
-      setThreads((current) =>
-        current.map((thread) =>
-          thread.threadId === transcript.threadId && threadStatusLooksWorking(thread.status)
-            ? { ...thread, status: 'idle' as const }
-            : thread
-        )
-      );
+      // A plain ready transcript can be stale while Codex is still running.
+      // OpenAssist keeps active-turn state separate from transcript reads; do
+      // the same here and let explicit status/stream completion clear working.
     },
-    [markThreadReady, markThreadWorking]
+    [markThreadWorking]
   );
 
   const syncWorkingStateFromThreads = useCallback((nextThreads: Thread[]) => {
@@ -2089,7 +2084,7 @@ export function App() {
         return next;
       });
       setActiveThreadId((current) => (current === threadId ? undefined : current));
-      setMessage('Thread deleted from Codex.');
+      setMessage('Thread removed.');
     },
     [session]
   );
@@ -2203,6 +2198,13 @@ export function App() {
           onChangeThreadModel={
             session
               ? async (threadId: string, modelSlug: string, reasoningEffort?: string) => {
+                  const previousModel = threadModels[threadId];
+                  const hadPreviousModel = Object.prototype.hasOwnProperty.call(threadModels, threadId);
+                  const previousReasoningEffort = threadReasoningEfforts[threadId];
+                  const hadPreviousReasoningEffort = Object.prototype.hasOwnProperty.call(
+                    threadReasoningEfforts,
+                    threadId
+                  );
                   // Record the pick BEFORE the network call so any transcript broadcast that
                   // races back doesn't briefly flip the chip back to the old selection.
                   userModelPicksRef.current.set(threadId, {
@@ -2224,7 +2226,30 @@ export function App() {
                       return next;
                     });
                   }
-                  await updateThreadModel(session, threadId, modelSlug, reasoningEffort);
+                  try {
+                    await updateThreadModel(session, threadId, modelSlug, reasoningEffort);
+                  } catch (error) {
+                    userModelPicksRef.current.delete(threadId);
+                    setThreadModels((current) => {
+                      const next = { ...current };
+                      if (hadPreviousModel && previousModel) {
+                        next[threadId] = previousModel;
+                      } else {
+                        delete next[threadId];
+                      }
+                      return next;
+                    });
+                    setThreadReasoningEfforts((current) => {
+                      const next = { ...current };
+                      if (hadPreviousReasoningEffort && previousReasoningEffort) {
+                        next[threadId] = previousReasoningEffort;
+                      } else {
+                        delete next[threadId];
+                      }
+                      return next;
+                    });
+                    throw error;
+                  }
                 }
               : undefined
           }
@@ -2296,7 +2321,7 @@ function ChooserScreen({
   return (
     <main className="shell centered-shell">
       <div className="surface-panel chooser-panel">
-        <CodexMark size="lg" />
+        <AppMark size="lg" />
         <p className="eyebrow">Agent Pulse</p>
         <h1>How will you use this?</h1>
         <p className="simple-copy">
@@ -2382,7 +2407,7 @@ function PairingScreen({
   return (
     <main className="shell centered-shell">
       <div className="surface-panel pairing-panel">
-        <CodexMark size="lg" />
+        <AppMark size="lg" />
         <p className="eyebrow">Connect a device</p>
         <h1>Pair this display</h1>
         <p className="simple-copy">Enter the PIN shown in admin mode on your Mac.</p>
@@ -2487,7 +2512,7 @@ function AdminLoginScreen({
   return (
     <main className="shell centered-shell">
       <div className="surface-panel pairing-panel">
-        <CodexMark size="lg" />
+        <AppMark size="lg" />
         <p className="eyebrow">Admin mode</p>
         <h1>Enter passcode</h1>
         <p className="simple-copy">
@@ -2726,7 +2751,7 @@ function SettingsScreen({
     <main className="shell settings-shell">
       <header className="topbar">
         <div className="brand-lockup">
-          <CodexMark size="md" />
+          <AppMark size="md" />
           <div>
             <p className="eyebrow">Admin mode</p>
             <h1>Agent Pulse settings</h1>

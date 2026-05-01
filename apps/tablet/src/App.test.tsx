@@ -17,6 +17,12 @@ describe('Agent Pulse tablet UI', () => {
     vi.restoreAllMocks();
   });
 
+  const expectCodexStopControl = async () => {
+    const stopButton = await screen.findByRole('button', { name: 'Stop Codex' });
+    expect(screen.queryByText('Codex is working')).not.toBeInTheDocument();
+    return stopButton;
+  };
+
   it('extracts model changes from Codex stream-state broadcast shapes', () => {
     expect(
       extractLatestModel({
@@ -1103,9 +1109,7 @@ describe('Agent Pulse tablet UI', () => {
       );
     });
 
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
-    expect(screen.getByText('Working')).toBeInTheDocument();
-    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    const stopButton = await expectCodexStopControl();
     expect(stopButton.closest('.codex-composer')).not.toBeNull();
     expect(stopButton.closest('.codex-thread-actions')).toBeNull();
 
@@ -1276,7 +1280,7 @@ describe('Agent Pulse tablet UI', () => {
     );
   });
 
-  it('clears working state when a live transcript says the thread is ready', async () => {
+  it('keeps working state when a stale ready transcript arrives before idle status', async () => {
     localStorage.setItem(
       'agent-pulse-session',
       JSON.stringify({
@@ -1391,7 +1395,7 @@ describe('Agent Pulse tablet UI', () => {
       );
     });
 
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    await expectCodexStopControl();
 
     await act(async () => {
       sockets[0]?.onmessage?.(
@@ -1422,6 +1426,22 @@ describe('Agent Pulse tablet UI', () => {
     });
 
     expect(await screen.findByText('Done.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/status/changed',
+            payload: {
+              threadId: 'thread-live',
+              status: 'idle'
+            }
+          })
+        })
+      );
+    });
+
     await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
     expect(screen.getByText('Ready')).toBeInTheDocument();
@@ -1862,8 +1882,7 @@ describe('Agent Pulse tablet UI', () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix usage bounce/ }));
-    expect(await screen.findByText('Context')).toBeInTheDocument();
-    expect(screen.getByText('72%')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Context 72%/ })).toBeInTheDocument();
 
     await act(async () => {
       sockets[0]?.onmessage?.(
@@ -1894,8 +1913,7 @@ describe('Agent Pulse tablet UI', () => {
     });
 
     expect(screen.getByText('Still working.')).toBeInTheDocument();
-    expect(screen.getByText('Context')).toBeInTheDocument();
-    expect(screen.getByText('72%')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Context 72%/ })).toBeInTheDocument();
 
     await act(async () => {
       resolveFreshTranscript?.({
@@ -1928,7 +1946,8 @@ describe('Agent Pulse tablet UI', () => {
       });
     });
 
-    expect(await screen.findByText('84%')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Context 84%/ })).toBeInTheDocument();
+    expect(screen.getByText('5h')).toBeInTheDocument();
     expect(screen.getByText('15%')).toBeInTheDocument();
   });
 
@@ -2211,6 +2230,175 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.queryByText('GPT-5.5')).not.toBeInTheDocument();
   });
 
+  it('groups the Copilot model picker by vendor and keeps groups collapsed by default', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      close(): void {}
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({
+              threads: [
+                {
+                  threadId: 'copilot:thread-model',
+                  provider: 'copilot',
+                  providerThreadId: 'thread-model',
+                  title: 'Fix Copilot grouping',
+                  workspace: 'CodexPulse',
+                  status: 'idle',
+                  lastActivityAt: '2026-05-01T17:12:00Z',
+                  lastTurnSummary: '',
+                  model: 'gpt-5.4'
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return {
+            ok: true,
+            json: async () => ({
+              models: [
+                {
+                  slug: 'gpt-5.4',
+                  displayName: 'GPT-5.4',
+                  provider: 'copilot',
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'gpt-5.2',
+                  displayName: 'GPT-5.2',
+                  provider: 'copilot',
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'claude-opus-4.6',
+                  displayName: 'Claude Opus 4.6',
+                  provider: 'copilot',
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'claude-sonnet-4.5',
+                  displayName: 'Claude Sonnet 4.5',
+                  provider: 'copilot',
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'gemini-3-pro-preview',
+                  displayName: 'Gemini 3 Pro Preview',
+                  provider: 'copilot',
+                  visibility: 'visible'
+                },
+                {
+                  slug: 'claude-opus-4.6-1m',
+                  displayName: 'Claude Opus 4.6 1M',
+                  provider: 'copilot',
+                  visibility: 'hidden'
+                },
+                {
+                  slug: 'gpt-5.5',
+                  displayName: 'GPT-5.5',
+                  provider: 'codex',
+                  visibility: 'visible'
+                }
+              ]
+            })
+          };
+        }
+
+        if (url === '/threads/copilot%3Athread-model/transcript?limit=40') {
+          return {
+            ok: true,
+            json: async () => ({
+              threadId: 'copilot:thread-model',
+              provider: 'copilot',
+              providerThreadId: 'thread-model',
+              activeTurnId: null,
+              sendState: {
+                canSend: true,
+                reason: 'ready',
+                label: 'Ready'
+              },
+              messages: [],
+              model: 'gpt-5.4'
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Copilot grouping/ }));
+
+    const modelChip = await screen.findByRole('button', { name: /GPT-5.4/ });
+    fireEvent.click(modelChip);
+
+    expect(await screen.findByRole('button', { name: /OpenAI GPT/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Anthropic Claude/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Google Gemini/ })).toBeInTheDocument();
+    expect(screen.queryByText('Claude Opus 4.6')).not.toBeInTheDocument();
+    expect(screen.queryByText('Gemini 3 Pro Preview')).not.toBeInTheDocument();
+    expect(screen.queryByText('Claude Opus 4.6 1M')).not.toBeInTheDocument();
+    expect(screen.queryByText('GPT-5.5')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Anthropic Claude/ }));
+
+    expect(await screen.findByText('Claude Opus 4.6')).toBeInTheDocument();
+    expect(screen.getByText('Claude Sonnet 4.5')).toBeInTheDocument();
+    expect(screen.queryByText('GPT-5.2')).not.toBeInTheDocument();
+  });
+
   it('lets the remote client stop a running Codex turn', async () => {
     localStorage.setItem(
       'agent-pulse-session',
@@ -2332,7 +2520,7 @@ describe('Agent Pulse tablet UI', () => {
         })
       );
     });
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    await expectCodexStopControl();
 
     const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
     expect(stopButton.closest('.codex-composer')).not.toBeNull();
@@ -2474,7 +2662,7 @@ describe('Agent Pulse tablet UI', () => {
         })
       );
     });
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    await expectCodexStopControl();
 
     fireEvent.click(screen.getByRole('button', { name: 'Stop Codex' }));
 
@@ -2587,11 +2775,10 @@ describe('Agent Pulse tablet UI', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
 
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+    await expectCodexStopControl();
   });
 
-  it('uses a fresh ready transcript as the live stream done signal', async () => {
+  it('keeps working through a ready transcript until the live status goes idle', async () => {
     localStorage.setItem(
       'agent-pulse-session',
       JSON.stringify({
@@ -2698,7 +2885,7 @@ describe('Agent Pulse tablet UI', () => {
         })
       );
     });
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    await expectCodexStopControl();
 
     await act(async () => {
       sockets[0]?.onmessage?.(
@@ -2725,6 +2912,19 @@ describe('Agent Pulse tablet UI', () => {
     });
 
     expect(await screen.findByText('Done now.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/status/changed',
+            payload: { threadId: 'thread-live', status: 'idle' }
+          })
+        })
+      );
+    });
+
     await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
     expect(screen.getByText('Ready')).toBeInTheDocument();
@@ -2779,8 +2979,7 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
     expect(await screen.findByText('Older ready state.')).toBeInTheDocument();
 
-    expect(screen.getByText('Codex is working')).toBeInTheDocument();
-    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    const stopButton = await expectCodexStopControl();
     expect(stopButton).toBeInTheDocument();
     expect(stopButton.closest('.codex-composer')).not.toBeNull();
   });
@@ -2832,8 +3031,7 @@ describe('Agent Pulse tablet UI', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Fix Mac helper sync/ }));
 
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
-    const stopButton = screen.getByRole('button', { name: 'Stop Codex' });
+    const stopButton = await expectCodexStopControl();
     expect(stopButton.closest('.codex-composer')).not.toBeNull();
   });
 
@@ -3012,7 +3210,42 @@ describe('Agent Pulse tablet UI', () => {
     if (!(tile instanceof HTMLElement)) {
       throw new Error('Expected recent activity tile to render.');
     }
-    expect(within(tile).getByText('Review')).toBeInTheDocument();
+    expect(tile.getAttribute('aria-label')).toMatch(/Review/);
+  });
+
+  it('shows provider hints in recent activity lists', () => {
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'claude-code:recent-1',
+            provider: 'claude-code',
+            title: 'Review Claude changes',
+            workspace: 'CodexPulse',
+            status: 'idle',
+            lastActivityAt: '2026-04-27T19:14:17.599Z',
+            lastTurnSummary: ''
+          }
+        ]}
+      />
+    );
+
+    const tile = document.querySelector('.codex-home-tile');
+    if (!(tile instanceof HTMLElement)) {
+      throw new Error('Expected recent activity tile to render.');
+    }
+
+    expect(tile.classList.contains('provider-claude-code')).toBe(true);
+    expect(tile.getAttribute('aria-label')).toMatch(/Claude/);
+    expect(
+      document.querySelector('.codex-insight-list-row-mark.provider-claude-code')
+    ).not.toBeNull();
   });
 
   it('restores the active chat from the URL and cached transcript before refresh requests finish', async () => {
@@ -3221,6 +3454,73 @@ describe('Agent Pulse tablet UI', () => {
     ).toBeInTheDocument();
   });
 
+  it('fuzzy searches sidebar threads by title and project name', () => {
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'running-1',
+            title: 'Implement dashboard grouping',
+            workspace: 'Agent Pulse',
+            status: 'running',
+            lastActivityAt: '2026-04-25T16:18:00Z',
+            lastTurnSummary: ''
+          },
+          {
+            threadId: 'waiting-1',
+            title: 'Review permission request',
+            workspace: 'OpenAssist',
+            status: 'waiting_approval',
+            lastActivityAt: '2026-04-25T16:14:00Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: '/Users/me/projects/AgentPulse'
+          },
+          {
+            projectId: 'project-openassist',
+            name: 'OpenAssist',
+            path: '/Users/me/projects/OpenAssist'
+          }
+        ]}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    const search = within(sidebar).getByRole('searchbox', { name: 'Search threads or projects' });
+
+    fireEvent.change(search, { target: { value: 'opn ast' } });
+    expect(within(sidebar).getByText('1 thread found')).toBeInTheDocument();
+    expect(
+      within(sidebar).getByRole('button', { name: 'Open chat for Review permission request' })
+    ).toBeInTheDocument();
+    expect(
+      within(sidebar).queryByRole('button', { name: /Open chat for Implement dashboard grouping/ })
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: 'impl grp' } });
+    expect(
+      within(sidebar).getByRole('button', { name: /Open chat for Implement dashboard grouping/ })
+    ).toBeInTheDocument();
+    expect(
+      within(sidebar).queryByRole('button', { name: 'Open chat for Review permission request' })
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(within(sidebar).getByRole('button', { name: 'Clear thread search' }));
+    expect(search).toHaveValue('');
+    expect(within(sidebar).getByText('Search by thread or project')).toBeInTheDocument();
+  });
+
   it('shows waiting approval instead of working when the thread status is approval-blocked', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'waiting-1',
@@ -3398,7 +3698,8 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Plan' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open composer options' }));
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: /Plan mode/i }));
     fireEvent.change(screen.getByLabelText('Message Codex'), {
       target: { value: 'Make a plan before editing.' }
     });
@@ -3657,6 +3958,116 @@ describe('Agent Pulse tablet UI', () => {
 
     await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
     expect(fetchTranscript).toHaveBeenCalledWith('thread-1', { messageLimit: 40 });
+  });
+
+  it('preserves the visible message position when older pages are prepended', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'message-3',
+          role: 'user',
+          kind: 'message',
+          text: 'Latest user message',
+          createdAt: '2026-04-25T16:16:00Z'
+        },
+        {
+          id: 'message-4',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Newest assistant message',
+          createdAt: '2026-04-25T16:17:00Z'
+        }
+      ]
+    }));
+    const fetchOlderMessages = vi.fn(async () => ({
+      threadId: 'thread-1',
+      messages: [
+        {
+          id: 'message-1',
+          role: 'user' as const,
+          kind: 'message' as const,
+          text: 'Older user message',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'message-2',
+          role: 'assistant' as const,
+          kind: 'message' as const,
+          text: 'Older assistant message',
+          createdAt: '2026-04-25T16:15:00Z'
+        }
+      ],
+      hasMore: false
+    }));
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-1',
+          title: 'Thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:17:00Z',
+          lastTurnSummary: ''
+        }}
+        fetchTranscript={fetchTranscript}
+        fetchOlderMessages={fetchOlderMessages}
+      />
+    );
+
+    expect(await screen.findByText('Newest assistant message')).toBeInTheDocument();
+
+    const scroller = container.querySelector('.codex-thread-messages') as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { value: 1000, configurable: true },
+      clientHeight: { value: 400, configurable: true }
+    });
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({
+      top: 0,
+      bottom: 400,
+      left: 0,
+      right: 320,
+      width: 320,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    } as DOMRect);
+    const anchor = screen
+      .getByText('Latest user message')
+      .closest('[data-scroll-anchor="true"]') as HTMLElement;
+    vi.spyOn(anchor, 'getBoundingClientRect')
+      .mockReturnValueOnce({
+        top: 120,
+        bottom: 160,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 120,
+        toJSON: () => ({})
+      } as DOMRect)
+      .mockReturnValue({
+        top: 300,
+        bottom: 340,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 300,
+        toJSON: () => ({})
+      } as DOMRect);
+
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+    fireEvent.wheel(scroller, { deltaY: -90 });
+
+    expect(await screen.findByText('Older assistant message')).toBeInTheDocument();
+    await waitFor(() => expect(scroller.scrollTop).toBe(180));
   });
 
   it('does not auto-load older pages when the latest two messages do not fill the viewport', async () => {
@@ -3936,7 +4347,8 @@ describe('Agent Pulse tablet UI', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Implement mobile chat/ }));
-    expect(await screen.findByText('Codex is working')).toBeInTheDocument();
+    expect(await screen.findByText('I am still running the command.')).toBeInTheDocument();
+    expect(screen.queryByText('Codex is working')).not.toBeInTheDocument();
     expect(screen.getByText('I am still running the command.')).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('Message Codex'), {
       target: { value: 'Add one more detail.' }
@@ -4215,11 +4627,11 @@ describe('Agent Pulse tablet UI', () => {
   it('keeps live agent work visible until the final answer arrives', async () => {
     const transcript: ThreadTranscript = {
       threadId: 'running-1',
-      activeTurnId: 'turn-1',
+      activeTurnId: 'mirror-streaming:running-1',
       sendState: {
-        canSend: true,
-        reason: 'ready',
-        label: 'Ready'
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Codex is working'
       },
       messages: [
         {
@@ -4284,8 +4696,68 @@ describe('Agent Pulse tablet UI', () => {
     // until a non-commentary final answer arrives, mirroring the desktop UI.
     const workToggle = screen.getByRole('button', { name: /Used the browser/ });
     expect(workToggle).toBeInTheDocument();
-    fireEvent.click(workToggle);
+    expect(workToggle).toHaveClass('is-live');
+    expect(workToggle.closest('.codex-activity-group')).toHaveClass('is-live');
+    expect(screen.queryByText('Codex is working')).not.toBeInTheDocument();
     expect(await screen.findByRole('button', { name: /browser.screenshot completed/ })).toBeInTheDocument();
+  });
+
+  it('keeps live Claude updates inside shared progress until the final answer arrives', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'claude-code:thread-live',
+      provider: 'claude-code',
+      activeTurnId: 'claude-turn-live',
+      sendState: {
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Claude is working'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Fix the streaming order.',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'assistant-progress-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'I am tracing the Claude stream now.',
+          createdAt: '2026-04-25T16:14:05Z',
+          phase: 'commentary'
+        } as ThreadTranscript['messages'][number],
+        {
+          id: 'tool-1',
+          role: 'activity',
+          kind: 'tool',
+          text: 'Bash\n{"command":"pwd"}',
+          createdAt: '2026-04-25T16:14:10Z'
+        }
+      ]
+    };
+
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'claude-code:thread-live',
+          provider: 'claude-code',
+          title: 'Claude streaming',
+          workspace: 'CodexPulse',
+          status: 'running',
+          lastActivityAt: '2026-04-25T16:14:10Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+      />
+    );
+
+    const workToggle = screen.getByRole('button', { name: /Used 1 tool/ });
+    expect(workToggle).toHaveClass('is-live');
+    expect(workToggle.closest('.codex-activity-group')).toHaveClass('is-live');
+    expect(screen.getByRole('button', { name: /I am tracing the Claude stream now\./ })).toBeInTheDocument();
+    expect(container.querySelector('.codex-message--assistant')).toBeNull();
   });
 
   it('summarizes hidden exploration and searches like OpenAssist', async () => {
@@ -4330,7 +4802,7 @@ describe('Agent Pulse tablet UI', () => {
       ]
     };
 
-    render(
+    const { container } = render(
       <ThreadView
         thread={{
           threadId: 'running-1',
@@ -4345,8 +4817,220 @@ describe('Agent Pulse tablet UI', () => {
     );
 
     expect(screen.getByText('Here is the final answer.')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Explored the workspace, ran 4 searches/ })).toBeInTheDocument();
+    const summary = screen.getByRole('button', { name: /Explored the workspace, ran 4 searches/ });
+    expect(summary).toBeInTheDocument();
     expect(screen.queryByText(/web_search completed/)).not.toBeInTheDocument();
+
+    const renderedOrder = Array.from(
+      container.querySelectorAll('.codex-message--user, .codex-activity-group, .codex-message--assistant')
+    ).map((node) =>
+      node.classList.contains('codex-message--user')
+        ? 'user'
+        : node.classList.contains('codex-activity-group')
+          ? 'activity'
+          : 'assistant'
+    );
+    expect(renderedOrder).toEqual(['user', 'activity', 'assistant']);
+
+    fireEvent.click(summary);
+    expect(screen.getByRole('button', { name: /rg -n "streaming" Sources/ })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /web_search completed/ })).toHaveLength(4);
+    fireEvent.click(summary);
+    expect(screen.queryByText(/web_search completed/)).not.toBeInTheDocument();
+  });
+
+  it('keeps activity provider colors and assistant icons for Codex, Claude, and Copilot', () => {
+    const cases = [
+      { provider: 'codex' as const, tone: 'codex', avatar: '.codex-mark' },
+      { provider: 'claude-code' as const, tone: 'claude-code', avatar: '.claude-mark' },
+      { provider: 'copilot' as const, tone: 'copilot', avatar: '.copilot-mark' }
+    ];
+
+    for (const item of cases) {
+      const transcript: ThreadTranscript = {
+        threadId: `${item.provider}:thread-provider`,
+        provider: item.provider,
+        activeTurnId: null,
+        sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+        messages: [
+          {
+            id: `user-${item.provider}`,
+            role: 'user',
+            kind: 'message',
+            text: 'Check provider styling.',
+            createdAt: '2026-04-25T16:14:00Z'
+          },
+          {
+            id: `tool-${item.provider}`,
+            role: 'activity',
+            kind: 'tool',
+            text: 'Bash pwd',
+            createdAt: '2026-04-25T16:14:04Z'
+          },
+          {
+            id: `assistant-${item.provider}`,
+            role: 'assistant',
+            kind: 'message',
+            text: 'Provider reply.',
+            createdAt: '2026-04-25T16:15:00Z',
+            phase: 'final_answer'
+          }
+        ]
+      };
+
+      const { container, unmount } = render(
+        <ThreadView
+          thread={{
+            threadId: `${item.provider}:thread-provider`,
+            provider: item.provider,
+            title: 'Provider thread',
+            workspace: 'Agent Pulse',
+            status: 'idle',
+            lastActivityAt: '2026-04-25T16:15:00Z',
+            lastTurnSummary: ''
+          }}
+          liveTranscript={transcript}
+        />
+      );
+
+      expect(container.querySelector(`.codex-activity-group.provider-${item.tone}`)).not.toBeNull();
+      expect(
+        container.querySelector(`.codex-message-avatar.provider-${item.tone} ${item.avatar}`)
+      ).not.toBeNull();
+      unmount();
+    }
+  });
+
+  it('uses the Claude avatar for Claude assistant replies', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'claude-code:thread-avatar',
+      provider: 'claude-code',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Claude reply.',
+          createdAt: '2026-04-25T16:15:00Z'
+        }
+      ]
+    };
+
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'claude-code:thread-avatar',
+          provider: 'claude-code',
+          title: 'Claude thread',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+      />
+    );
+
+    expect(container.querySelector('.codex-message-avatar.provider-claude-code .claude-mark')).not.toBeNull();
+    expect(container.querySelector('.codex-message-avatar.provider-claude-code .codex-mark')).toBeNull();
+  });
+
+  it('hides Codex plugins, skills, and slash commands in the Claude composer', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'claude-code:thread-composer',
+      provider: 'claude-code',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'claude-code:thread-composer',
+          provider: 'claude-code',
+          title: 'Claude thread',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        plugins={[
+          {
+            slug: 'browser-use',
+            marketplace: 'openai-bundled',
+            qualifiedSlug: 'browser-use@openai-bundled',
+            displayName: 'Browser Use',
+            shortDescription: 'Open Codex browser pages.',
+            enabled: true
+          }
+        ]}
+        skills={[
+          {
+            slug: 'browser',
+            name: 'Browser',
+            description: 'Browser skill',
+            source: 'user'
+          }
+        ]}
+        commands={[
+          {
+            slug: 'compact',
+            name: 'compact',
+            description: 'Compact the Codex context.',
+            builtIn: true
+          }
+        ]}
+      />
+    );
+
+    const input = screen.getByPlaceholderText('Ask Claude anything');
+
+    fireEvent.change(input, { target: { value: '/', selectionStart: 1 } });
+    fireEvent.keyUp(input, { key: '/' });
+    expect(screen.queryByText('/compact')).not.toBeInTheDocument();
+    expect(screen.queryByText('No matching commands.')).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: '@browser', selectionStart: 8 } });
+    fireEvent.keyUp(input, { key: 'r' });
+    expect(screen.queryByText('Browser Use')).not.toBeInTheDocument();
+    expect(screen.queryByText('Browser')).not.toBeInTheDocument();
+  });
+
+  it('allows deleting a Claude thread from the thread header', async () => {
+    const deleteThread = vi.fn(async () => undefined);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const transcript: ThreadTranscript = {
+      threadId: 'claude-code:thread-delete',
+      provider: 'claude-code',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'claude-code:thread-delete',
+          provider: 'claude-code',
+          title: 'Claude thread',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        deleteThread={deleteThread}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete thread' }));
+
+    await waitFor(() => expect(deleteThread).toHaveBeenCalledWith('claude-code:thread-delete'));
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/local Claude history/i));
   });
 
   it('uses a project dropdown before creating a new Codex thread', async () => {
@@ -4402,6 +5086,128 @@ describe('Agent Pulse tablet UI', () => {
       })
     );
     expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
+  });
+
+  it('lets a new thread choose any enabled agent and only that agent model', async () => {
+    const newThread = {
+      threadId: 'claude-code:thread-new',
+      provider: 'claude-code' as const,
+      title: 'New Claude thread',
+      workspace: 'OpenAssist',
+      status: 'idle' as const,
+      lastActivityAt: '2026-04-26T10:00:00Z',
+      lastTurnSummary: ''
+    };
+    const onNewThread = vi.fn(async () => newThread);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[]}
+        projects={[
+          {
+            projectId: 'project-openassist',
+            name: 'OpenAssist',
+            path: '/Users/me/projects/OpenAssist',
+            providers: ['claude-code']
+          }
+        ]}
+        models={[
+          {
+            slug: 'gpt-5.5',
+            displayName: 'GPT-5.5',
+            provider: 'codex'
+          },
+          {
+            slug: 'sonnet',
+            displayName: 'Claude Sonnet',
+            provider: 'claude-code'
+          }
+        ]}
+        onNewThread={onNewThread}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'New thread in OpenAssist' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'New thread' });
+    expect(within(dialog).getByRole('combobox', { name: 'Project' })).toHaveValue('project-openassist');
+    expect(within(dialog).getByRole('radio', { name: 'Codex' })).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Claude' }));
+
+    const modelSelect = within(dialog).getByRole('combobox', { name: 'Model' });
+    expect(within(modelSelect).queryByRole('option', { name: 'GPT-5.5' })).not.toBeInTheDocument();
+    expect(within(modelSelect).getByRole('option', { name: 'Claude Sonnet' })).toBeInTheDocument();
+
+    fireEvent.change(modelSelect, { target: { value: 'sonnet' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start thread' }));
+
+    await waitFor(() =>
+      expect(onNewThread).toHaveBeenCalledWith({
+        projectId: 'project-openassist',
+        provider: 'claude-code',
+        modelSlug: 'sonnet'
+      })
+    );
+  });
+
+  it('removes an empty newly-created draft thread when closing it', async () => {
+    const newThread = {
+      threadId: 'thread-new-empty',
+      provider: 'codex' as const,
+      title: 'New thread',
+      workspace: 'CodexPulse',
+      status: 'idle' as const,
+      lastActivityAt: '2026-04-26T10:00:00Z',
+      lastTurnSummary: ''
+    };
+    const onNewThread = vi.fn(async () => newThread);
+    const onDeleteThread = vi.fn(async () => undefined);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[]}
+        projects={[
+          {
+            projectId: 'project-codexpulse',
+            name: 'CodexPulse',
+            path: '/Users/me/projects/CodexPulse'
+          }
+        ]}
+        transcriptUpdates={{
+          'thread-new-empty': {
+            threadId: 'thread-new-empty',
+            provider: 'codex',
+            activeTurnId: null,
+            sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+            messages: []
+          }
+        }}
+        onNewThread={onNewThread}
+        onDeleteThread={onDeleteThread}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'New thread' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New thread' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start thread' }));
+
+    expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Close thread chat' }));
+
+    await waitFor(() => expect(onDeleteThread).toHaveBeenCalledWith('thread-new-empty'));
+    expect(screen.queryByRole('button', { name: /Open chat for New thread/ })).not.toBeInTheDocument();
   });
 
   it('shows an empty dropdown state when no Codex projects are listed', async () => {

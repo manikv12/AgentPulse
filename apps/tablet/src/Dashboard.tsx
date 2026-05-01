@@ -12,15 +12,16 @@ import type {
   ThreadMessageResponse,
   ThreadTranscript
 } from '@agent-pulse/shared';
-import { Menu, MessagesSquare, X } from 'lucide-react';
+import { CheckCheck, Menu, MessagesSquare, X } from 'lucide-react';
 import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
 import type { FetchThreadTranscriptOptions } from './api';
 import { DashboardInsights } from './DashboardInsights';
+import { ProviderMark } from './ProviderMark';
 import { Sidebar } from './Sidebar';
 import { Spinner } from './Spinner';
 import { ThreadView, type ApprovalMethodForUi } from './ThreadView';
 import { providerForModel, providerLabel, providerTone } from './providers';
-import { relativeTime, statusLabels, statusTone, hasUnseenActivity, threadNeedsReview } from './status';
+import { relativeTime, statusLabels, statusTone, isAttentionStatus, threadNeedsReview } from './status';
 
 const SEEN_ACTIVITY_KEY = 'agent-pulse:seen-thread-activity';
 const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
@@ -138,7 +139,11 @@ export function Dashboard({
   const [internalActiveThreadId, setInternalActiveThreadId] = useState<string | undefined>(() => readActiveThreadId());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [createdThreads, setCreatedThreads] = useState<Thread[]>([]);
+  const [touchedCreatedThreadIds, setTouchedCreatedThreadIds] = useState<Set<string>>(
+    () => new Set()
+  );
   const [newThreadDialogOpen, setNewThreadDialogOpen] = useState(false);
+  const [newThreadInitialProjectId, setNewThreadInitialProjectId] = useState<string | undefined>();
   const [newThreadError, setNewThreadError] = useState('');
   const [creatingProjectId, setCreatingProjectId] = useState<string | undefined>();
   const [localSeenThreadActivity, setLocalSeenThreadActivity] = useState<Record<string, number>>(
@@ -262,17 +267,56 @@ export function Dashboard({
   const handleCloseThread = () => {
     if (activeThread) {
       markThreadSeen(activeThread, setSeenThreadActivity);
+      const isLocalDraft = createdThreads.some((thread) => thread.threadId === activeThread.threadId);
+      const transcript = transcriptUpdates[activeThread.threadId];
+      const hasUserInput = touchedCreatedThreadIds.has(activeThread.threadId);
+      const isEmptyDraft =
+        isLocalDraft && !hasUserInput && (!transcript || transcript.messages.length === 0);
+      if (isEmptyDraft && onDeleteThread) {
+        void onDeleteThread(activeThread.threadId).catch(() => undefined);
+        setCreatedThreads((current) =>
+          current.filter((thread) => thread.threadId !== activeThread.threadId)
+        );
+        setTouchedCreatedThreadIds((current) => {
+          if (!current.has(activeThread.threadId)) {
+            return current;
+          }
+          const next = new Set(current);
+          next.delete(activeThread.threadId);
+          return next;
+        });
+      }
     }
     updateActiveThreadId(undefined);
   };
 
   const handleNewThread = (projectId?: string) => {
-    if (!projectId) {
-      setNewThreadDialogOpen(true);
-      setNewThreadError('');
+    setNewThreadInitialProjectId(projectId);
+    setNewThreadDialogOpen(true);
+    setNewThreadError('');
+  };
+
+  const handleMarkAllReviewed = () => {
+    const reviewThreads = visibleThreads.filter((thread) =>
+      threadNeedsReview(thread, seenThreadActivity)
+    );
+    if (reviewThreads.length === 0) {
       return;
     }
-    void createThread({ projectId });
+
+    setSeenThreadActivity((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const thread of reviewThreads) {
+        const activityAt = Date.parse(thread.lastActivityAt);
+        if (!Number.isFinite(activityAt) || (next[thread.threadId] ?? 0) >= activityAt) {
+          continue;
+        }
+        next[thread.threadId] = activityAt;
+        changed = true;
+      }
+      return changed ? next : current;
+    });
   };
 
   const createThread = async (target: NewThreadTarget): Promise<boolean> => {
@@ -288,6 +332,14 @@ export function Dashboard({
         thread,
         ...current.filter((candidate) => candidate.threadId !== thread.threadId)
       ]);
+      setTouchedCreatedThreadIds((current) => {
+        if (!current.has(thread.threadId)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(thread.threadId);
+        return next;
+      });
       updateActiveThreadId(thread.threadId);
       setSidebarOpen(false);
       setNewThreadDialogOpen(false);
@@ -331,7 +383,25 @@ export function Dashboard({
             onClose={handleCloseThread}
             onOpenSidebar={() => setSidebarOpen(true)}
             fetchTranscript={fetchTranscript}
-            sendMessage={sendMessage}
+            sendMessage={
+              sendMessage
+                ? async (threadId, text, options) => {
+                    if (createdThreads.some((thread) => thread.threadId === threadId)) {
+                      setTouchedCreatedThreadIds((current) => {
+                        if (current.has(threadId)) {
+                          return current;
+                        }
+                        const next = new Set(current);
+                        next.add(threadId);
+                        return next;
+                      });
+                    }
+                    return options === undefined
+                      ? sendMessage(threadId, text)
+                      : sendMessage(threadId, text, options);
+                  }
+                : undefined
+            }
             stopWork={stopWork}
             deleteThread={onDeleteThread}
             fetchOlderMessages={
@@ -379,6 +449,8 @@ export function Dashboard({
             onOpenSidebar={() => setSidebarOpen(true)}
             isLoading={!threadsLoaded}
             seenThreadActivity={seenThreadActivity}
+            onMarkAllReviewed={handleMarkAllReviewed}
+            workingThreadIds={workingThreadIds}
           />
         )}
       </main>
@@ -392,8 +464,10 @@ export function Dashboard({
       ) : null}
       {newThreadDialogOpen ? (
         <NewThreadDialog
+          key={newThreadInitialProjectId ?? 'new-thread'}
           projects={projects}
           models={models}
+          initialProjectId={newThreadInitialProjectId}
           creatingProjectId={creatingProjectId}
           error={newThreadError}
           onClose={() => setNewThreadDialogOpen(false)}
@@ -467,6 +541,7 @@ function markThreadSeen(
 function NewThreadDialog({
   projects,
   models,
+  initialProjectId,
   creatingProjectId,
   error,
   onClose,
@@ -474,12 +549,17 @@ function NewThreadDialog({
 }: {
   projects: Project[];
   models: CatalogModel[];
+  initialProjectId?: string;
   creatingProjectId?: string;
   error: string;
   onClose: () => void;
   onCreate: (target: NewThreadTarget) => void;
 }) {
-  const [selectedProjectId, setSelectedProjectId] = useState(() => projects[0]?.projectId ?? '');
+  const [selectedProjectId, setSelectedProjectId] = useState(() =>
+    initialProjectId && projects.some((project) => project.projectId === initialProjectId)
+      ? initialProjectId
+      : projects[0]?.projectId ?? ''
+  );
   const [selectedProvider, setSelectedProvider] = useState<AgentProvider>('codex');
   // Empty `selectedModelSlug` means "use the project's default model from
   // ~/.codex/config.toml". The user can override here for one-off threads.
@@ -487,12 +567,16 @@ function NewThreadDialog({
   const [selectedEffort, setSelectedEffort] = useState<string>('');
   const creating = creatingProjectId !== undefined;
   const selectedProject = projects.find((project) => project.projectId === selectedProjectId);
-  const availableProviders = useMemo<AgentProvider[]>(
-    () => (selectedProject?.providers?.length ? [...selectedProject.providers] : ['codex']),
-    [selectedProject?.providers]
-  );
+  const availableProviders = useMemo<AgentProvider[]>(() => {
+    const providers = [
+      ...models.map((model) => providerForModel(model)),
+      ...projects.flatMap((project) => project.providers ?? [])
+    ];
+    const uniqueProviders = [...new Set(providers)];
+    return uniqueProviders.length > 0 ? uniqueProviders : ['codex'];
+  }, [models, projects]);
   const providerModels = useMemo(
-    () => models.filter((model) => providerForModel(model) === selectedProvider),
+    () => models.filter((model) => providerForModel(model) === selectedProvider && model.visibility !== 'hidden'),
     [models, selectedProvider]
   );
   const selectedModel = providerModels.find((model) => model.slug === selectedModelSlug);
@@ -601,9 +685,9 @@ function NewThreadDialog({
             <p className="new-thread-empty">No saved projects are available yet.</p>
           )}
 
-          {selectedProject && availableProviders.length > 1 ? (
+          {selectedProject && availableProviders.length > 0 ? (
             <>
-              <span className="new-thread-label">Provider</span>
+              <span className="new-thread-label">Agent</span>
               <div className="new-thread-provider-row" role="radiogroup" aria-label="Provider">
                 {availableProviders.map((provider) => (
                   <button
@@ -699,32 +783,82 @@ function capitalizeEffort(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
+const EMPTY_MAIN_TONE_COLOR: Record<string, string> = {
+  green: 'var(--tone-green)',
+  blue: 'var(--tone-blue)',
+  yellow: 'var(--tone-yellow)',
+  red: 'var(--tone-red)',
+  orange: 'var(--tone-orange)',
+  gray: 'var(--tone-gray)'
+};
+
 function EmptyMain({
   threads,
   onOpenSidebar,
   onSelectThread,
   isLoading = false,
-  seenThreadActivity = {}
+  seenThreadActivity = {},
+  onMarkAllReviewed,
+  workingThreadIds = new Set()
 }: {
   threads: Thread[];
   onOpenSidebar: () => void;
   onSelectThread: (thread: Thread) => void;
   isLoading?: boolean;
   seenThreadActivity?: Record<string, number>;
+  onMarkAllReviewed?: () => void;
+  workingThreadIds?: Set<string>;
 }) {
-  const recentThreads = [...threads]
-    .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
-    .slice(0, 8);
+  const running = threads.filter(
+    t => workingThreadIds.has(t.threadId) || t.status === 'running' || t.status === 'compacting'
+  ).length;
+  const waiting = threads.filter(t => t.status === 'waiting_approval').length;
+  const errors = threads.filter(t => t.status === 'error' || t.status === 'connection').length;
+
+  const reviewThreads = useMemo(() =>
+    threads
+      .filter(t => threadNeedsReview(t, seenThreadActivity))
+      .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime()),
+    [seenThreadActivity, threads]
+  );
+
+  const attentionThreads = useMemo(() =>
+    threads
+      .filter(t => isAttentionStatus(t.status) && !threadNeedsReview(t, seenThreadActivity))
+      .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
+      .slice(0, 6),
+    [seenThreadActivity, threads]
+  );
+
+  const recentThreads = useMemo(() =>
+    threads
+      .filter(t => !isAttentionStatus(t.status) && !threadNeedsReview(t, seenThreadActivity))
+      .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
+      .slice(0, 10),
+    [seenThreadActivity, threads]
+  );
+
+  const isLiveThread = (thread: Thread) =>
+    workingThreadIds.has(thread.threadId) || thread.status === 'running' || thread.status === 'compacting';
+
+  const threadDotTone = (thread: Thread) => statusTone[isLiveThread(thread) ? 'running' : thread.status];
+  const heroTitle =
+    running > 0
+      ? `${running} thread${running === 1 ? '' : 's'} running`
+      : reviewThreads.length > 0
+        ? `${reviewThreads.length} thread${reviewThreads.length === 1 ? '' : 's'} ready for review`
+        : 'Agent Pulse is ready';
+  const heroCopy =
+    running > 0
+      ? 'Live work is in progress. Open a thread to watch the latest changes.'
+      : reviewThreads.length > 0
+        ? 'Recent work finished. Review the threads that need your attention.'
+        : 'Pick a recent thread to continue or check what happened last.';
 
   if (isLoading && threads.length === 0) {
     return (
       <section className="codex-shell-empty codex-home">
-        <button
-          className="codex-sidebar-toggle"
-          type="button"
-          onClick={onOpenSidebar}
-          aria-label="Open thread list"
-        >
+        <button className="codex-sidebar-toggle" type="button" onClick={onOpenSidebar} aria-label="Open thread list">
           <Menu size={20} />
         </button>
         <div className="codex-loading-overlay">
@@ -737,57 +871,193 @@ function EmptyMain({
 
   return (
     <section className="codex-shell-empty codex-home">
-      <button
-        className="codex-sidebar-toggle"
-        type="button"
-        onClick={onOpenSidebar}
-        aria-label="Open thread list"
-      >
+      <button className="codex-sidebar-toggle" type="button" onClick={onOpenSidebar} aria-label="Open thread list">
         <Menu size={20} />
       </button>
-      <div className="codex-home-hero glass">
-        <div className="codex-home-hero-icon" aria-hidden="true">
-          <MessagesSquare size={28} />
-        </div>
-        <h1 className="codex-home-hero-title">Agent Pulse</h1>
-        <p className="codex-home-hero-subtitle">Pick a thread to follow what Codex is doing.</p>
-      </div>
 
-      {recentThreads.length > 0 ? (
-        <div className="codex-home-section">
-          <div className="codex-home-section-heading">
-            <h2 className="codex-home-section-title">Recent activity</h2>
-            <span className="codex-home-section-meta">{recentThreads.length} thread{recentThreads.length === 1 ? '' : 's'}</span>
-          </div>
-          <div className="codex-home-tiles">
-            {recentThreads.map((thread) => {
-              const needsReview = threadNeedsReview(thread, seenThreadActivity);
-              const tone = needsReview ? 'yellow' : statusTone[thread.status] || 'gray';
-              const statusLabel = needsReview ? 'Review' : statusLabels[thread.status] ?? thread.status;
-              return (
-                <button
-                  key={thread.threadId}
-                  type="button"
-                  className="codex-home-tile"
-                  onClick={() => onSelectThread(thread)}
-                >
-                  <div className="codex-home-tile-row">
-                    <span
-                      className={`codex-home-tile-dot tone-${tone}`}
-                      style={{ background: `var(--tone-${tone})` }}
-                      aria-hidden="true"
-                    />
-                    <span className="codex-home-tile-status">{statusLabel}</span>
-                    <span className="codex-home-tile-time">{relativeTime(thread.lastActivityAt)}</span>
-                  </div>
-                  <h3 className="codex-home-tile-title">{thread.title}</h3>
-                  <p className="codex-home-tile-workspace">{thread.workspace}</p>
-                </button>
-              );
-            })}
-          </div>
+      <div className="codex-home-dashboard">
+        <div className="codex-home-topbar">
+          <h1 className="codex-home-topbar-title">Agent Pulse</h1>
+          {threads.length > 0 && (
+            <div className="codex-home-status-chips">
+              {running > 0 && (
+                <span className="codex-home-chip codex-home-chip-blue">
+                  <span className="codex-home-chip-dot is-working" aria-hidden="true" />
+                  {running} running
+                </span>
+              )}
+              {waiting > 0 && (
+                <span className="codex-home-chip codex-home-chip-yellow">
+                  <span className="codex-home-chip-dot" aria-hidden="true" />
+                  {waiting} waiting
+                </span>
+              )}
+              {errors > 0 && (
+                <span className="codex-home-chip codex-home-chip-red">
+                  <span className="codex-home-chip-dot" aria-hidden="true" />
+                  {errors} error{errors !== 1 ? 's' : ''}
+                </span>
+              )}
+            </div>
+          )}
         </div>
-      ) : null}
+
+        {threads.length === 0 ? (
+          <div className="codex-home-empty">
+            <MessagesSquare size={28} aria-hidden="true" />
+            <p>No threads yet. Start a new thread in Codex.</p>
+          </div>
+        ) : (
+          <div className="codex-home-content">
+            <div className="codex-home-hero-panel">
+              <div className="codex-home-hero-icon" aria-hidden="true">
+                <MessagesSquare size={22} />
+              </div>
+              <div className="codex-home-hero-copy">
+                <p className="codex-home-hero-eyebrow">{threads.length} total threads</p>
+                <h2 className="codex-home-hero-title">{heroTitle}</h2>
+                <p className="codex-home-hero-subtitle">{heroCopy}</p>
+              </div>
+            </div>
+
+            <div className="codex-home-kpi-row" aria-label="Thread summary">
+              <div className="codex-home-kpi">
+                <span className="codex-home-kpi-value tone-blue">{running}</span>
+                <span className="codex-home-kpi-label">Running</span>
+              </div>
+              <div className="codex-home-kpi">
+                <span className="codex-home-kpi-value tone-yellow">{reviewThreads.length}</span>
+                <span className="codex-home-kpi-label">Review</span>
+              </div>
+              <div className="codex-home-kpi">
+                <span className="codex-home-kpi-value tone-green">{recentThreads.length}</span>
+                <span className="codex-home-kpi-label">Recent</span>
+              </div>
+            </div>
+
+            {reviewThreads.length > 0 && (
+              <div className="codex-home-card">
+                <div className="codex-home-card-header">
+                  <h2 className="codex-home-card-title">Needs review</h2>
+                  {onMarkAllReviewed ? (
+                    <button
+                      className="codex-home-mark-reviewed"
+                      type="button"
+                      onClick={onMarkAllReviewed}
+                    >
+                      <CheckCheck size={14} aria-hidden="true" />
+                      <span>Mark all reviewed</span>
+                    </button>
+                  ) : null}
+                </div>
+                <div className="codex-home-thread-list">
+                  {reviewThreads.map((t) => (
+                    <button
+                      key={t.threadId}
+                      className={`codex-home-tile codex-home-thread-row provider-${providerTone(t.provider)}`}
+                      type="button"
+                      onClick={() => onSelectThread(t)}
+                      aria-label={`Review ${providerLabel(t.provider)} chat ${t.title}`}
+                    >
+                      <span
+                        className={`codex-home-thread-dot ${isLiveThread(t) ? 'is-working' : ''}`}
+                        style={{
+                          background: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)],
+                          color: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)]
+                        }}
+                        aria-hidden="true"
+                      />
+                      <span
+                        className={`codex-home-thread-mark provider-${providerTone(t.provider)}`}
+                        aria-hidden="true"
+                      >
+                        <ProviderMark provider={t.provider} size="sm" />
+                      </span>
+                      <span className="codex-home-thread-title">{t.title}</span>
+                      <span className="codex-home-thread-badge" data-status="review">
+                        Review
+                      </span>
+                      <span className="codex-home-thread-time">{relativeTime(t.lastActivityAt)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {attentionThreads.length > 0 && (
+              <div className="codex-home-card">
+                <h2 className="codex-home-card-title">Needs attention</h2>
+                <div className="codex-home-thread-list">
+                  {attentionThreads.map((t) => (
+                    <button
+                      key={t.threadId}
+                      className={`codex-home-tile codex-home-thread-row provider-${providerTone(t.provider)}`}
+                      type="button"
+                      onClick={() => onSelectThread(t)}
+                      aria-label={`Open ${providerLabel(t.provider)} chat ${t.title}`}
+                    >
+                      <span
+                        className={`codex-home-thread-dot ${isLiveThread(t) ? 'is-working' : ''}`}
+                        style={{
+                          background: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)],
+                          color: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)]
+                        }}
+                        aria-hidden="true"
+                      />
+                      <span
+                        className={`codex-home-thread-mark provider-${providerTone(t.provider)}`}
+                        aria-hidden="true"
+                      >
+                        <ProviderMark provider={t.provider} size="sm" />
+                      </span>
+                      <span className="codex-home-thread-title">{t.title}</span>
+                      <span className="codex-home-thread-badge" data-status={t.status}>
+                        {statusLabels[t.status]}
+                      </span>
+                      <span className="codex-home-thread-time">{relativeTime(t.lastActivityAt)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {recentThreads.length > 0 && (
+              <div className="codex-home-card">
+                <h2 className="codex-home-card-title">Recent threads</h2>
+                <div className="codex-home-thread-list">
+                  {recentThreads.map((t) => (
+                    <button
+                      key={t.threadId}
+                      className={`codex-home-tile codex-home-thread-row provider-${providerTone(t.provider)}`}
+                      type="button"
+                      onClick={() => onSelectThread(t)}
+                      aria-label={`Open ${providerLabel(t.provider)} chat ${t.title}`}
+                    >
+                      <span
+                        className={`codex-home-thread-dot ${isLiveThread(t) ? 'is-working' : ''}`}
+                        style={{
+                          background: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)],
+                          color: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)]
+                        }}
+                        aria-hidden="true"
+                      />
+                      <span
+                        className={`codex-home-thread-mark provider-${providerTone(t.provider)}`}
+                        aria-hidden="true"
+                      >
+                        <ProviderMark provider={t.provider} size="sm" />
+                      </span>
+                      <span className="codex-home-thread-title">{t.title}</span>
+                      <span className="codex-home-thread-workspace">{t.workspace}</span>
+                      <span className="codex-home-thread-time">{relativeTime(t.lastActivityAt)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </section>
   );
 }

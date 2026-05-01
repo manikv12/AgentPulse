@@ -10,10 +10,13 @@ import {
   Settings,
   Sun,
   Wifi,
-  WifiOff
+  WifiOff,
+  Search,
+  X
 } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
-import { CodexMark } from './CodexMark';
+import { AppMark } from './AppMark';
+import { ProviderMark } from './ProviderMark';
 import { providerLabel, providerTone } from './providers';
 import { hasUnseenActivity, isAttentionStatus, relativeTime, statusTone, threadNeedsReview } from './status';
 import { useThemePreference, type ThemePreference } from './theme';
@@ -127,6 +130,75 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
   return [...groupedThreads, ...emptyProjectGroups];
 }
 
+function fuzzyIncludes(value: string | undefined, query: string): boolean {
+  const haystack = normalizeSearchText(value);
+  const needle = normalizeSearchText(query);
+  if (!needle) {
+    return true;
+  }
+  if (haystack.includes(needle)) {
+    return true;
+  }
+  const compactHaystack = haystack.replace(/\s+/g, '');
+  const compactNeedle = needle.replace(/\s+/g, '');
+  if (compactHaystack.includes(compactNeedle)) {
+    return true;
+  }
+
+  let index = 0;
+  for (const char of compactHaystack) {
+    if (char === compactNeedle[index]) {
+      index += 1;
+      if (index === compactNeedle.length) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function normalizeSearchText(value: string | undefined): string {
+  return (value ?? '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function filterProjectGroups(groups: ProjectGroup[], rawQuery: string): ProjectGroup[] {
+  const query = rawQuery.trim();
+  if (!query) {
+    return groups;
+  }
+
+  return groups
+    .map((group) => {
+      const projectMatches =
+        fuzzyIncludes(group.workspace, query) ||
+        fuzzyIncludes(group.workspacePath, query) ||
+        fuzzyIncludes(group.project?.name, query) ||
+        fuzzyIncludes(group.project?.path, query);
+      const matchingThreads = group.threads.filter(
+        (thread) =>
+          projectMatches ||
+          fuzzyIncludes(thread.title, query) ||
+          fuzzyIncludes(thread.workspace, query) ||
+          fuzzyIncludes(thread.workspacePath, query)
+      );
+
+      if (!projectMatches && matchingThreads.length === 0) {
+        return undefined;
+      }
+
+      return {
+        ...group,
+        threads: projectMatches ? group.threads : matchingThreads
+      };
+    })
+    .filter((group): group is ProjectGroup => group !== undefined);
+}
+
 function ThemeQuickToggle({
   theme,
   onChange
@@ -170,6 +242,16 @@ export function Sidebar({
   const { theme, setTheme } = useThemePreference();
   const [collapsed, setCollapsed] = useState<boolean>(() => readCollapsedFromStorage());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => readCollapsedGroupsFromStorage());
+  const [searchQuery, setSearchQuery] = useState('');
+  const visibleProjectGroups = useMemo(
+    () => filterProjectGroups(projectGroups, searchQuery),
+    [projectGroups, searchQuery]
+  );
+  const searchActive = searchQuery.trim().length > 0;
+  const visibleThreadCount = visibleProjectGroups.reduce(
+    (count, group) => count + group.threads.length,
+    0
+  );
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -227,7 +309,7 @@ export function Sidebar({
           type="button"
           style={{ background: 'transparent', border: 0, padding: 0, cursor: 'pointer' }}
         >
-          <CodexMark size="sm" />
+          <AppMark size="sm" />
         </button>
 
         <button
@@ -264,20 +346,16 @@ export function Sidebar({
         <div className="codex-sidebar-rail-divider" aria-hidden="true" />
 
         <ul className="codex-sidebar-rail-threads">
-          {projectGroups.map((group, groupIndex) => (
+          {visibleProjectGroups.map((group, groupIndex) => (
             <Fragment key={group.workspacePath}>
               {groupIndex > 0 ? (
                 <li className="codex-sidebar-rail-group-divider" aria-hidden="true" />
               ) : null}
               {group.threads.map((thread) => {
                 const active = thread.threadId === activeThreadId;
-                const needsReview = threadNeedsReview(thread, seenThreadActivity);
-                const tone = needsReview ? 'yellow' : statusTone[thread.status];
                 const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
-                const showAttentionDot =
-                  isWorking ||
-                  needsReview ||
-                  (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
+                const showLiveDot =
+                  isWorking || thread.status === 'running' || thread.status === 'compacting';
                 const initial = (group.workspace.trim().charAt(0) || '·').toUpperCase();
 
                 return (
@@ -290,13 +368,9 @@ export function Sidebar({
                       title={`${group.workspace} · ${providerLabel(thread.provider)} · ${thread.title} · ${thread.status}`}
                     >
                       <span className={`codex-sidebar-rail-initial provider-${providerTone(thread.provider)}`}>{initial}</span>
-                      <span
-                        className={`codex-sidebar-rail-status tone-${tone}`}
-                        aria-hidden="true"
-                      />
-                      {showAttentionDot ? (
+                      {showLiveDot ? (
                         <span
-                          className={`codex-sidebar-rail-dot tone-${tone} ${isWorking ? 'is-working' : ''}`}
+                          className="codex-sidebar-rail-dot tone-blue is-working"
                           aria-hidden="true"
                         />
                       ) : null}
@@ -347,7 +421,7 @@ export function Sidebar({
           type="button"
           style={{ background: 'transparent', border: 0, padding: 0, cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit', color: 'inherit' }}
         >
-          <CodexMark size="sm" />
+          <AppMark size="sm" />
           <div className="codex-sidebar-brand-copy">
             <span className="codex-sidebar-brand-title">Agent Pulse</span>
           </div>
@@ -375,11 +449,44 @@ export function Sidebar({
 
       <p className="codex-sidebar-section-label">Threads</p>
 
+      <div className={`codex-sidebar-search-shell ${searchActive ? 'is-active' : ''}`}>
+        <label className="codex-sidebar-search">
+          <Search size={11} aria-hidden="true" />
+          <span className="sr-only">Search threads</span>
+          <input
+            type="search"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.currentTarget.value)}
+            placeholder="Search threads or projects"
+            aria-label="Search threads or projects"
+          />
+          {searchActive ? (
+            <button
+              className="codex-sidebar-search-clear"
+              type="button"
+              onClick={() => setSearchQuery('')}
+              aria-label="Clear thread search"
+              title="Clear search"
+            >
+              <X size={13} />
+            </button>
+          ) : null}
+        </label>
+        <div className="codex-sidebar-search-meta" aria-live="polite">
+          {searchActive
+            ? `${visibleThreadCount} thread${visibleThreadCount === 1 ? '' : 's'} found`
+            : 'Search by thread or project'}
+        </div>
+      </div>
+
       <div className="codex-sidebar-thread-scroll" aria-label="Thread list">
-        {projectGroups.map((group) => {
-          const isGroupCollapsed = collapsedGroups.has(group.workspacePath);
+        {visibleProjectGroups.map((group) => {
+          const isGroupCollapsed = !searchActive && collapsedGroups.has(group.workspacePath);
           return (
-            <div key={group.workspacePath} className="codex-sidebar-group">
+            <div
+              key={group.workspacePath}
+              className={`codex-sidebar-group ${searchActive ? 'is-search-result' : ''}`}
+            >
               <div className="codex-sidebar-group-heading">
                 <button
                   className="codex-sidebar-group-name"
@@ -410,15 +517,15 @@ export function Sidebar({
                 {group.threads.map((thread) => {
                 const active = thread.threadId === activeThreadId;
                 const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
+                const isLive = isWorking || thread.status === 'compacting';
                 const isWaitingApproval = thread.status === 'waiting_approval';
                 const isCompacting = thread.status === 'compacting';
                 const needsReview = threadNeedsReview(thread, seenThreadActivity);
-                const dotTone = needsReview ? 'yellow' : statusTone[thread.status];
+                const dotTone = isLive ? 'blue' : needsReview ? 'yellow' : statusTone[thread.status];
                 const showDot =
-                  isWorking ||
+                  isLive ||
                   needsReview ||
                   isWaitingApproval ||
-                  isCompacting ||
                   (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
 
                 return (
@@ -432,15 +539,17 @@ export function Sidebar({
                       <span className="codex-sidebar-thread-dot-slot" aria-hidden="true">
                         {showDot ? (
                           <span
-                            className={`codex-sidebar-thread-dot tone-${dotTone} ${isWorking ? 'is-working' : ''}`}
+                            className={`codex-sidebar-thread-dot tone-${dotTone} ${isLive ? 'is-working' : ''}`}
                           />
                         ) : null}
                       </span>
-                      <span className="codex-sidebar-thread-title">{thread.title}</span>
-                      <span className={`codex-sidebar-thread-provider provider-${providerTone(thread.provider)}`}>
-                        <span className="provider-inline-dot" aria-hidden="true" />
-                        <span className="provider-inline-text">{providerLabel(thread.provider)}</span>
+                      <span
+                        className={`codex-sidebar-thread-mark provider-${providerTone(thread.provider)}`}
+                        aria-label={providerLabel(thread.provider)}
+                      >
+                        <ProviderMark provider={thread.provider} size="sm" />
                       </span>
+                      <span className="codex-sidebar-thread-title">{thread.title}</span>
                       {needsReview ? (
                         <span className="codex-sidebar-thread-state is-review">Review</span>
                       ) : isWaitingApproval ? (
@@ -463,6 +572,9 @@ export function Sidebar({
         </div>
       );
     })}
+        {visibleProjectGroups.length === 0 ? (
+          <div className="codex-sidebar-search-empty">No matching threads or projects.</div>
+        ) : null}
   </div>
 
       <footer className="codex-sidebar-footer">

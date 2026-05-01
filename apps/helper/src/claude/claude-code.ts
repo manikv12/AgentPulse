@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir, readFile, rm, stat, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
@@ -11,6 +11,7 @@ import {
   ThreadSchema,
   ThreadTranscriptSchema,
   ThreadUsageSchema,
+  type ChatAttachment,
   type ChatMessage,
   type CatalogModel,
   type LiveEvent,
@@ -51,6 +52,7 @@ type ClaudeCodeProviderOptions = {
 type ParsedClaudeSession = {
   nativeSessionId: string;
   threadId: string;
+  filePath: string;
   title: string;
   workspacePath: string;
   lastActivityAt: string;
@@ -187,13 +189,27 @@ export class ClaudeCodeProvider {
     return thread;
   }
 
+  discardDraftThread(threadId: string): boolean {
+    const draft = this.drafts.get(threadId);
+    if (!draft) {
+      return false;
+    }
+    this.drafts.delete(threadId);
+    this.threadCwds.delete(threadId);
+    this.modelOverrides.delete(threadId);
+    this.effortOverrides.delete(threadId);
+    return true;
+  }
+
   async readTranscript(threadId: string): Promise<ThreadTranscript> {
     const nativeSessionId = nativeSessionIdFromThreadId(threadId);
     const session = await this.readSessionByNativeId(nativeSessionId);
     const live = this.liveSessions.get(threadId);
     const draft = this.drafts.get(threadId);
     const baseMessages = session?.messages ?? [];
-    const messages = mergeMessages(baseMessages, live?.messages ?? []);
+    const messages = live
+      ? mergeLiveMessages(baseMessages, live.messages)
+      : mergeMessages(baseMessages, []);
     const usage = mergeUsage(
       live?.usage ?? session?.usage,
       await this.usageReader.readUsage().catch(() => undefined)
@@ -275,6 +291,34 @@ export class ClaudeCodeProvider {
     }
     live.process.kill('SIGTERM');
     this.finishLiveSession(live, 'interrupted');
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    const nativeSessionId = nativeSessionIdFromThreadId(threadId);
+    const session = await this.readSessionByNativeId(nativeSessionId);
+    const hadDraft = this.drafts.delete(threadId);
+    const live = this.liveSessions.get(threadId);
+    if (live) {
+      this.liveSessions.delete(threadId);
+      live.process.kill('SIGTERM');
+    }
+
+    this.modelOverrides.delete(threadId);
+    this.effortOverrides.delete(threadId);
+    this.threadCwds.delete(threadId);
+
+    if (!session) {
+      if (hadDraft || live) {
+        return;
+      }
+      throw new Error('Claude session was not found.');
+    }
+
+    await unlink(session.filePath);
+    await rm(path.join(this.claudeHome, 'image-cache', nativeSessionId), {
+      recursive: true,
+      force: true
+    }).catch(() => undefined);
   }
 
   async listModels(): Promise<CatalogModel[]> {
@@ -567,9 +611,9 @@ export class ClaudeCodeProvider {
       const message = recordField(payload, 'message');
       live.model = normalizeClaudeModelAlias(stringField(message, 'model')) ?? live.model;
       live.usage = mergeUsage(live.usage, usageFromClaudeMessage(message));
-      const text = extractClaudeMessageText(payload.message);
-      if (text) {
-        this.installAssistantText(live, text);
+      const parts = extractClaudeMessageParts(payload.message, `claude-assistant:${live.activeTurnId}`);
+      if (parts.text || parts.attachments.length > 0) {
+        this.installAssistantMessage(live, parts.text, parts.attachments, 'commentary');
       }
     } else if (type === 'stream_event') {
       this.handleStreamEvent(live, recordField(payload, 'event'));
@@ -582,9 +626,11 @@ export class ClaudeCodeProvider {
         this.broadcast({ type: 'thread/pending-approvals/changed', payload: { threadId: live.threadId, requests: [...live.pendingRequests.values()] } });
       }
     } else if (type === 'result') {
-      const text = extractClaudeResultText(payload);
-      if (text) {
-        this.installAssistantText(live, text);
+      const parts = extractClaudeResultParts(payload, `claude-assistant:${live.activeTurnId}`);
+      if (parts.text || parts.attachments.length > 0) {
+        this.installAssistantMessage(live, parts.text, parts.attachments, 'final_answer');
+      } else {
+        this.finalizeAssistantMessage(live, 'final_answer');
       }
       this.finishTurn(live);
     }
@@ -664,14 +710,48 @@ export class ClaudeCodeProvider {
   }
 
   private installAssistantText(live: LiveClaudeSession, text: string): void {
+    this.installAssistantMessage(live, text, [], 'commentary');
+  }
+
+  private installAssistantMessage(
+    live: LiveClaudeSession,
+    text: string,
+    attachments: ChatAttachment[],
+    phase: 'commentary' | 'final_answer'
+  ): void {
     live.assistantText = text;
     const id = live.assistantMessageId ?? `claude-assistant:${live.activeTurnId}`;
     live.assistantMessageId = id;
+    const previousAttachments =
+      live.messages.find((message) => message.id === id)?.attachments ?? [];
+    const nextAttachments = mergeAttachments(previousAttachments, attachments);
     upsertMessage(live.messages, ChatMessageSchema.parse({
       id,
       role: 'assistant',
       kind: 'message',
       text,
+      phase,
+      createdAt: this.now().toISOString(),
+      ...(nextAttachments.length > 0 ? { attachments: nextAttachments } : {})
+    }));
+    this.emitTranscript(live.threadId);
+  }
+
+  private finalizeAssistantMessage(
+    live: LiveClaudeSession,
+    phase: 'commentary' | 'final_answer'
+  ): void {
+    const id = live.assistantMessageId;
+    if (!id) {
+      return;
+    }
+    const existing = live.messages.find((message) => message.id === id);
+    if (!existing || existing.role !== 'assistant' || existing.kind !== 'message') {
+      return;
+    }
+    upsertMessage(live.messages, ChatMessageSchema.parse({
+      ...existing,
+      phase,
       createdAt: this.now().toISOString()
     }));
     this.emitTranscript(live.threadId);
@@ -890,29 +970,31 @@ async function parseClaudeSessionFile(filePath: string, encodedProjectName: stri
       continue;
     }
     if (type === 'user') {
-      const text = extractClaudeMessageText(payload.message);
-      if (!text) continue;
+      const { text, attachments } = extractClaudeMessageParts(payload.message, `claude-user:${payloadSessionId ?? nativeSessionId}:${index}`);
+      if (!text && attachments.length === 0) continue;
       title = title || compactTitle(text);
       messages.push(ChatMessageSchema.parse({
         id: stringField(payload, 'uuid') ?? `claude-user:${payloadSessionId ?? nativeSessionId}:${index}`,
         role: 'user',
         kind: 'message',
         text,
-        createdAt: timestampToIso(timestamp, fileStat.mtime)
+        createdAt: timestampToIso(timestamp, fileStat.mtime),
+        ...(attachments.length > 0 ? { attachments } : {})
       }));
     } else if (type === 'assistant') {
       const message = recordField(payload, 'message');
       model = normalizeClaudeModelAlias(stringField(message, 'model')) ?? model;
       usage = mergeUsage(usage, usageFromClaudeMessage(message));
-      const text = extractClaudeMessageText(message);
-      if (text) {
+      const { text, attachments } = extractClaudeMessageParts(message, `claude-assistant:${payloadSessionId ?? nativeSessionId}:${index}`);
+      if (text || attachments.length > 0) {
         lastTurnSummary = compactSummary(text);
         messages.push(ChatMessageSchema.parse({
           id: stringField(payload, 'uuid') ?? `claude-assistant:${payloadSessionId ?? nativeSessionId}:${index}`,
           role: 'assistant',
           kind: 'message',
           text,
-          createdAt: timestampToIso(timestamp, fileStat.mtime)
+          createdAt: timestampToIso(timestamp, fileStat.mtime),
+          ...(attachments.length > 0 ? { attachments } : {})
         }));
       }
       for (const plan of extractPlanMessagesFromClaudeMessage(message, index, timestampToIso(timestamp, fileStat.mtime))) {
@@ -928,6 +1010,7 @@ async function parseClaudeSessionFile(filePath: string, encodedProjectName: stri
   return {
     nativeSessionId,
     threadId: threadIdForClaudeSession(nativeSessionId),
+    filePath,
     title: title || 'Claude chat',
     workspacePath,
     lastActivityAt,
@@ -967,6 +1050,53 @@ function mergeMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessage[] 
   for (const message of base) byId.set(message.id, message);
   for (const message of live) byId.set(message.id, message);
   return [...byId.values()].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
+function mergeLiveMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessage[] {
+  if (live.length === 0) {
+    return mergeMessages(base, live);
+  }
+
+  const liveIds = new Set(live.map((message) => message.id));
+  const liveSignatures = new Map<string, number>();
+  for (const message of live) {
+    const signature = messageContentSignature(message);
+    liveSignatures.set(signature, (liveSignatures.get(signature) ?? 0) + 1);
+  }
+
+  // While Claude is streaming, the JSONL file can already contain the current user
+  // message using a different id and a newer file timestamp. Keep the in-memory live
+  // turn as the authoritative tail so progress stays under the message that triggered it.
+  const baseWithoutLiveEchoes: ChatMessage[] = [];
+  for (let index = base.length - 1; index >= 0; index -= 1) {
+    const message = base[index]!;
+    const signature = messageContentSignature(message);
+    const duplicateCount = liveSignatures.get(signature) ?? 0;
+    if (liveIds.has(message.id) || duplicateCount > 0) {
+      if (duplicateCount > 0) {
+        liveSignatures.set(signature, duplicateCount - 1);
+      }
+      continue;
+    }
+    baseWithoutLiveEchoes.unshift(message);
+  }
+
+  const byId = new Map<string, ChatMessage>();
+  for (const message of baseWithoutLiveEchoes) byId.set(message.id, message);
+  for (const message of live) byId.set(message.id, message);
+  return [...byId.values()];
+}
+
+function messageContentSignature(message: ChatMessage): string {
+  return [
+    message.role,
+    message.kind,
+    message.phase ?? '',
+    message.text.trim(),
+    (message.attachments ?? [])
+      .map((attachment) => `${attachment.kind}:${attachment.url ?? ''}:${attachment.sourcePath ?? ''}`)
+      .join('|')
+  ].join('\u001f');
 }
 
 function upsertMessage(messages: ChatMessage[], message: ChatMessage): void {
@@ -1041,30 +1171,122 @@ function claudeElicitationResponse(requestId: string, response: unknown): Record
 }
 
 function extractClaudeMessageText(message: unknown): string {
+  return extractClaudeMessageParts(message, 'claude-message').text;
+}
+
+function extractClaudeMessageParts(
+  message: unknown,
+  ownerId: string
+): { text: string; attachments: ChatAttachment[] } {
   const record = recordField({ message }, 'message');
   if (!record) {
-    return '';
+    return { text: '', attachments: [] };
   }
   const content = record.content;
   if (typeof content === 'string') {
-    return content.trim();
+    return textWithLocalImageAttachments(content, ownerId);
   }
   if (!Array.isArray(content)) {
-    return '';
+    return { text: '', attachments: [] };
   }
-  return content
+  const attachments: ChatAttachment[] = [];
+  const text = content
     .map((block) => {
       if (!block || typeof block !== 'object') return '';
       const entry = block as Record<string, unknown>;
-      return stringField(entry, 'type') === 'text' ? stringField(entry, 'text') ?? '' : '';
+      if (stringField(entry, 'type') === 'text') {
+        const parts = textWithLocalImageAttachments(stringField(entry, 'text') ?? '', `${ownerId}:${attachments.length}`);
+        attachments.push(...parts.attachments);
+        return parts.text;
+      }
+      const image = localImageAttachmentFromRecord(entry, `${ownerId}:block:${attachments.length + 1}`);
+      if (image) {
+        attachments.push(image);
+      }
+      return '';
     })
     .filter(Boolean)
     .join('\n\n')
     .trim();
+  return { text, attachments };
 }
 
 function extractClaudeResultText(payload: Record<string, unknown>): string {
-  return stringField(payload, 'result') ?? stringField(payload, 'response') ?? '';
+  return extractClaudeResultParts(payload, 'claude-result').text;
+}
+
+function extractClaudeResultParts(
+  payload: Record<string, unknown>,
+  ownerId: string
+): { text: string; attachments: ChatAttachment[] } {
+  return textWithLocalImageAttachments(
+    stringField(payload, 'result') ?? stringField(payload, 'response') ?? '',
+    ownerId
+  );
+}
+
+const LOCAL_IMAGE_MARKER_PATTERN =
+  /\[\s*Image(?:\s*#[^\]:]+)?\s*:\s*source\s*:\s*([^\]\n]+?\.(?:png|jpe?g|gif|webp|bmp|tiff?))\s*\]/gi;
+
+function textWithLocalImageAttachments(
+  rawText: string,
+  ownerId: string
+): { text: string; attachments: ChatAttachment[] } {
+  const attachments: ChatAttachment[] = [];
+  const text = rawText.replace(LOCAL_IMAGE_MARKER_PATTERN, (_match, sourcePath: string) => {
+    const cleanPath = sourcePath.trim();
+    attachments.push({
+      id: `${ownerId}-image-${attachments.length + 1}`,
+      kind: 'image',
+      url: `agent-pulse-local-image:${ownerId}-image-${attachments.length + 1}`,
+      alt: `Image ${attachments.length + 1}`,
+      sourcePath: cleanPath
+    });
+    return '';
+  });
+  return {
+    text: text
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim(),
+    attachments
+  };
+}
+
+function localImageAttachmentFromRecord(
+  record: Record<string, unknown>,
+  ownerId: string
+): ChatAttachment | undefined {
+  const type = stringField(record, 'type')?.toLowerCase() ?? '';
+  const sourcePath =
+    stringField(record, 'source') ??
+    stringField(record, 'sourcePath') ??
+    stringField(record, 'path') ??
+    stringField(record, 'filePath');
+  if (!sourcePath || !path.isAbsolute(sourcePath)) {
+    return undefined;
+  }
+  if (!type.includes('image') && !/\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i.test(sourcePath)) {
+    return undefined;
+  }
+  return {
+    id: `${ownerId}-image-1`,
+    kind: 'image',
+    url: `agent-pulse-local-image:${ownerId}-image-1`,
+    alt: stringField(record, 'alt') ?? stringField(record, 'title') ?? 'Image',
+    sourcePath
+  };
+}
+
+function mergeAttachments(
+  existing: ChatAttachment[],
+  incoming: ChatAttachment[]
+): ChatAttachment[] {
+  const byKey = new Map<string, ChatAttachment>();
+  for (const attachment of [...existing, ...incoming]) {
+    byKey.set(attachment.sourcePath ?? attachment.url, attachment);
+  }
+  return [...byKey.values()];
 }
 
 function extractPlanMessagesFromClaudeMessage(message: Record<string, unknown> | undefined, index: number, createdAt: string): ChatMessage[] {

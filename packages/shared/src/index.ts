@@ -12,7 +12,7 @@ export const THREAD_STATUSES = [
 
 export type ThreadStatus = (typeof THREAD_STATUSES)[number];
 
-export const AGENT_PROVIDERS = ['codex', 'claude-code'] as const;
+export const AGENT_PROVIDERS = ['codex', 'claude-code', 'copilot'] as const;
 
 export type AgentProvider = (typeof AGENT_PROVIDERS)[number];
 
@@ -269,6 +269,7 @@ export type ThreadSendState = z.infer<typeof ThreadSendStateSchema>;
 
 export const ThreadRateLimitWindowSchema = z.object({
   usedPercent: z.number(),
+  label: z.string().min(1).optional(),
   windowMinutes: z.number().optional(),
   resetsAt: z.number().optional()
 });

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, statSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import type { IncomingMessage, Server } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
@@ -67,6 +68,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { AdminAuth } from '../auth/admin';
 import { RateLimiter, type DeviceRegistry, type PairingManager } from '../auth/pairing';
 import { isClaudeThreadId } from '../claude/claude-code';
+import { isCopilotThreadId } from '../copilot/copilot';
 import { SendBlockedError } from '../codex/app-server-chat';
 import type { CatalogReader } from '../codex/catalog';
 import type { createThreadOpener } from '../codex/thread-opener';
@@ -88,6 +90,7 @@ const DESKTOP_INTEREST_TTL_MS = 30 * 60_000;
 const MANUAL_OPEN_COOLDOWN_MS = 2_500;
 const AUTO_DESKTOP_REFRESH_SETTLE_MS = 800;
 const AUTO_DESKTOP_REFRESH_COOLDOWN_MS = 10_000;
+const MAX_THREADS_PER_PROJECT = 6;
 
 type DesktopRefreshCandidate = {
   threadId: string;
@@ -179,7 +182,9 @@ export type ClaudeCodeBridge = {
     options?: { model?: string; effort?: string; collaborationMode?: CollaborationModeKind }
   ): Promise<ThreadMessageResponse>;
   startThread?(cwd: string, options?: { model?: string; reasoningEffort?: string }): Promise<Thread>;
+  discardDraftThread?(threadId: string): boolean;
   interruptTurn?(threadId: string): Promise<void>;
+  deleteThread?(threadId: string): Promise<void>;
   respondToApproval?(
     threadId: string,
     requestId: string,
@@ -195,6 +200,8 @@ export type ClaudeCodeBridge = {
   setModel?(threadId: string, modelSlug: string, reasoningEffort?: string): Promise<void>;
 };
 
+export type CopilotBridge = ClaudeCodeBridge;
+
 export type AgentPulseServerOptions = {
   settings: HelperSettings;
   settingsStore: HelperSettingsStore;
@@ -206,6 +213,7 @@ export type AgentPulseServerOptions = {
   appServer?: AppServerChatBridge;
   mirror?: CodexMirrorBridge;
   claudeCode?: ClaudeCodeBridge;
+  copilot?: CopilotBridge;
   catalog?: CatalogReader;
   seenThreadStore?: SeenThreadStore;
   usageProvider?: (threadId: string) => Promise<import('@agent-pulse/shared').ThreadUsage | undefined>;
@@ -266,8 +274,7 @@ export async function startAgentPulseServer(
     hub,
     options.appServer,
     options.mirror,
-    transformTranscript,
-    options.seenThreadStore
+    transformTranscript
   );
   const detachCatalog = options.catalog?.onChange((kind) => {
     hub.broadcast({ type: 'catalog/changed', payload: { kind } });
@@ -313,6 +320,11 @@ function createApp(
   // is slow or upstream Codex is degraded — we'd rather return slightly stale data fast
   // than block long enough for the cloudflared tunnel to cancel the request.
   const transcriptCache = new Map<string, ThreadTranscript>();
+  // Maps threadId → workspace path on disk. Populated whenever we list threads or start
+  // a new one, then read by `transformTranscript` to resolve agent-emitted relative
+  // image paths (e.g. `![logo](assets/foo.svg)`) to tokenized `/attachments/...` URLs
+  // the browser can actually load.
+  const threadCwdByThreadId = new Map<string, string>();
   const liveSubscribedThreadIds = new Set<string>();
   // Codex's desktop "New chat" is a draft until the first user message. `thread/start`
   // returns an id immediately, but the thread may not appear in the normal session list
@@ -331,11 +343,19 @@ function createApp(
   let currentSettings = options.settings;
   const isProviderEnabled = (provider: AgentProvider): boolean =>
     normalizeEnabledProviders(currentSettings.enabledProviders).includes(provider);
-  const providerForThreadId = (threadId: string): AgentProvider =>
-    isClaudeThreadId(threadId) ? 'claude-code' : 'codex';
+  const providerForThreadId = (threadId: string): AgentProvider => {
+    if (isClaudeThreadId(threadId)) return 'claude-code';
+    if (isCopilotThreadId(threadId)) return 'copilot';
+    return 'codex';
+  };
+  const displayNameForProvider = (provider: AgentProvider): string => {
+    if (provider === 'claude-code') return 'Claude Code';
+    if (provider === 'copilot') return 'GitHub Copilot';
+    return 'Codex';
+  };
   const disabledProviderResponse = (context: Context, provider: AgentProvider) =>
     context.json(
-      { error: `${provider === 'claude-code' ? 'Claude' : 'Codex'} is turned off in Agent Pulse settings.` },
+      { error: `${displayNameForProvider(provider)} is turned off in Agent Pulse settings.` },
       403
     );
   const remoteActivity: RemoteActivityLogEntry[] = [];
@@ -510,6 +530,7 @@ function createApp(
   };
   const forgetThread = (threadId: string): void => {
     transcriptCache.delete(threadId);
+    threadCwdByThreadId.delete(threadId);
     liveSubscribedThreadIds.delete(threadId);
     draftThreads.delete(threadId);
     desktopInterestUntilByThread.delete(threadId);
@@ -535,8 +556,16 @@ function createApp(
       pendingAutoDesktopRefresh = undefined;
     }
   };
-  const listCodexThreads = async (): Promise<Thread[]> =>
-    mergeDraftThreads(
+  const rememberThreadCwds = (threads: Thread[]): void => {
+    for (const thread of threads) {
+      const cwd = thread.workspacePath;
+      if (cwd && path.isAbsolute(cwd)) {
+        threadCwdByThreadId.set(thread.threadId, cwd);
+      }
+    }
+  };
+  const listCodexThreads = async (): Promise<Thread[]> => {
+    const threads = mergeDraftThreads(
       await reconcileThreadStatuses(
         await options.threadProvider.listThreads(),
         options.appServer,
@@ -545,19 +574,29 @@ function createApp(
       ),
       draftThreads
     );
+    rememberThreadCwds(threads);
+    return threads;
+  };
   const listAllThreads = async (): Promise<Thread[]> => {
-    const [codexThreads, claudeThreads] = await Promise.all([
+    const [codexThreads, claudeThreads, copilotThreads] = await Promise.all([
       isProviderEnabled('codex') ? listCodexThreads() : Promise.resolve([]),
-      isProviderEnabled('claude-code') ? options.claudeCode?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([])
+      isProviderEnabled('claude-code') ? options.claudeCode?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([]),
+      isProviderEnabled('copilot') ? options.copilot?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([])
     ]);
-    return [...codexThreads, ...claudeThreads];
+    rememberThreadCwds(claudeThreads);
+    rememberThreadCwds(copilotThreads);
+    return limitThreadsPerProject(
+      [...codexThreads, ...claudeThreads, ...copilotThreads],
+      MAX_THREADS_PER_PROJECT
+    );
   };
   const listAllProjects = async (): Promise<Project[]> => {
-    const [codexProjects, claudeProjects] = await Promise.all([
+    const [codexProjects, claudeProjects, copilotProjects] = await Promise.all([
       isProviderEnabled('codex') ? listProjects(options.threadProvider) : Promise.resolve([]),
-      isProviderEnabled('claude-code') ? options.claudeCode?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([])
+      isProviderEnabled('claude-code') ? options.claudeCode?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([]),
+      isProviderEnabled('copilot') ? options.copilot?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([])
     ]);
-    return mergeProjectsByPath([...codexProjects, ...claudeProjects]);
+    return mergeProjectsByPath([...codexProjects, ...claudeProjects, ...copilotProjects]);
   };
   const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
     if (!options.appServer?.readTranscript) {
@@ -1057,6 +1096,9 @@ function createApp(
     if (parsed.provider === 'claude-code' && !options.claudeCode?.startThread) {
       return context.json({ error: 'Claude Code connection unavailable.' }, 503);
     }
+    if (parsed.provider === 'copilot' && !options.copilot?.startThread) {
+      return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
+    }
 
     let cwd: string;
     if (parsed.projectId) {
@@ -1087,7 +1129,12 @@ function createApp(
     }
 
     try {
-      const starter = parsed.provider === 'claude-code' ? options.claudeCode! : options.appServer!;
+      const starter =
+        parsed.provider === 'claude-code'
+          ? options.claudeCode!
+          : parsed.provider === 'copilot'
+            ? options.copilot!
+            : options.appServer!;
       const thread = await starter.startThread!(cwd, {
         ...(parsed.modelSlug ? { model: parsed.modelSlug } : {}),
         ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
@@ -1095,6 +1142,7 @@ function createApp(
       if (parsed.provider === 'codex') {
         draftThreads.set(thread.threadId, thread);
       }
+      threadCwdByThreadId.set(thread.threadId, cwd);
       hub.broadcast({ type: 'thread/upsert', payload: thread });
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
 
@@ -1103,7 +1151,7 @@ function createApp(
       const detail = error instanceof Error ? error.message : String(error);
       console.error('[agent-pulse] startThread failed', { provider: parsed.provider, cwd, error: detail });
       return context.json(
-        { error: `${parsed.provider === 'claude-code' ? 'Claude Code' : 'Codex'} could not start a new thread in ${cwd}: ${detail}` },
+        { error: `${displayNameForProvider(parsed.provider)} could not start a new thread in ${cwd}: ${detail}` },
         503
       );
     }
@@ -1132,6 +1180,20 @@ function createApp(
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         return context.json({ error: `Claude Code transcript unavailable: ${detail}` }, 503);
+      }
+    }
+    if (isCopilotThreadId(threadId)) {
+      if (!options.copilot) {
+        return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
+      }
+      try {
+        const transcript = await options.copilot.readTranscript(threadId);
+        return context.json(
+          ThreadTranscriptSchema.parse(limitTranscriptMessages(transcript, messageLimit))
+        );
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: `GitHub Copilot transcript unavailable: ${detail}` }, 503);
       }
     }
 
@@ -1222,6 +1284,27 @@ function createApp(
         }
         const transcript = await (options.claudeCode.readFullTranscript?.(threadId) ??
           options.claudeCode.readTranscript(threadId));
+        const beforeIndex = transcript.messages.findIndex((message) => message.id === before);
+        if (beforeIndex <= 0) {
+          return context.json(
+            OlderThreadMessagesResponseSchema.parse({ threadId, messages: [], hasMore: false })
+          );
+        }
+        const sliceStart = Math.max(0, beforeIndex - limit);
+        return context.json(
+          OlderThreadMessagesResponseSchema.parse({
+            threadId,
+            messages: transcript.messages.slice(sliceStart, beforeIndex),
+            hasMore: sliceStart > 0
+          })
+        );
+      }
+      if (isCopilotThreadId(threadId)) {
+        if (!options.copilot) {
+          return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
+        }
+        const transcript = await (options.copilot.readFullTranscript?.(threadId) ??
+          options.copilot.readTranscript(threadId));
         const beforeIndex = transcript.messages.findIndex((message) => message.id === before);
         if (beforeIndex <= 0) {
           return context.json(
@@ -1345,6 +1428,24 @@ function createApp(
         hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
         return context.json(result);
       }
+      if (isCopilotThreadId(threadId)) {
+        if (!options.copilot) {
+          return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
+        }
+        const override = pendingModelOverrides.get(threadId);
+        const result = ThreadMessageResponseSchema.parse(
+          await options.copilot.sendMessage(threadId, parsed.text, {
+            ...(override ? { model: override.model } : {}),
+            ...(override?.effort ? { effort: override.effort } : {})
+          })
+        );
+        if (override) {
+          pendingModelOverrides.delete(threadId);
+        }
+        hub.broadcast({ type: 'thread/transcript/changed', payload: result.transcript });
+        hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+        return context.json(result);
+      }
 
       await options.appServer?.ensureConnected?.().catch(() => undefined);
       const mirrorReady = options.mirror?.isConnected() === true;
@@ -1453,6 +1554,15 @@ function createApp(
       hub.broadcast({ type: 'thread/status/changed', payload: { threadId, status: 'idle' } });
       return context.json(ThreadStopResponseSchema.parse({ ok: true }));
     }
+    if (isCopilotThreadId(threadId)) {
+      if (!options.copilot?.interruptTurn) {
+        return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
+      }
+      await options.copilot.interruptTurn(threadId);
+      hub.broadcast({ type: 'thread/streaming-changed', payload: { threadId, isStreaming: false } });
+      hub.broadcast({ type: 'thread/status/changed', payload: { threadId, status: 'idle' } });
+      return context.json(ThreadStopResponseSchema.parse({ ok: true }));
+    }
 
     await options.appServer?.ensureConnected?.().catch(() => undefined);
     if (!options.appServer?.isConnected() || !options.appServer.interruptTurn) {
@@ -1544,7 +1654,48 @@ function createApp(
       return disabledProviderResponse(context, providerForThreadId(threadId));
     }
     if (isClaudeThreadId(threadId)) {
-      return context.json({ error: 'Deleting Claude Code history is not supported yet.' }, 405);
+      if (options.claudeCode?.deleteThread) {
+        try {
+          await options.claudeCode.deleteThread(threadId);
+          forgetThread(threadId);
+          hub.broadcast({ type: 'thread/remove', payload: { threadId } });
+          return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          return context.json({ error: `Claude could not delete this thread: ${detail}` }, 503);
+        }
+      }
+      if (options.claudeCode?.discardDraftThread?.(threadId)) {
+        forgetThread(threadId);
+        hub.broadcast({ type: 'thread/remove', payload: { threadId } });
+        return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
+      }
+      return context.json({ error: 'Claude Code connection unavailable.' }, 503);
+    }
+    if (isCopilotThreadId(threadId)) {
+      if (options.copilot?.deleteThread) {
+        try {
+          await options.copilot.deleteThread(threadId);
+          forgetThread(threadId);
+          hub.broadcast({ type: 'thread/remove', payload: { threadId } });
+          return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          return context.json({ error: `GitHub Copilot could not delete this thread: ${detail}` }, 503);
+        }
+      }
+      if (options.copilot?.discardDraftThread?.(threadId)) {
+        forgetThread(threadId);
+        hub.broadcast({ type: 'thread/remove', payload: { threadId } });
+        return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
+      }
+      return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
+    }
+
+    if (draftThreads.has(threadId)) {
+      forgetThread(threadId);
+      hub.broadcast({ type: 'thread/remove', payload: { threadId } });
+      return context.json(ThreadDeleteResponseSchema.parse({ ok: true }));
     }
 
     await options.appServer?.ensureConnected?.().catch(() => undefined);
@@ -1573,10 +1724,13 @@ function createApp(
 
     const parsed = ThreadOpenRequestSchema.parse(await context.req.json());
     if (!isProviderEnabled(providerForThreadId(parsed.threadId))) {
-      return context.json({ ok: false, error: `${providerForThreadId(parsed.threadId) === 'claude-code' ? 'Claude' : 'Codex'} is turned off in Agent Pulse settings.` }, 403);
+      return context.json({ ok: false, error: `${displayNameForProvider(providerForThreadId(parsed.threadId))} is turned off in Agent Pulse settings.` }, 403);
     }
     if (isClaudeThreadId(parsed.threadId)) {
       return context.json({ ok: false, error: 'Claude Code chats are controlled directly in Agent Pulse.' }, 405);
+    }
+    if (isCopilotThreadId(parsed.threadId)) {
+      return context.json({ ok: false, error: 'GitHub Copilot chats are controlled directly in Agent Pulse.' }, 405);
     }
     const result = await openThreadWithMiniRefresh(parsed.threadId);
     if (!result.ok) {
@@ -1690,11 +1844,15 @@ function createApp(
     const claudeModels = options.claudeCode?.listModels
       ? await options.claudeCode.listModels().catch(() => [])
       : [];
+    const copilotModels = options.copilot?.listModels
+      ? await options.copilot.listModels().catch(() => [])
+      : [];
     return context.json(
       CatalogModelsResponseSchema.parse({
         models: [
           ...(isProviderEnabled('codex') ? models : []),
-          ...(isProviderEnabled('claude-code') ? claudeModels : [])
+          ...(isProviderEnabled('claude-code') ? claudeModels : []),
+          ...(isProviderEnabled('copilot') ? copilotModels : [])
         ]
       })
     );
@@ -1740,7 +1898,9 @@ function createApp(
     }
     const requests = isClaudeThreadId(threadId)
       ? options.claudeCode?.getPendingApprovalRequests?.(threadId) ?? []
-      : options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
+      : isCopilotThreadId(threadId)
+        ? options.copilot?.getPendingApprovalRequests?.(threadId) ?? []
+        : options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
     return context.json({ threadId, requests });
   });
 
@@ -1765,6 +1925,18 @@ function createApp(
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         return context.json({ error: `Could not record Claude approval: ${detail}` }, 503);
+      }
+    }
+    if (isCopilotThreadId(threadId)) {
+      if (!options.copilot?.respondToApproval) {
+        return context.json({ error: 'GitHub Copilot does not have a pending approval channel available.' }, 503);
+      }
+      try {
+        await options.copilot.respondToApproval(threadId, requestId, parsed.method, parsed.decision);
+        return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: `Could not record Copilot approval: ${detail}` }, 503);
       }
     }
     if (!options.mirror?.respondToApproval || !options.mirror.isConnected()) {
@@ -1808,6 +1980,29 @@ function createApp(
       try {
         if (options.claudeCode?.setModel) {
           await options.claudeCode.setModel(threadId, parsed.modelSlug, parsed.reasoningEffort);
+          pendingModelOverrides.delete(threadId);
+        } else {
+          pendingModelOverrides.set(threadId, {
+            model: parsed.modelSlug,
+            ...(parsed.reasoningEffort ? { effort: parsed.reasoningEffort } : {})
+          });
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: detail }, detail.includes('still working') ? 409 : 503);
+      }
+      return context.json(
+        ThreadModelUpdateResponseSchema.parse({
+          ok: true,
+          modelSlug: parsed.modelSlug,
+          ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+        })
+      );
+    }
+    if (isCopilotThreadId(threadId)) {
+      try {
+        if (options.copilot?.setModel) {
+          await options.copilot.setModel(threadId, parsed.modelSlug, parsed.reasoningEffort);
           pendingModelOverrides.delete(threadId);
         } else {
           pendingModelOverrides.set(threadId, {
@@ -1933,9 +2128,15 @@ function createApp(
       options.mirror
     );
     transcriptCache.set(threadId, realtimeTranscript);
-    return exposeLocalAttachments(
+    const exposed = exposeLocalAttachments(
       applyMobileSendState(realtimeTranscript, currentSettings),
       threadId,
+      localAttachments
+    );
+    return rewriteWorkspaceImageReferences(
+      exposed,
+      threadId,
+      threadCwdByThreadId.get(threadId),
       localAttachments
     );
   };
@@ -1948,6 +2149,12 @@ function createApp(
   });
   const detachClaudeLiveEvent = options.claudeCode?.onLiveEvent?.((event) => {
     if (!isProviderEnabled('claude-code')) {
+      return;
+    }
+    hub.broadcast(event);
+  });
+  const detachCopilotLiveEvent = options.copilot?.onLiveEvent?.((event) => {
+    if (!isProviderEnabled('copilot')) {
       return;
     }
     hub.broadcast(event);
@@ -1965,6 +2172,17 @@ function createApp(
       return;
     }
     void options.claudeCode?.readTranscript(threadId)
+      .then((transcript) => {
+        const visible = transformTranscript(transcript, threadId);
+        hub.broadcast({ type: 'thread/transcript/changed', payload: visible });
+      })
+      .catch(() => undefined);
+  });
+  const detachCopilotLiveState = options.copilot?.onLiveStateChange?.((threadId) => {
+    if (!isProviderEnabled('copilot')) {
+      return;
+    }
+    void options.copilot?.readTranscript(threadId)
       .then((transcript) => {
         const visible = transformTranscript(transcript, threadId);
         hub.broadcast({ type: 'thread/transcript/changed', payload: visible });
@@ -2013,8 +2231,10 @@ function createApp(
       }
       detachAppServerLiveEvent?.();
       detachClaudeLiveEvent?.();
+      detachCopilotLiveEvent?.();
       detachAppServerLiveState?.();
       detachClaudeLiveState?.();
+      detachCopilotLiveState?.();
       detachAppServerTurnCompleted?.();
       detachAppServerConnection?.();
       detachMirrorPendingApprovals?.();
@@ -2336,10 +2556,111 @@ function imageContentType(filePath: string): string {
       return 'image/gif';
     case '.webp':
       return 'image/webp';
+    case '.svg':
+      return 'image/svg+xml';
     case '.png':
     default:
       return 'image/png';
   }
+}
+
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']);
+// Match markdown images: ![alt](url) or ![alt](url "title"). Captures alt, url, and the
+// remainder (whitespace + optional title). Greedy-but-bounded url match avoids running
+// past the closing paren when the alt text contains square brackets.
+const MARKDOWN_IMAGE_REGEX = /!\[([^\]]*)\]\(([^)\s]+)([^)]*)\)/g;
+
+function rewriteWorkspaceImageReferences(
+  transcript: ThreadTranscript,
+  threadId: string,
+  cwd: string | undefined,
+  localAttachments: Map<string, LocalAttachment>
+): ThreadTranscript {
+  if (!cwd) {
+    return transcript;
+  }
+  let changed = false;
+  const messages = transcript.messages.map((message) => {
+    if (!message.text || !message.text.includes('![')) {
+      return message;
+    }
+    const rewritten = message.text.replace(
+      MARKDOWN_IMAGE_REGEX,
+      (full, alt: string, url: string, tail: string) => {
+        const tokenUrl = tokenUrlForWorkspaceImage(url, cwd, threadId, localAttachments);
+        if (!tokenUrl) {
+          return full;
+        }
+        return `![${alt}](${tokenUrl}${tail})`;
+      }
+    );
+    if (rewritten === message.text) {
+      return message;
+    }
+    changed = true;
+    return { ...message, text: rewritten };
+  });
+  if (!changed) {
+    return transcript;
+  }
+  return ThreadTranscriptSchema.parse({ ...transcript, messages });
+}
+
+function tokenUrlForWorkspaceImage(
+  rawUrl: string,
+  cwd: string,
+  threadId: string,
+  localAttachments: Map<string, LocalAttachment>
+): string | undefined {
+  // Skip absolute URLs, data URIs, root-relative, and protocol-relative paths — those
+  // either already work or don't refer to a workspace file.
+  if (
+    !rawUrl ||
+    rawUrl.startsWith('http://') ||
+    rawUrl.startsWith('https://') ||
+    rawUrl.startsWith('data:') ||
+    rawUrl.startsWith('//') ||
+    rawUrl.startsWith('/') ||
+    rawUrl.startsWith('#')
+  ) {
+    return undefined;
+  }
+  const decoded = (() => {
+    try {
+      return decodeURI(rawUrl);
+    } catch {
+      return rawUrl;
+    }
+  })();
+  const ext = path.extname(decoded).toLowerCase();
+  if (!IMAGE_EXTENSIONS.has(ext)) {
+    return undefined;
+  }
+  const absolute = path.resolve(cwd, decoded);
+  const rel = path.relative(cwd, absolute);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return undefined;
+  }
+  if (!existsSync(absolute)) {
+    return undefined;
+  }
+  try {
+    if (!statSync(absolute).isFile()) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  const token = createHash('sha256')
+    .update(`${threadId}:img:${absolute}`)
+    .digest('hex')
+    .slice(0, 32);
+  localAttachments.set(token, {
+    sourcePath: absolute,
+    contentType: imageContentType(absolute),
+    expiresAt: Date.now() + 2 * 60 * 60 * 1000
+  });
+  return `/attachments/${token}`;
 }
 
 async function requireAuth(request: Request, registry: DeviceRegistry) {
@@ -2482,8 +2803,7 @@ function startThreadPolling(
   hub: LiveEventHub,
   appServer: AppServerChatBridge | undefined,
   mirror: CodexMirrorBridge | undefined,
-  transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript,
-  seenThreadStore?: SeenThreadStore
+  transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ) {
   let previous = new Map<string, string>();
   let inFlight = false;
@@ -2547,12 +2867,10 @@ function startThreadPolling(
 
       previous = next;
 
-      // Drop seen-thread entries for threads that no longer exist, but only on
-      // a full sweep — partial polls only pull recently-active threads, so the
-      // 'next' map there isn't an authoritative list of what exists.
-      if (fullSweep && seenThreadStore) {
-        await seenThreadStore.pruneOrphans(new Set(next.keys())).catch(() => undefined);
-      }
+      // Do not prune seen-thread entries from this poll result. The thread list
+      // is intentionally filtered/limited for the UI, so a missing id here does
+      // not mean the thread no longer exists. SeenThreadStore's TTL handles old
+      // records without making reviewed threads reappear after a helper restart.
     } finally {
       inFlight = false;
     }
@@ -3004,6 +3322,34 @@ function adminForbidden(context: {
   json: (body: unknown, status?: number) => Response;
 }): Response {
   return context.json({ error: 'Admin mode required.' }, 401);
+}
+
+function limitThreadsPerProject(threads: Thread[], limit: number): Thread[] {
+  if (limit <= 0 || threads.length <= limit) {
+    return threads;
+  }
+
+  const grouped = new Map<string, Thread[]>();
+  for (const thread of threads) {
+    const projectKey = thread.workspacePath?.trim() || thread.workspace.trim() || 'unknown';
+    grouped.set(projectKey, [...(grouped.get(projectKey) ?? []), thread]);
+  }
+
+  if ([...grouped.values()].every((group) => group.length <= limit)) {
+    return threads;
+  }
+
+  const allowedThreadIds = new Set<string>();
+  for (const group of grouped.values()) {
+    for (const thread of sortThreadsByActivity(group).slice(0, limit)) {
+      allowedThreadIds.add(thread.threadId);
+    }
+  }
+  return threads.filter((thread) => allowedThreadIds.has(thread.threadId));
+}
+
+function sortThreadsByActivity(threads: Thread[]): Thread[] {
+  return [...threads].sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt));
 }
 
 const CODEX_ICNS_PATH = '/Applications/Codex.app/Contents/Resources/electron.icns';

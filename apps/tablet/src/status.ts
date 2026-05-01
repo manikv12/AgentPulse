@@ -1,5 +1,7 @@
 import type { Thread, ThreadStatus } from '@agent-pulse/shared';
 
+const SEEN_ACTIVITY_CLOCK_SKEW_MS = 1_000;
+
 export const statusLabels: Record<ThreadStatus, string> = {
   idle: 'Idle',
   running: 'Running',
@@ -27,7 +29,7 @@ export function isAttentionStatus(status: ThreadStatus): boolean {
 export function hasUnseenActivity(thread: Thread, seenThreadActivity: Record<string, number>): boolean {
   const seenAt = seenThreadActivity[thread.threadId] ?? 0;
   const activityAt = Date.parse(thread.lastActivityAt);
-  return Number.isFinite(activityAt) && activityAt > seenAt;
+  return Number.isFinite(activityAt) && activityAt - seenAt > SEEN_ACTIVITY_CLOCK_SKEW_MS;
 }
 
 export function threadNeedsReview(thread: Thread, seenThreadActivity: Record<string, number>): boolean {

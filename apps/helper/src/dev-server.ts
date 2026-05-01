@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { AdminAuth } from './auth/admin';
 import { KeychainDeviceStore } from './auth/keychain-store';
 import { ClaudeCodeProvider } from './claude/claude-code';
+import { CopilotProvider } from './copilot/copilot';
 import { CodexAppServerChat } from './codex/app-server-chat';
 import { CodexAppServerClient } from './codex/app-server-client';
 import { CatalogReader } from './codex/catalog';
@@ -49,6 +50,7 @@ catalog.start();
 const advertiser = new BonjourAdvertiser();
 const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: '0.1.0' }));
 const claudeCode = new ClaudeCodeProvider();
+const copilot = new CopilotProvider();
 
 // IPC mirror to a running Codex desktop window. This is the helper's source for
 // desktop-owned actions: send, model changes, and approval requests/decisions.
@@ -86,6 +88,7 @@ const server = await startAgentPulseServer({
   appServer,
   mirror,
   claudeCode,
+  copilot,
   catalog,
   seenThreadStore,
   usageProvider,

@@ -3,6 +3,14 @@ import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { URL } from 'node:url';
 
+const DEV_SERVER_UNAVAILABLE_BODY = 'Tablet dev server unavailable.';
+const DEV_SERVER_UNAVAILABLE_HEADERS = {
+  'cache-control': 'no-cache, no-store, must-revalidate',
+  pragma: 'no-cache',
+  expires: '0',
+  'content-type': 'text/plain; charset=utf-8'
+} as const;
+
 export type TabletDevProxy = {
   target: string;
   fetch(request: Request): Promise<Response>;
@@ -31,25 +39,31 @@ export function createTabletDevProxy(target: string): TabletDevProxy {
         init.body = await request.arrayBuffer();
       }
 
-      const response = await fetch(upstream, init);
-      const responseHeaders = new Headers(response.headers);
-      const contentType = responseHeaders.get('content-type') ?? '';
-      if (contentType.includes('text/html')) {
-        responseHeaders.set('cache-control', 'no-cache, no-store, must-revalidate');
-        responseHeaders.set('pragma', 'no-cache');
-        responseHeaders.set('expires', '0');
-      }
+      try {
+        const response = await fetch(upstream, init);
+        const responseHeaders = new Headers(response.headers);
+        const contentType = responseHeaders.get('content-type') ?? '';
+        if (contentType.includes('text/html')) {
+          responseHeaders.set('cache-control', 'no-cache, no-store, must-revalidate');
+          responseHeaders.set('pragma', 'no-cache');
+          responseHeaders.set('expires', '0');
+        }
 
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders
-      });
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: responseHeaders
+        });
+      } catch {
+        return devServerUnavailableResponse();
+      }
     },
     proxyUpgrade(request, clientSocket, head) {
       const upstreamHost = targetUrl.hostname;
       const upstreamPort = Number(targetUrl.port) || 80;
+      let connected = false;
       const upstreamSocket = connect(upstreamPort, upstreamHost, () => {
+        connected = true;
         const requestLine = `${request.method ?? 'GET'} ${request.url ?? '/'} HTTP/1.1\r\n`;
         const headerLines = [`Host: ${targetUrl.host}`];
         for (const [name, value] of Object.entries(request.headers)) {
@@ -76,8 +90,36 @@ export function createTabletDevProxy(target: string): TabletDevProxy {
         clientSocket.destroy();
         upstreamSocket.destroy();
       };
-      upstreamSocket.on('error', cleanup);
+      upstreamSocket.on('error', () => {
+        if (!connected && !clientSocket.destroyed && clientSocket.writable) {
+          clientSocket.end(devServerUnavailableUpgradeResponse());
+          upstreamSocket.destroy();
+          return;
+        }
+        cleanup();
+      });
       clientSocket.on('error', cleanup);
     }
   };
+}
+
+function devServerUnavailableResponse(): Response {
+  return new Response(DEV_SERVER_UNAVAILABLE_BODY, {
+    status: 503,
+    headers: DEV_SERVER_UNAVAILABLE_HEADERS
+  });
+}
+
+function devServerUnavailableUpgradeResponse(): string {
+  return [
+    'HTTP/1.1 503 Service Unavailable',
+    'Connection: close',
+    `Content-Length: ${Buffer.byteLength(DEV_SERVER_UNAVAILABLE_BODY)}`,
+    'Cache-Control: no-cache, no-store, must-revalidate',
+    'Pragma: no-cache',
+    'Expires: 0',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    DEV_SERVER_UNAVAILABLE_BODY
+  ].join('\r\n');
 }

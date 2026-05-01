@@ -1,6 +1,8 @@
 import type { HelperHealth, Project, Thread, ThreadStatus } from '@agent-pulse/shared';
 import { useMemo } from 'react';
-import { relativeTime, statusLabels, statusTone } from './status';
+import { ProviderMark } from './ProviderMark';
+import { providerLabel, providerTone } from './providers';
+import { statusLabels, statusTone } from './status';
 
 type Props = {
   threads: Thread[];
@@ -38,38 +40,10 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
   }, [threads]);
 
   const totalThreads = threads.length;
-  const activeThreads =
-    (statusCounts.running ?? 0) +
-    (statusCounts.compacting ?? 0) +
-    (statusCounts.waiting_approval ?? 0);
 
   const statusSegments = STATUS_ORDER
-    .map((status) => ({
-      status,
-      count: statusCounts[status] ?? 0
-    }))
+    .map((status) => ({ status, count: statusCounts[status] ?? 0 }))
     .filter((s) => s.count > 0);
-
-  const recentThreads = useMemo(() => {
-    return [...threads]
-      .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
-      .slice(0, 8);
-  }, [threads]);
-
-  const projectCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const t of threads) {
-      counts[t.workspace] = (counts[t.workspace] ?? 0) + 1;
-    }
-    return counts;
-  }, [threads]);
-
-  const topProjects = useMemo(() => {
-    const ordered = projects.length > 0
-      ? projects.map((p) => ({ name: p.name, count: projectCounts[p.name] ?? 0 }))
-      : Object.entries(projectCounts).map(([name, count]) => ({ name, count }));
-    return ordered.sort((a, b) => b.count - a.count).slice(0, 6);
-  }, [projects, projectCounts]);
 
   const modelUsage = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -81,31 +55,43 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
     return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
   }, [threads, threadModels]);
 
+  const topProjects = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const t of threads) {
+      counts[t.workspace] = (counts[t.workspace] ?? 0) + 1;
+    }
+    const ordered = projects.length > 0
+      ? projects.map((p) => ({ name: p.name, count: counts[p.name] ?? 0 }))
+      : Object.entries(counts).map(([name, count]) => ({ name, count }));
+    return ordered.sort((a, b) => b.count - a.count).slice(0, 5);
+  }, [projects, threads]);
+
+  const recentThreads = useMemo(
+    () =>
+      [...threads]
+        .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
+        .slice(0, 5),
+    [threads]
+  );
+
   return (
     <aside className="codex-insights-rail" aria-label="Insights">
+
       <section className="codex-insight-card">
-        <h3 className="codex-insight-card-title">Overview</h3>
-        <div className="codex-insight-stat-row">
-          <div className="codex-insight-stat">
-            <div className="codex-insight-stat-value">{totalThreads}</div>
-            <div className="codex-insight-stat-label">Threads</div>
-          </div>
-          <div className="codex-insight-stat">
-            <div className="codex-insight-stat-value">{activeThreads}</div>
-            <div className="codex-insight-stat-label">Active</div>
-          </div>
-          <div className="codex-insight-stat">
-            <div className="codex-insight-stat-value" style={{ color: TONE_COLOR[helperTone(health)] }}>
-              {capitalize(health.status)}
-            </div>
-            <div className="codex-insight-stat-label">Helper</div>
-          </div>
+        <h3 className="codex-insight-card-title">Helper</h3>
+        <div className="codex-insight-helper-row">
+          <span
+            className="codex-insight-helper-dot"
+            style={{ background: TONE_COLOR[helperTone(health)] }}
+            aria-hidden="true"
+          />
+          <span className="codex-insight-helper-status">{capitalize(health.status)}</span>
         </div>
       </section>
 
-      {statusSegments.length > 0 ? (
+      {statusSegments.length > 0 && (
         <section className="codex-insight-card">
-          <h3 className="codex-insight-card-title">Status</h3>
+          <h3 className="codex-insight-card-title">Status breakdown</h3>
           <div className="codex-insight-bars" role="img" aria-label="Thread status breakdown">
             {statusSegments.map(({ status, count }) => (
               <div
@@ -123,7 +109,7 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
             {statusSegments.map(({ status, count }) => (
               <span key={status}>
                 <span
-                  className="codex-insight-bar-legend-dot"
+                  className={`codex-insight-bar-legend-dot ${status === 'running' || status === 'compacting' ? 'is-working' : ''}`}
                   style={{ background: TONE_COLOR[statusTone[status]] }}
                 />
                 {statusLabels[status]} · {count}
@@ -131,29 +117,11 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
             ))}
           </div>
         </section>
-      ) : null}
+      )}
 
-      {recentThreads.length > 0 ? (
+      {topProjects.length > 0 && (
         <section className="codex-insight-card">
-          <h3 className="codex-insight-card-title">Recent activity</h3>
-          <ul className="codex-insight-list">
-            {recentThreads.map((t) => (
-              <li key={t.threadId} className="codex-insight-list-row">
-                <span
-                  className="codex-insight-list-row-dot"
-                  style={{ background: TONE_COLOR[statusTone[t.status]] }}
-                />
-                <span className="codex-insight-list-row-title">{t.title}</span>
-                <span className="codex-insight-list-row-meta">{relativeTime(t.lastActivityAt)}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-
-      {topProjects.length > 0 ? (
-        <section className="codex-insight-card">
-          <h3 className="codex-insight-card-title">Projects</h3>
+          <h3 className="codex-insight-card-title">Workspaces</h3>
           <ul className="codex-insight-list">
             {topProjects.map((p) => (
               <li key={p.name} className="codex-insight-list-row">
@@ -163,11 +131,31 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
             ))}
           </ul>
         </section>
-      ) : null}
+      )}
 
-      {modelUsage.length > 0 ? (
+      {recentThreads.length > 0 && (
         <section className="codex-insight-card">
-          <h3 className="codex-insight-card-title">Models in use</h3>
+          <h3 className="codex-insight-card-title">Recent activity</h3>
+          <ul className="codex-insight-list">
+            {recentThreads.map((thread) => (
+              <li key={thread.threadId} className="codex-insight-list-row">
+                <span
+                  className={`codex-insight-list-row-mark provider-${providerTone(thread.provider)}`}
+                  aria-label={providerLabel(thread.provider)}
+                >
+                  <ProviderMark provider={thread.provider} size="sm" />
+                </span>
+                <span className="codex-insight-list-row-title">{thread.title}</span>
+                <span className="codex-insight-list-row-meta">{statusLabels[thread.status]}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {modelUsage.length > 0 && (
+        <section className="codex-insight-card">
+          <h3 className="codex-insight-card-title">Models</h3>
           <ul className="codex-insight-list">
             {modelUsage.map(([model, count]) => (
               <li key={model} className="codex-insight-list-row">
@@ -177,7 +165,8 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
             ))}
           </ul>
         </section>
-      ) : null}
+      )}
+
     </aside>
   );
 }

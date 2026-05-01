@@ -952,16 +952,18 @@ export class CodexAppServerChat {
       // many times inside one turn, and using them to clear isStreaming makes the
       // tablet's working badge flicker. Any active flag (running, waitingOnApproval,
       // waitingOnUserInput) keeps the thread in a working state.
-      state.isStreaming = type === 'active';
-      if (type !== 'active') {
+      const shouldKeepActiveTurn = type !== 'active' && state.activeTurnId !== null;
+      state.isStreaming = type === 'active' || shouldKeepActiveTurn;
+      if (type !== 'active' && !shouldKeepActiveTurn) {
         state.activeTurnId = null;
         state.isCompacting = false;
       }
+      const visibleType = shouldKeepActiveTurn ? 'active' : type;
       this.emitLiveEvent({
         type: 'thread/status/changed',
         payload: {
           threadId,
-          status: mapAppServerStatus({ type, activeFlags } as AppServerThreadStatus)
+          status: mapAppServerStatus({ type: visibleType, activeFlags } as AppServerThreadStatus)
         }
       });
       this.emitThreadStateChanged(threadId);
