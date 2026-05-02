@@ -8,6 +8,7 @@ import {
   type CatalogModel,
   type CatalogPlugin,
   type CatalogSkill,
+  type ChatAttachment,
   type CollaborationModeKind,
   type AgentProvider,
   type HelperHealth,
@@ -21,7 +22,6 @@ import {
 } from '@agent-pulse/shared';
 import {
   AlertTriangle,
-  Bot,
   CheckCircle2,
   Cloud,
   Copy,
@@ -86,6 +86,7 @@ import {
 } from './api';
 import { AppMark } from './AppMark';
 import { Dashboard, type NewThreadTarget } from './Dashboard';
+import { ProviderMark } from './ProviderMark';
 import { providerLabel, providerTone } from './providers';
 import { useThemePreference, type ThemePreference } from './theme';
 
@@ -149,6 +150,14 @@ function sameSession(
     left.deviceId === right.deviceId &&
     left.fingerprint === right.fingerprint
   );
+}
+
+function screenAfterClearingSession(current: AppScreen): AppScreen {
+  if (ADMIN_FLEX_SCREENS.has(current) || current === 'pairing') {
+    return current;
+  }
+
+  return 'chooser';
 }
 
 function parseSeenLocalStorage(raw: string | null): Record<string, number> {
@@ -1278,6 +1287,16 @@ export function App() {
   );
 
   const [streamingThreadIds, setStreamingThreadIds] = useState<Set<string>>(() => new Set());
+  // Per-token assistant text overlay. Keyed by threadId so the active conversation
+  // can render Claude's reply word-by-word ahead of the next full transcript snapshot.
+  // - `thread/assistant/text-delta` appends the delta (resets if messageId changed).
+  // - `thread/assistant/text-end` clears the entry once the turn is finalized.
+  // - The overlay is layered on top of the transcript in `ThreadView`; when the
+  //   transcript message is longer-or-equal we ignore the overlay so missed deltas
+  //   recover automatically.
+  const [liveAssistantTextByThread, setLiveAssistantTextByThread] = useState<
+    Record<string, { messageId: string; text: string }>
+  >({});
   // Helper-synced "user has reviewed this thread at" map. Populated from
   // /threads/seen-activity on session connect, then kept fresh by the
   // thread/seen-activity/changed live event. Dashboard merges this with its
@@ -1435,6 +1454,7 @@ export function App() {
   const [skills, setSkills] = useState<CatalogSkill[]>([]);
   const [commands, setCommands] = useState<CatalogCommand[]>([]);
   const [models, setModels] = useState<CatalogModel[]>([]);
+  const [sessionRecoverySuspended, setSessionRecoverySuspended] = useState(false);
   const [threadPendingRequests, setThreadPendingRequests] = useState<
     Record<string, PendingRequestSummary[]>
   >({});
@@ -1525,6 +1545,7 @@ export function App() {
     if (!session) {
       setThreads([]);
       setTranscripts({});
+      setLiveAssistantTextByThread({});
       setThreadsLoaded(false);
       setActiveThreadId(undefined);
       return;
@@ -1537,6 +1558,11 @@ export function App() {
 
   const refresh = useCallback(async () => {
     const requestSession = session;
+    if (requestSession && sessionRecoverySuspended) {
+      setThreadsLoaded(false);
+      setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
+      return;
+    }
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 5_000);
 
@@ -1552,16 +1578,13 @@ export function App() {
       }
 
       if (!requestSession) {
+        setSessionRecoverySuspended(false);
         setThreads([]);
         setTranscripts({});
+        setLiveAssistantTextByThread({});
         setThreadsLoaded(false);
         setActiveThreadId(undefined);
-        setScreen((current) => {
-          if (ADMIN_FLEX_SCREENS.has(current) || current === 'pairing') {
-            return current;
-          }
-          return 'chooser';
-        });
+        setScreen(screenAfterClearingSession);
         return;
       }
 
@@ -1677,28 +1700,38 @@ export function App() {
               deviceId: recovered.deviceId,
               deviceName: recovered.deviceName
             };
+            setSessionRecoverySuspended(false);
             saveSession(nextSession);
             setSession(nextSession);
             setScreen((current) => (ADMIN_FLEX_SCREENS.has(current) ? current : 'dashboard'));
             return;
-          } catch {
+          } catch (recoverError) {
+            if (!(recoverError instanceof Response) || (recoverError.status !== 401 && recoverError.status !== 403)) {
+              setSessionRecoverySuspended(true);
+              setThreadsLoaded(false);
+              setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
+              return;
+            }
+
             // Fall through to the old reset behavior when the helper confirms this
             // browser is not the saved device anymore.
           }
         }
+        setSessionRecoverySuspended(false);
         clearSession();
         setSession(undefined);
         setThreads([]);
         setTranscripts({});
+        setLiveAssistantTextByThread({});
         setThreadsLoaded(false);
         setActiveThreadId(undefined);
-        setScreen('chooser');
+        setScreen(screenAfterClearingSession);
         return;
       }
       setThreadsLoaded(false);
       setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
     }
-  }, [session, syncWorkingStateFromThreads]);
+  }, [session, sessionRecoverySuspended, syncWorkingStateFromThreads]);
 
   useEffect(() => {
     void refresh();
@@ -1706,6 +1739,11 @@ export function App() {
 
   useEffect(() => {
     if (!session) {
+      setSessionRecoverySuspended(false);
+      return;
+    }
+
+    if (sessionRecoverySuspended) {
       return;
     }
 
@@ -1748,6 +1786,13 @@ export function App() {
             current.filter((thread) => thread.threadId !== liveEvent.payload.threadId)
           );
           setTranscripts((current) => removeTranscriptCache(current, liveEvent.payload.threadId));
+          setLiveAssistantTextByThread((current) => {
+            if (!(liveEvent.payload.threadId in current)) {
+              return current;
+            }
+            const { [liveEvent.payload.threadId]: _removed, ...rest } = current;
+            return rest;
+          });
         }
 
         if (liveEvent.type === 'thread/transcript/changed') {
@@ -1792,6 +1837,36 @@ export function App() {
           }
         }
 
+        if (liveEvent.type === 'thread/assistant/text-delta') {
+          const { threadId, messageId, delta } = liveEvent.payload;
+          if (!delta) return;
+          setLiveAssistantTextByThread((current) => {
+            const existing = current[threadId];
+            if (existing && existing.messageId === messageId) {
+              return {
+                ...current,
+                [threadId]: { messageId, text: existing.text + delta }
+              };
+            }
+            return {
+              ...current,
+              [threadId]: { messageId, text: delta }
+            };
+          });
+        }
+
+        if (liveEvent.type === 'thread/assistant/text-end') {
+          const { threadId, messageId } = liveEvent.payload;
+          setLiveAssistantTextByThread((current) => {
+            const existing = current[threadId];
+            if (!existing || existing.messageId !== messageId) {
+              return current;
+            }
+            const { [threadId]: _removed, ...rest } = current;
+            return rest;
+          });
+        }
+
         if (liveEvent.type === 'thread/pending-approvals/changed') {
           // Helper-driven push of the current pending approval requests for a thread.
           const { threadId, requests } = liveEvent.payload;
@@ -1832,7 +1907,7 @@ export function App() {
 
       };
       socket.onclose = () => {
-        if (closingFromCleanup || !loadSession()) {
+        if (closingFromCleanup || sessionRecoverySuspended || !loadSession()) {
           return;
         }
         setMessage('Reconnecting to helper...');
@@ -1853,6 +1928,7 @@ export function App() {
     };
   }, [
     session,
+    sessionRecoverySuspended,
     applyTranscriptActivityState,
     applyTranscriptModel,
     markThreadReady,
@@ -1871,6 +1947,7 @@ export function App() {
       fingerprint,
       deviceName: result.deviceName
     };
+    setSessionRecoverySuspended(false);
     saveSession(nextSession);
     setSession(nextSession);
     setActiveThreadId(undefined);
@@ -1918,7 +1995,7 @@ export function App() {
         result.thread,
         ...current.filter((thread) => thread.threadId !== result.thread.threadId)
       ]);
-      setMessage('New thread created in Agent Pulse.');
+      setMessage('New chat created in Agent Pulse.');
       return result.thread;
     } catch (error) {
       if (error instanceof Response && error.status === 403) {
@@ -1977,7 +2054,7 @@ export function App() {
     async (
       threadId: string,
       text: string,
-      options?: { collaborationMode?: CollaborationModeKind }
+      options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
     ) => {
       if (!session) {
         return Promise.reject(new Error('Not connected.'));
@@ -1989,6 +2066,8 @@ export function App() {
       // just-started turn yet, and committing that to the cache would make ThreadView
       // re-show the previous turn's assistant reply under the optimistic bubble.
       const trimmedSendText = text.trim();
+      const sentAttachmentIds = new Set(options?.attachments?.map((attachment) => attachment.id) ?? []);
+      const sentAttachmentUrls = new Set(options?.attachments?.map((attachment) => attachment.url) ?? []);
       const previousTranscript = transcripts[threadId];
       const baselineMessageIds = new Set(
         previousTranscript?.messages.map((message) => message.id) ?? []
@@ -1997,8 +2076,12 @@ export function App() {
       const responseHasNewUserMessage = result.transcript.messages.some(
         (message) =>
           message.role === 'user' &&
-          message.text.trim() === trimmedSendText &&
-          !baselineMessageIds.has(message.id)
+          !baselineMessageIds.has(message.id) &&
+          ((trimmedSendText && message.text.trim() === trimmedSendText) ||
+            (message.attachments ?? []).some(
+              (attachment) =>
+                sentAttachmentIds.has(attachment.id) || sentAttachmentUrls.has(attachment.url)
+            ))
       );
       if (responseHasNewUserMessage) {
         setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
@@ -2065,6 +2148,11 @@ export function App() {
       await deleteThread(session, threadId);
       setThreads((current) => current.filter((thread) => thread.threadId !== threadId));
       setTranscripts((current) => removeTranscriptCache(current, threadId));
+      setLiveAssistantTextByThread((current) => {
+        if (!(threadId in current)) return current;
+        const { [threadId]: _removed, ...rest } = current;
+        return rest;
+      });
       setThreadPendingRequests((current) => {
         if (!(threadId in current)) return current;
         const next = { ...current };
@@ -2172,6 +2260,7 @@ export function App() {
           stopWork={handleStopWork}
           fetchOlderMessages={handleFetchOlderMessages}
           transcriptUpdates={transcripts}
+          liveAssistantTextByThread={liveAssistantTextByThread}
           threadModels={threadModels}
           threadReasoningEfforts={threadReasoningEfforts}
           threadPendingRequests={threadPendingRequests}
@@ -3277,8 +3366,8 @@ function AgentProviderSettings({
               aria-pressed={enabled}
               title={lockedOn ? 'At least one agent must stay on' : undefined}
             >
-              <span className="agent-provider-toggle-icon">
-                <Bot size={16} />
+              <span className={`agent-provider-toggle-icon provider-${providerTone(provider)}`}>
+                <ProviderMark provider={provider} size="sm" />
               </span>
               <span>
                 <strong>{providerLabel(provider)}</strong>

@@ -54,6 +54,7 @@ type TurnStartOptions = {
   model?: string;
   effort?: string;
   collaborationMode?: CollaborationModeKind;
+  attachments?: ChatAttachment[];
 };
 
 type AppServerCollaborationMode = {
@@ -443,7 +444,7 @@ export class CodexAppServerChat {
     ensureCanSend(transcript.sendState);
 
     if (thread.status.type === 'active' && transcript.activeTurnId) {
-      return this.steerActiveTurn(threadId, trimmed, transcript.activeTurnId);
+      return this.steerActiveTurn(threadId, trimmed, transcript.activeTurnId, options.attachments);
     }
 
     // turn/start accepts `model` and `effort` directly. We pass the user's queued overrides
@@ -451,15 +452,15 @@ export class CodexAppServerChat {
     // desktop window to own the conversation.
     const response = await this.transport.request<{ turn: { id: string } }>('turn/start', {
       threadId,
-      input: userTextInput(trimmed),
+      input: userTextInput(trimmed, options.attachments),
       ...turnStartOverrides(options, thread)
     });
     this.markLiveTurnStarted(threadId, response.turn.id, trimmed);
-    const updatedTranscript = await this.readTranscript(threadId).catch((error) => {
+    const updatedTranscript = await this.readTranscriptAfterAcceptedSend(threadId).catch((error) => {
       if (isUnmaterializedDraftError(error)) {
         return startedDraftTranscript(threadId, trimmed, response.turn.id);
       }
-      throw error;
+      return startedDraftTranscript(threadId, trimmed, response.turn.id);
     });
     const visibleTranscript = this.applyLiveState(updatedTranscript, threadId);
     return ThreadMessageResponseSchema.parse({
@@ -769,7 +770,8 @@ export class CodexAppServerChat {
   private async steerActiveTurn(
     threadId: string,
     text: string,
-    activeTurnId: string | null
+    activeTurnId: string | null,
+    attachments: ChatAttachment[] | undefined
   ): Promise<ThreadMessageResponse> {
     if (!activeTurnId) {
       throw new SendBlockedError(
@@ -779,14 +781,14 @@ export class CodexAppServerChat {
     }
 
     try {
-      return await this.callTurnSteer(threadId, text, activeTurnId);
+      return await this.callTurnSteer(threadId, text, activeTurnId, attachments);
     } catch {
       const refreshed = await this.loadExistingThread(threadId);
       const refreshedTranscript = mapThreadToTranscript(refreshed);
       ensureCanSend(refreshedTranscript.sendState);
 
       if (refreshedTranscript.activeTurnId && refreshedTranscript.activeTurnId !== activeTurnId) {
-        return this.callTurnSteer(threadId, text, refreshedTranscript.activeTurnId);
+        return this.callTurnSteer(threadId, text, refreshedTranscript.activeTurnId, attachments);
       }
 
       throw new SendBlockedError('thread_changed', 'Thread changed. Try again.');
@@ -796,19 +798,22 @@ export class CodexAppServerChat {
   private async callTurnSteer(
     threadId: string,
     text: string,
-    expectedTurnId: string
+    expectedTurnId: string,
+    attachments: ChatAttachment[] | undefined
   ): Promise<ThreadMessageResponse> {
     const response = await this.transport.request<{ turnId: string }>('turn/steer', {
       threadId,
-      input: userTextInput(text),
+      input: userTextInput(text, attachments),
       expectedTurnId
     });
-    const updatedTranscript = await this.readTranscript(threadId);
+    const updatedTranscript = await this.readTranscriptAfterAcceptedSend(threadId).catch(() =>
+      startedDraftTranscript(threadId, text, response.turnId)
+    );
     return ThreadMessageResponseSchema.parse({
       ok: true,
       mode: 'steer',
       turnId: response.turnId,
-      transcript: updatedTranscript
+      transcript: this.applyLiveState(updatedTranscript, threadId)
     });
   }
 
@@ -819,15 +824,15 @@ export class CodexAppServerChat {
   ): Promise<ThreadMessageResponse> {
     const response = await this.transport.request<{ turn: { id: string } }>('turn/start', {
       threadId,
-      input: userTextInput(text),
+      input: userTextInput(text, options.attachments),
       ...turnStartOverrides(options, undefined, this.threadExecutionSettings.get(threadId))
     });
     this.markLiveTurnStarted(threadId, response.turn.id, text);
-    const transcript = await this.readTranscript(threadId).catch((error) => {
+    const transcript = await this.readTranscriptAfterAcceptedSend(threadId).catch((error) => {
       if (isUnmaterializedDraftError(error)) {
         return startedDraftTranscript(threadId, text, response.turn.id);
       }
-      throw error;
+      return startedDraftTranscript(threadId, text, response.turn.id);
     });
     return ThreadMessageResponseSchema.parse({
       ok: true,
@@ -835,6 +840,14 @@ export class CodexAppServerChat {
       turnId: response.turn.id,
       transcript: this.applyLiveState(transcript, threadId)
     });
+  }
+
+  private async readTranscriptAfterAcceptedSend(threadId: string): Promise<ThreadTranscript> {
+    return promiseWithTimeout(
+      this.readTranscript(threadId),
+      1_500,
+      'Codex accepted the message, but transcript refresh was slow.'
+    );
   }
 
   private async loadExistingThread(threadId: string): Promise<AppServerThread> {
@@ -1340,6 +1353,20 @@ function userMessageForStartedTurn(turnId: string, text: string): ChatMessage {
   });
 }
 
+function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })
+  ]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  });
+}
+
 function transcriptConfirmsLiveMessage(liveMessage: ChatMessage, transcriptMessages: ChatMessage[]): boolean {
   if (liveMessage.role !== 'user') {
     return false;
@@ -1359,14 +1386,35 @@ function transcriptConfirmsLiveMessage(liveMessage: ChatMessage, transcriptMessa
   });
 }
 
-function userTextInput(text: string) {
-  return [
-    {
+function userTextInput(text: string, attachments: ChatAttachment[] = []) {
+  const input: Record<string, unknown>[] = [];
+  if (text.trim()) {
+    input.push({
       type: 'text',
       text,
       text_elements: []
+    });
+  }
+  for (const attachment of attachments) {
+    if (!attachment.url) {
+      continue;
     }
-  ];
+    input.push({
+      type: 'input_image',
+      image_url: {
+        url: attachment.url
+      }
+    });
+  }
+  return input.length > 0
+    ? input
+    : [
+        {
+          type: 'text',
+          text,
+          text_elements: []
+        }
+      ];
 }
 
 function turnStartOverrides(

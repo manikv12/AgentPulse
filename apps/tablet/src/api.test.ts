@@ -262,6 +262,71 @@ describe('tablet API helpers', () => {
     );
   });
 
+  it('includes image attachments when sending a tablet message', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/threads/thread-1/messages') {
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            mode: 'start',
+            turnId: 'turn-1',
+            transcript: {
+              threadId: 'thread-1',
+              activeTurnId: null,
+              sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+              messages: [
+                {
+                  id: 'user-1',
+                  role: 'user',
+                  kind: 'message',
+                  text: 'See this.',
+                  createdAt: '2026-04-25T16:14:00Z',
+                  attachments: [
+                    {
+                      id: 'pasted-image-1',
+                      kind: 'image',
+                      url: '/attachments/token',
+                      alt: 'Pasted image 1'
+                    }
+                  ]
+                }
+              ]
+            }
+          })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+    const attachment = {
+      id: 'pasted-image-1',
+      kind: 'image' as const,
+      url: 'data:image/png;base64,iVBORw0KGgo=',
+      alt: 'Pasted image 1',
+      mimeType: 'image/png'
+    };
+
+    await sendThreadMessage(session, 'thread-1', 'See this.', {
+      attachments: [attachment]
+    });
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/threads/thread-1/messages',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ text: 'See this.', attachments: [attachment] })
+      })
+    );
+  });
+
   it('stops Codex work through the authenticated helper route', async () => {
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       if (url === '/threads/thread-1/stop') {
@@ -451,6 +516,47 @@ describe('tablet API helpers', () => {
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({ cwd: '/Users/me/projects/CodexPulse' })
+      })
+    );
+  });
+
+  it('starts a new thread in the shared chat location', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/threads/new') {
+        return {
+          ok: true,
+          json: async () => ({
+            thread: {
+              threadId: 'claude-code:thread-new',
+              provider: 'claude-code',
+              title: 'New Claude chat',
+              workspace: 'Chats',
+              workspaceKind: 'chat',
+              status: 'idle',
+              lastActivityAt: '2026-04-26T10:00:00Z',
+              lastTurnSummary: ''
+            }
+          })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+
+    await startThread(session, { location: 'chat', provider: 'claude-code' });
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/threads/new',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ location: 'chat', provider: 'claude-code' })
       })
     );
   });

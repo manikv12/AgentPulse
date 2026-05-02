@@ -1665,6 +1665,8 @@ dd {
   border-radius: 8px;
   background: var(--surface-muted);
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
 }
 
 .markdown-body pre code {
@@ -1683,11 +1685,14 @@ dd {
 }
 
 .markdown-body table {
-  display: block;
-  overflow-x: auto;
+  display: table;
+  width: 100%;
+  table-layout: fixed;
+  overflow: visible;
   margin: 8px 0;
   border-collapse: collapse;
   font-size: 0.875rem;
+  touch-action: pan-y;
 }
 
 .markdown-body th,
@@ -1695,6 +1700,8 @@ dd {
   padding: 6px 10px;
   border: 1px solid var(--border);
   text-align: left;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body th {
@@ -1777,11 +1784,13 @@ dd {
 }
 
 .settings-shell {
+  width: 100%;
   max-width: 1120px;
   margin: 0 auto;
   display: grid;
   gap: 22px;
   align-content: start;
+  padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
 }
 
 .settings-overview {
@@ -1964,7 +1973,7 @@ dd {
 
 .agent-provider-toggle-row {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
   gap: 10px;
 }
 
@@ -2001,6 +2010,25 @@ dd {
   border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
   border-radius: 9px;
   background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.agent-provider-toggle-icon .codex-mark,
+.agent-provider-toggle-icon .provider-mark,
+.agent-provider-toggle-icon .codex-mark img,
+.agent-provider-toggle-icon .codex-mark svg,
+.agent-provider-toggle-icon .provider-mark svg {
+  width: 18px;
+  height: 18px;
+}
+
+.agent-provider-toggle-icon.provider-codex .codex-mark {
+  background: transparent;
+  box-shadow: none;
+}
+
+.agent-provider-toggle-icon.provider-codex .codex-mark img,
+.agent-provider-toggle-icon.provider-codex .codex-mark svg {
+  border-radius: 4px;
 }
 
 .agent-provider-toggle strong,
@@ -2381,6 +2409,70 @@ dd {
 }
 
 @media (max-width: 740px) {
+  .shell.settings-shell {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    min-height: 100svh;
+    padding: calc(12px + env(safe-area-inset-top, 0px)) 12px calc(18px + env(safe-area-inset-bottom, 0px));
+    gap: 12px;
+    overflow-x: hidden;
+  }
+
+  .settings-shell .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 12;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: calc(12px + env(safe-area-inset-top, 0px)) 12px 12px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    -webkit-backdrop-filter: blur(18px) saturate(130%);
+    backdrop-filter: blur(18px) saturate(130%);
+  }
+
+  .settings-shell .brand-lockup {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .settings-shell .brand-lockup > div {
+    min-width: 0;
+  }
+
+  .settings-shell h1 {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    font-size: clamp(1.2rem, 6.2vw, 1.55rem);
+    line-height: 1.12;
+  }
+
+  .settings-shell .topbar-actions {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .settings-shell .topbar-actions .secondary-action {
+    width: 100%;
+    min-width: 0;
+    padding-inline: 10px;
+  }
+
+  .settings-overview {
+    gap: 14px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    border-radius: 12px;
+    background: var(--surface);
+  }
+
   .topbar {
     flex-direction: column;
     align-items: flex-start;
@@ -2400,29 +2492,69 @@ dd {
 
   .settings-grid {
     grid-template-columns: 1fr;
+    min-width: 0;
   }
 
   .settings-overview,
   .settings-panel {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
     padding: 16px;
   }
 
   .settings-status-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .settings-stat {
+    min-height: 64px;
+    padding: 10px;
+  }
+
+  .settings-stat strong {
+    font-size: 1.08rem;
   }
 
   .setting-row {
     grid-template-columns: 1fr;
+    gap: 10px;
   }
 
   .setting-row .secondary-action {
     width: 100%;
   }
 
+  .agent-provider-toggle-row {
+    grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  }
+
+  .agent-provider-toggle {
+    min-height: 54px;
+    padding: 9px;
+    gap: 8px;
+  }
+
+  .agent-provider-toggle strong {
+    font-size: 0.84rem;
+  }
+
   .remote-form,
   .remote-checklist,
+  .remote-protocol-control,
   .remote-url-box {
     grid-template-columns: 1fr;
+  }
+
+  .remote-url-box {
+    align-items: start;
+  }
+
+  .remote-url-box img {
+    width: min(112px, 100%);
+    height: auto;
+    aspect-ratio: 1;
   }
 
   .remote-actions {
@@ -2431,6 +2563,47 @@ dd {
 
   .settings-panel-title-row {
     flex-direction: column;
+  }
+
+  .settings-panel {
+    gap: 14px;
+    border-radius: 11px;
+  }
+
+  .settings-panel-heading {
+    gap: 10px;
+  }
+
+  .settings-panel-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+  }
+
+  .theme-segmented {
+    grid-template-columns: 1fr;
+  }
+
+  .passcode-form {
+    gap: 10px;
+  }
+
+  .pin-display {
+    min-height: 74px;
+    overflow-wrap: anywhere;
+    font-size: clamp(1.65rem, 9vw, 2.25rem);
+    letter-spacing: 0.04em;
+  }
+
+  .pin-actions,
+  .device-actions {
+    justify-content: flex-start;
+  }
+
+  .device-list li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
   }
 
   .thread-board {
@@ -2666,6 +2839,102 @@ dd {
   flex-direction: column;
   gap: 2px;
   margin-top: 8px;
+}
+
+.codex-sidebar-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.codex-sidebar-section:first-child {
+  border-top: 0;
+}
+
+.codex-sidebar-section-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+}
+
+.codex-sidebar-section-toggle {
+  display: grid;
+  grid-template-columns: 16px minmax(0, auto) auto;
+  align-items: center;
+  justify-content: start;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-subtle);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+
+.codex-sidebar-section-toggle:hover {
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+.codex-sidebar-section-chevron {
+  display: grid;
+  place-items: center;
+  color: var(--text-subtle);
+}
+
+.codex-sidebar-section-count {
+  min-width: 18px;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.codex-sidebar-section-action {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.codex-sidebar-section-action:hover:not(:disabled) {
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+.codex-sidebar-section-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.codex-sidebar-section-empty {
+  padding: 7px 10px 8px 31px;
+  color: var(--text-subtle);
+  font-size: 0.76rem;
+}
+
+.codex-sidebar-section-body,
+.codex-sidebar-chat-threads {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .codex-sidebar-search-shell {
@@ -3106,7 +3375,7 @@ dd {
   z-index: 55;
 }
 
-/* ── New thread chooser ────────────────────────────────────────────────── */
+/* ── New chat chooser ──────────────────────────────────────────────────── */
 
 .new-thread-backdrop {
   position: fixed;
@@ -3262,6 +3531,42 @@ dd {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
+}
+
+.new-thread-location-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.new-thread-location-pick {
+  appearance: none;
+  min-height: 36px;
+  padding: 0 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.new-thread-location-pick:hover {
+  background: var(--surface-hover, rgba(255, 255, 255, 0.05));
+}
+
+.new-thread-location-pick.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+
+.new-thread-location-pick:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .new-thread-provider-row {
@@ -3748,22 +4053,59 @@ dd {
 }
 
 .codex-thread-messages {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
   padding: 24px 24px 24px;
-  /* Headroom so the last message can scroll past the floating bottom panel */
-  /* (composer + context bar). Roomy enough for a few lines of input + safe */
-  /* area on devices with home indicators.                                  */
   padding-bottom: calc(180px + env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
   gap: 18px;
   width: 100%;
-  max-width: 920px;
-  margin: 0 auto;
+  max-width: none;
+  margin: 0;
+  /* Browser-level scroll anchoring keeps the viewport locked to a stable child
+     when content above it resizes (markdown images loading, activity groups
+     expanding/collapsing, older-history prepends). This is a free smoothness
+     win on top of the explicit anchor JS in ThreadView.tsx. */
+  overflow-anchor: auto;
+}
+
+.codex-thread-messages > .codex-message,
+.codex-thread-messages > .codex-activity-group,
+.codex-thread-messages > .codex-thread-load-older,
+.codex-thread-messages > .codex-thread-loading-older,
+.codex-thread-messages > .codex-thread-older-error,
+.codex-thread-messages > .codex-thread-older-status,
+.codex-thread-messages > .codex-thread-placeholder {
+  width: min(100%, 920px);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* The "loading older" spinner block appears and disappears at the top of the
+   list while loading older history. Marking it as a non-anchor candidate prevents the
+   browser from picking it as the scroll anchor — without this, the viewport
+   would jump when the spinner is removed at the end of the load. */
+.codex-thread-messages > .codex-thread-loading-older,
+.codex-thread-messages > .codex-thread-load-older,
+.codex-thread-messages > .codex-thread-older-error,
+.codex-thread-messages > .codex-thread-older-status {
+  overflow-anchor: none;
+}
+
+/* Skip rendering offscreen messages on scroll — the browser only paints what's
+   in/near the viewport. contain-intrinsic-size gives the layout a placeholder
+   height so the scrollbar stays accurate. Big perf win on long transcripts. */
+.codex-thread-messages > .codex-message,
+.codex-thread-messages > .codex-activity-group {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
 }
 
 /* ── Message containers ─────────────────────────────────────────────────── */
@@ -4454,12 +4796,22 @@ button.codex-activity-row:hover,
 
 .codex-pending-request {
   border: 1px solid rgba(99, 132, 255, 0.4);
-  background: rgba(99, 132, 255, 0.08);
+  background:
+    linear-gradient(
+      rgba(99, 132, 255, 0.10),
+      rgba(99, 132, 255, 0.10)
+    ),
+    var(--glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(180%);
   border-radius: 12px;
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 8px 24px rgba(0, 0, 0, 0.10);
 }
 
 .codex-pending-request-title {
@@ -4540,6 +4892,49 @@ button.codex-activity-row:hover,
   cursor: not-allowed;
   opacity: 0.6;
   background: transparent;
+}
+
+.codex-composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 2px 4px 0;
+}
+
+.codex-composer-attachment {
+  position: relative;
+  width: 72px;
+  height: 54px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.codex-composer-attachment-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.codex-composer-attachment-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+
+.codex-composer-attachment-remove:hover {
+  background: var(--surface);
 }
 
 .codex-composer-row {
@@ -6853,6 +7248,37 @@ button.codex-activity-row:hover,
 }
 
 /* Inline "loading older messages" indicator at the top of a thread. */
+.codex-thread-load-older {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: fit-content;
+  min-height: 36px;
+  padding: 8px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--surface-panel);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+  transition: border-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.codex-thread-load-older:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+.codex-thread-load-older:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 .codex-thread-loading-older {
   display: flex;
   align-items: center;

@@ -3,6 +3,7 @@ import type {
   CatalogModel,
   CatalogPlugin,
   CatalogSkill,
+  ChatAttachment,
   CollaborationModeKind,
   AgentProvider,
   HelperHealth,
@@ -44,7 +45,7 @@ export type DashboardProps = {
   sendMessage?: (
     threadId: string,
     text: string,
-    options?: { collaborationMode?: CollaborationModeKind }
+    options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
   ) => Promise<ThreadMessageResponse>;
   stopWork?: (threadId: string) => Promise<void>;
   fetchOlderMessages?: (
@@ -53,6 +54,11 @@ export type DashboardProps = {
     limit?: number
   ) => Promise<OlderThreadMessagesResponse>;
   transcriptUpdates?: Record<string, ThreadTranscript>;
+  // Per-thread per-token assistant text overlay produced by the WebSocket
+  // `thread/assistant/text-delta` stream. Forwarded as-is to ThreadView so
+  // Claude (and any other provider that opts into delta events) can render
+  // its reply word-by-word ahead of the next transcript snapshot.
+  liveAssistantTextByThread?: Record<string, { messageId: string; text: string }>;
   threadModels?: Record<string, string>;
   threadReasoningEfforts?: Record<string, string>;
   threadPendingRequests?: Record<string, PendingRequest[]>;
@@ -103,6 +109,7 @@ export type PendingRequest = {
 };
 
 export type NewThreadTarget =
+  | { location: 'chat'; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
   | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
   | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string };
 
@@ -122,6 +129,7 @@ export function Dashboard({
   stopWork,
   fetchOlderMessages,
   transcriptUpdates = {},
+  liveAssistantTextByThread = {},
   threadModels = {},
   threadReasoningEfforts = {},
   threadPendingRequests = {},
@@ -145,7 +153,7 @@ export function Dashboard({
   const [newThreadDialogOpen, setNewThreadDialogOpen] = useState(false);
   const [newThreadInitialProjectId, setNewThreadInitialProjectId] = useState<string | undefined>();
   const [newThreadError, setNewThreadError] = useState('');
-  const [creatingProjectId, setCreatingProjectId] = useState<string | undefined>();
+  const [creatingTargetId, setCreatingTargetId] = useState<string | undefined>();
   const [localSeenThreadActivity, setLocalSeenThreadActivity] = useState<Record<string, number>>(
     () => readSeenThreadActivity()
   );
@@ -325,7 +333,7 @@ export function Dashboard({
     }
 
     setNewThreadError('');
-    setCreatingProjectId('projectId' in target ? target.projectId : target.cwd);
+    setCreatingTargetId(targetKeyForNewThread(target));
     try {
       const thread = await onNewThread(target);
       setCreatedThreads((current) => [
@@ -349,12 +357,13 @@ export function Dashboard({
       setNewThreadDialogOpen(true);
       return false;
     } finally {
-      setCreatingProjectId(undefined);
+      setCreatingTargetId(undefined);
     }
   };
 
   return (
     <div className="codex-shell" data-route={activeThread ? 'thread' : 'home'}>
+      <h1 className="sr-only">Agent Pulse</h1>
       {sidebarOpen ? (
         <div
           className="codex-sidebar-backdrop"
@@ -412,6 +421,7 @@ export function Dashboard({
             }
             openThreadInCodex={onOpenThreadInCodex}
             liveTranscript={transcriptUpdates[activeThread.threadId]}
+            liveAssistantText={liveAssistantTextByThread[activeThread.threadId]}
             modelName={threadModels[activeThread.threadId] ?? activeThread.model}
             selectedModelSlug={threadModels[activeThread.threadId] ?? activeThread.model}
             selectedReasoningEffort={
@@ -468,7 +478,7 @@ export function Dashboard({
           projects={projects}
           models={models}
           initialProjectId={newThreadInitialProjectId}
-          creatingProjectId={creatingProjectId}
+          creatingTargetId={creatingTargetId}
           error={newThreadError}
           onClose={() => setNewThreadDialogOpen(false)}
           onCreate={(target) => void createThread(target)}
@@ -479,8 +489,18 @@ export function Dashboard({
 }
 
 function projectIdForActiveThread(thread: Thread, projects: Project[]): string {
+  if (thread.workspaceKind === 'chat') {
+    return '';
+  }
   const match = projects.find((project) => project.name === thread.workspace);
   return match?.projectId ?? '';
+}
+
+function targetKeyForNewThread(target: NewThreadTarget): string {
+  if ('location' in target) {
+    return `chat:${target.provider ?? 'codex'}`;
+  }
+  return 'projectId' in target ? target.projectId : target.cwd;
 }
 
 function readSeenThreadActivity(): Record<string, number> {
@@ -542,7 +562,7 @@ function NewThreadDialog({
   projects,
   models,
   initialProjectId,
-  creatingProjectId,
+  creatingTargetId,
   error,
   onClose,
   onCreate
@@ -550,11 +570,14 @@ function NewThreadDialog({
   projects: Project[];
   models: CatalogModel[];
   initialProjectId?: string;
-  creatingProjectId?: string;
+  creatingTargetId?: string;
   error: string;
   onClose: () => void;
   onCreate: (target: NewThreadTarget) => void;
 }) {
+  const [selectedLocation, setSelectedLocation] = useState<'chat' | 'project'>(
+    initialProjectId ? 'project' : 'chat'
+  );
   const [selectedProjectId, setSelectedProjectId] = useState(() =>
     initialProjectId && projects.some((project) => project.projectId === initialProjectId)
       ? initialProjectId
@@ -565,7 +588,7 @@ function NewThreadDialog({
   // ~/.codex/config.toml". The user can override here for one-off threads.
   const [selectedModelSlug, setSelectedModelSlug] = useState<string>('');
   const [selectedEffort, setSelectedEffort] = useState<string>('');
-  const creating = creatingProjectId !== undefined;
+  const creating = creatingTargetId !== undefined;
   const selectedProject = projects.find((project) => project.projectId === selectedProjectId);
   const availableProviders = useMemo<AgentProvider[]>(() => {
     const providers = [
@@ -585,13 +608,16 @@ function NewThreadDialog({
   useEffect(() => {
     if (projects.length === 0) {
       setSelectedProjectId('');
+      if (selectedLocation === 'project') {
+        setSelectedLocation('chat');
+      }
       return;
     }
 
     if (!projects.some((project) => project.projectId === selectedProjectId)) {
       setSelectedProjectId(projects[0]?.projectId ?? '');
     }
-  }, [projects, selectedProjectId]);
+  }, [projects, selectedProjectId, selectedLocation]);
 
   useEffect(() => {
     if (!availableProviders.includes(selectedProvider)) {
@@ -629,19 +655,19 @@ function NewThreadDialog({
         className="new-thread-dialog"
         role="dialog"
         aria-modal="true"
-        aria-label="New thread"
+        aria-label="New chat"
         onClick={(event) => event.stopPropagation()}
       >
         <header className="new-thread-header">
           <div>
-            <h2>Start a new thread</h2>
-            <p>Pick the folder and agent provider for this chat.</p>
+            <h2>Start a new chat</h2>
+            <p>Pick the location and agent provider.</p>
           </div>
           <button
             className="new-thread-close"
             type="button"
             onClick={onClose}
-            aria-label="Close new thread"
+            aria-label="Close new chat"
           >
             <X size={18} />
           </button>
@@ -651,11 +677,13 @@ function NewThreadDialog({
           className="new-thread-form"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!selectedProjectId || creating) {
+            if ((selectedLocation === 'project' && !selectedProjectId) || creating) {
               return;
             }
             const target: NewThreadTarget = {
-              projectId: selectedProjectId,
+              ...(selectedLocation === 'chat'
+                ? { location: 'chat' as const }
+                : { projectId: selectedProjectId }),
               provider: selectedProvider,
               ...(selectedModelSlug ? { modelSlug: selectedModelSlug } : {}),
               ...(selectedEffort ? { reasoningEffort: selectedEffort } : {})
@@ -663,29 +691,66 @@ function NewThreadDialog({
             onCreate(target);
           }}
         >
-          <label className="new-thread-label" htmlFor="new-thread-project">
-            Project
-          </label>
-          <select
-            id="new-thread-project"
-            className="new-thread-select"
-            value={selectedProjectId}
-            onChange={(event) => setSelectedProjectId(event.target.value)}
-            disabled={creating || projects.length === 0}
-          >
-            {projects.map((project) => (
-              <option key={project.projectId} value={project.projectId}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-          {selectedProject ? (
-            <p className="new-thread-selected-path">{selectedProject.path}</p>
-          ) : (
-            <p className="new-thread-empty">No saved projects are available yet.</p>
-          )}
+          <span className="new-thread-label">Location</span>
+          <div className="new-thread-location-row" role="radiogroup" aria-label="Location">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={selectedLocation === 'chat'}
+              className={`new-thread-location-pick ${
+                selectedLocation === 'chat' ? 'is-selected' : ''
+              }`}
+              onClick={() => setSelectedLocation('chat')}
+              disabled={creating}
+            >
+              Chats
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={selectedLocation === 'project'}
+              className={`new-thread-location-pick ${
+                selectedLocation === 'project' ? 'is-selected' : ''
+              }`}
+              onClick={() => setSelectedLocation('project')}
+              disabled={creating || projects.length === 0}
+            >
+              Project folder
+            </button>
+          </div>
+          {selectedLocation === 'chat' ? (
+            <p className="new-thread-selected-path">
+              Library/Application Support/Agent Pulse/Chats/{selectedProvider}
+            </p>
+          ) : null}
 
-          {selectedProject && availableProviders.length > 0 ? (
+          {selectedLocation === 'project' ? (
+            <>
+              <label className="new-thread-label" htmlFor="new-thread-project">
+                Project
+              </label>
+              <select
+                id="new-thread-project"
+                className="new-thread-select"
+                value={selectedProjectId}
+                onChange={(event) => setSelectedProjectId(event.target.value)}
+                disabled={creating || projects.length === 0}
+              >
+                {projects.map((project) => (
+                  <option key={project.projectId} value={project.projectId}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              {selectedProject ? (
+                <p className="new-thread-selected-path">{selectedProject.path}</p>
+              ) : (
+                <p className="new-thread-empty">No saved projects are available yet.</p>
+              )}
+            </>
+          ) : null}
+
+          {availableProviders.length > 0 ? (
             <>
               <span className="new-thread-label">Agent</span>
               <div className="new-thread-provider-row" role="radiogroup" aria-label="Provider">
@@ -721,7 +786,7 @@ function NewThreadDialog({
                 onChange={(event) => setSelectedModelSlug(event.target.value)}
                 disabled={creating}
               >
-                <option value="">Use project default</option>
+                <option value="">Use default model</option>
                 {providerModels.map((model) => (
                   <option key={model.slug} value={model.slug}>
                     {model.displayName}
@@ -760,14 +825,15 @@ function NewThreadDialog({
             <button
               className="new-thread-submit"
               type="submit"
-              disabled={!selectedProjectId || creating}
+              disabled={(selectedLocation === 'project' && !selectedProjectId) || creating}
             >
-              {creatingProjectId === selectedProjectId ? (
+              {creatingTargetId === `chat:${selectedProvider}` ||
+              (selectedLocation === 'project' && creatingTargetId === selectedProjectId) ? (
                 <>
                   <Spinner size={14} /> Starting
                 </>
               ) : (
-                'Start thread'
+                'Start chat'
               )}
             </button>
           </div>
@@ -879,7 +945,7 @@ function EmptyMain({
         {threads.length === 0 ? (
           <div className="codex-home-empty">
             <MessagesSquare size={28} aria-hidden="true" />
-            <p>No threads yet. Start a new thread in Codex.</p>
+            <p>No chats yet. Start a new chat.</p>
           </div>
         ) : (
           <div className="codex-home-content">

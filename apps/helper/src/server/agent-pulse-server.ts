@@ -69,8 +69,16 @@ import type { AdminAuth } from '../auth/admin';
 import { RateLimiter, type DeviceRegistry, type PairingManager } from '../auth/pairing';
 import { isClaudeThreadId } from '../claude/claude-code';
 import { isCopilotThreadId } from '../copilot/copilot';
+import {
+  createSharedChatCwd,
+  decorateSharedChatThread,
+  decorateSharedChatThreads,
+  filterSharedChatProjects,
+  isSharedChatPath
+} from '../chats/shared-chat-paths';
 import { SendBlockedError } from '../codex/app-server-chat';
 import type { CatalogReader } from '../codex/catalog';
+import { registerCodexProjectlessChat } from '../codex/codex-global-state';
 import type { createThreadOpener } from '../codex/thread-opener';
 import { debugLog } from '../debug';
 import type { SeenThreadStore } from './seen-thread-store';
@@ -80,7 +88,8 @@ import { createTabletDevProxy, type TabletDevProxy } from './tablet-dev-proxy';
 type ThreadOpener = ReturnType<typeof createThreadOpener>;
 
 type LocalAttachment = {
-  sourcePath: string;
+  sourcePath?: string;
+  data?: Buffer;
   contentType: string;
   expiresAt: number;
 };
@@ -91,6 +100,21 @@ const MANUAL_OPEN_COOLDOWN_MS = 2_500;
 const AUTO_DESKTOP_REFRESH_SETTLE_MS = 800;
 const AUTO_DESKTOP_REFRESH_COOLDOWN_MS = 10_000;
 const MAX_THREADS_PER_PROJECT = 6;
+const MAX_OUTGOING_ATTACHMENTS = 6;
+const MAX_OUTGOING_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES = 16 * 1024 * 1024;
+
+type MessageSendOptions = {
+  model?: string;
+  effort?: string;
+  collaborationMode?: CollaborationModeKind;
+  attachments?: ChatAttachment[];
+};
+
+type PreparedOutgoingAttachments = {
+  provider: ChatAttachment[];
+  display: ChatAttachment[];
+};
 
 type DesktopRefreshCandidate = {
   threadId: string;
@@ -108,7 +132,7 @@ export type AppServerChatBridge = {
   sendMessage(
     threadId: string,
     text: string,
-    options?: { model?: string; effort?: string; collaborationMode?: CollaborationModeKind }
+    options?: MessageSendOptions
   ): Promise<ThreadMessageResponse>;
   startThread?(
     cwd: string,
@@ -145,11 +169,7 @@ export type CodexMirrorBridge = {
   sendMessage(
     threadId: string,
     text: string,
-    options?: {
-      collaborationMode?: CollaborationModeKind;
-      model?: string;
-      effort?: string;
-    }
+    options?: MessageSendOptions
   ): Promise<ThreadMessageResponse>;
   setModelAndReasoning?(
     threadId: string,
@@ -179,7 +199,7 @@ export type ClaudeCodeBridge = {
   sendMessage(
     threadId: string,
     text: string,
-    options?: { model?: string; effort?: string; collaborationMode?: CollaborationModeKind }
+    options?: MessageSendOptions
   ): Promise<ThreadMessageResponse>;
   startThread?(cwd: string, options?: { model?: string; reasoningEffort?: string }): Promise<Thread>;
   discardDraftThread?(threadId: string): boolean;
@@ -218,6 +238,8 @@ export type AgentPulseServerOptions = {
   seenThreadStore?: SeenThreadStore;
   usageProvider?: (threadId: string) => Promise<import('@agent-pulse/shared').ThreadUsage | undefined>;
   version: string;
+  chatRoot?: string;
+  codexGlobalStatePath?: string;
   tabletDistDir?: string;
   tabletDevUrl?: string;
   onLanModeChange?: (enabled: boolean) => Promise<void>;
@@ -330,6 +352,7 @@ function createApp(
   // returns an id immediately, but the thread may not appear in the normal session list
   // and transcript reads can say "not materialized yet" until that first turn exists.
   const draftThreads = new Map<string, Thread>();
+  const registeredProjectlessCodexThreadIds = new Set<string>();
   const desktopInterestUntilByThread = new Map<string, number>();
   const manualOpenInFlight = new Map<string, Promise<{ ok: boolean; error?: string }>>();
   const lastManualOpenAtByThread = new Map<string, number>();
@@ -460,6 +483,20 @@ function createApp(
     manualOpenInFlight.set(threadId, opening);
     return opening;
   };
+  const waitForDesktopOwnership = async (threadId: string): Promise<void> => {
+    if (!options.mirror?.waitForOwnership) {
+      return;
+    }
+    if (options.mirror.isThreadOwned?.(threadId)) {
+      return;
+    }
+    await options.mirror.waitForOwnership(threadId, 4_000).catch((error: unknown) => {
+      console.warn('[agent-pulse] Codex desktop did not confirm thread ownership', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  };
   const rememberAgentPulseTurn = (threadId: string, turnId: string, mode: ThreadMessageResponse['mode']): void => {
     if (mode === 'start') {
       agentPulseOwnedTurnKeys.add(completedTurnKey(threadId, turnId));
@@ -564,8 +601,68 @@ function createApp(
       }
     }
   };
+  const registerSharedCodexChatThread = async (thread: Thread): Promise<void> => {
+    if (
+      registeredProjectlessCodexThreadIds.has(thread.threadId) ||
+      !(
+        thread.workspaceKind === 'chat' ||
+        isSharedChatPath(thread.workspacePath, options.chatRoot)
+      )
+    ) {
+      return;
+    }
+
+    try {
+      await registerCodexProjectlessChat(thread.threadId, {
+        chatRoot: options.chatRoot,
+        globalStatePath: options.codexGlobalStatePath
+      });
+      registeredProjectlessCodexThreadIds.add(thread.threadId);
+    } catch (error) {
+      console.warn('[agent-pulse] Could not register shared chat with Codex global state', {
+        threadId: thread.threadId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+  const registerKnownSharedCodexChatThread = async (threadId: string): Promise<void> => {
+    if (registeredProjectlessCodexThreadIds.has(threadId)) {
+      return;
+    }
+    const draftThread = draftThreads.get(threadId);
+    if (draftThread) {
+      await registerSharedCodexChatThread(draftThread);
+      return;
+    }
+    const workspacePath = threadCwdByThreadId.get(threadId);
+    if (isSharedChatPath(workspacePath, options.chatRoot)) {
+      await registerSharedCodexChatThread(
+        ThreadSchema.parse({
+          threadId,
+          provider: 'codex',
+          title: 'Chat',
+          workspace: 'Chats',
+          workspacePath,
+          workspaceKind: 'chat',
+          status: 'idle',
+          lastActivityAt: new Date().toISOString(),
+          lastTurnSummary: ''
+        })
+      );
+      return;
+    }
+
+    const listedThread = (await options.threadProvider.listThreads().catch(() => []))
+      .find((thread) => thread.threadId === threadId);
+    if (!listedThread) {
+      return;
+    }
+    const decoratedThread = decorateSharedChatThread(listedThread, options.chatRoot);
+    rememberThreadCwds([decoratedThread]);
+    await registerSharedCodexChatThread(decoratedThread);
+  };
   const listCodexThreads = async (): Promise<Thread[]> => {
-    const threads = mergeDraftThreads(
+    const threads = decorateSharedChatThreads(mergeDraftThreads(
       await reconcileThreadStatuses(
         await options.threadProvider.listThreads(),
         options.appServer,
@@ -573,8 +670,9 @@ function createApp(
         transformTranscript
       ),
       draftThreads
-    );
+    ), options.chatRoot);
     rememberThreadCwds(threads);
+    await Promise.all(threads.map((thread) => registerSharedCodexChatThread(thread)));
     return threads;
   };
   const listAllThreads = async (): Promise<Thread[]> => {
@@ -583,10 +681,12 @@ function createApp(
       isProviderEnabled('claude-code') ? options.claudeCode?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([]),
       isProviderEnabled('copilot') ? options.copilot?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([])
     ]);
-    rememberThreadCwds(claudeThreads);
-    rememberThreadCwds(copilotThreads);
+    const decoratedClaudeThreads = decorateSharedChatThreads(claudeThreads, options.chatRoot);
+    const decoratedCopilotThreads = decorateSharedChatThreads(copilotThreads, options.chatRoot);
+    rememberThreadCwds(decoratedClaudeThreads);
+    rememberThreadCwds(decoratedCopilotThreads);
     return limitThreadsPerProject(
-      [...codexThreads, ...claudeThreads, ...copilotThreads],
+      [...codexThreads, ...decoratedClaudeThreads, ...decoratedCopilotThreads],
       MAX_THREADS_PER_PROJECT
     );
   };
@@ -596,7 +696,10 @@ function createApp(
       isProviderEnabled('claude-code') ? options.claudeCode?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([]),
       isProviderEnabled('copilot') ? options.copilot?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([])
     ]);
-    return mergeProjectsByPath([...codexProjects, ...claudeProjects, ...copilotProjects]);
+    return filterSharedChatProjects(
+      mergeProjectsByPath([...codexProjects, ...claudeProjects, ...copilotProjects]),
+      options.chatRoot
+    );
   };
   const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
     if (!options.appServer?.readTranscript) {
@@ -697,7 +800,14 @@ function createApp(
     }
 
     try {
-      const image = await readFile(attachment.sourcePath);
+      const image = attachment.data
+        ? new Uint8Array(attachment.data)
+        : attachment.sourcePath
+          ? await readFile(attachment.sourcePath)
+          : undefined;
+      if (!image) {
+        return context.notFound();
+      }
       return new Response(image, {
         headers: {
           'content-type': attachment.contentType,
@@ -1101,6 +1211,7 @@ function createApp(
     }
 
     let cwd: string;
+    const isSharedChat = parsed.location === 'chat';
     if (parsed.projectId) {
       const projects = await listAllProjects();
       const project = projects.find((candidate) => candidate.projectId === parsed.projectId);
@@ -1108,6 +1219,8 @@ function createApp(
         return context.json({ error: 'Project is not available.' }, 404);
       }
       cwd = project.path;
+    } else if (isSharedChat) {
+      cwd = await createSharedChatCwd(parsed.provider, options.chatRoot);
     } else {
       cwd = normalizeRequestedCwd(parsed.cwd ?? '');
       if (!path.isAbsolute(cwd)) {
@@ -1135,12 +1248,27 @@ function createApp(
           : parsed.provider === 'copilot'
             ? options.copilot!
             : options.appServer!;
-      const thread = await starter.startThread!(cwd, {
+      const rawThread = await starter.startThread!(cwd, {
         ...(parsed.modelSlug ? { model: parsed.modelSlug } : {}),
         ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
       });
+      const thread = isSharedChat
+        ? decorateSharedChatThread({ ...rawThread, workspacePath: rawThread.workspacePath ?? cwd }, options.chatRoot)
+        : rawThread;
       if (parsed.provider === 'codex') {
         draftThreads.set(thread.threadId, thread);
+        if (isSharedChat) {
+          await registerSharedCodexChatThread(thread);
+          const openResult = await openThreadWithMiniRefresh(thread.threadId);
+          if (openResult.ok) {
+            await waitForDesktopOwnership(thread.threadId);
+          } else {
+            console.warn('[agent-pulse] Could not open shared chat in Codex desktop', {
+              threadId: thread.threadId,
+              error: openResult.error
+            });
+          }
+        }
       }
       threadCwdByThreadId.set(thread.threadId, cwd);
       hub.broadcast({ type: 'thread/upsert', payload: thread });
@@ -1425,9 +1553,21 @@ function createApp(
     }
 
     const parsed = ThreadMessageRequestSchema.parse(await context.req.json());
+    const threadId = context.req.param('threadId');
+    let outgoingAttachments: PreparedOutgoingAttachments;
+    try {
+      outgoingAttachments = prepareOutgoingAttachments(
+        parsed.attachments ?? [],
+        threadId,
+        localAttachments
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not attach that image.';
+      return context.json({ error: message }, 400);
+    }
+    const textToSend = parsed.text || defaultAttachmentMessage(outgoingAttachments.display.length);
 
     try {
-      const threadId = context.req.param('threadId');
       if (!isProviderEnabled(providerForThreadId(threadId))) {
         return disabledProviderResponse(context, providerForThreadId(threadId));
       }
@@ -1437,16 +1577,22 @@ function createApp(
         }
         const override = pendingModelOverrides.get(threadId);
         const result = ThreadMessageResponseSchema.parse(
-          await options.claudeCode.sendMessage(threadId, parsed.text, {
+          await options.claudeCode.sendMessage(threadId, textToSend, {
             ...(override ? { model: override.model } : {}),
             ...(override?.effort ? { effort: override.effort } : {}),
-            ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
+            ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {}),
+            ...(outgoingAttachments.provider.length
+              ? { attachments: outgoingAttachments.provider }
+              : {})
           })
         );
         if (override) {
           pendingModelOverrides.delete(threadId);
         }
-        const visibleTranscript = transformTranscript(result.transcript, threadId);
+        const visibleTranscript = transformTranscript(
+          attachOutgoingAttachments(result.transcript, textToSend, outgoingAttachments.display),
+          threadId
+        );
         const parsedResponse = ThreadMessageResponseSchema.parse({
           ...result,
           transcript: visibleTranscript
@@ -1462,15 +1608,21 @@ function createApp(
         }
         const override = pendingModelOverrides.get(threadId);
         const result = ThreadMessageResponseSchema.parse(
-          await options.copilot.sendMessage(threadId, parsed.text, {
+          await options.copilot.sendMessage(threadId, textToSend, {
             ...(override ? { model: override.model } : {}),
-            ...(override?.effort ? { effort: override.effort } : {})
+            ...(override?.effort ? { effort: override.effort } : {}),
+            ...(outgoingAttachments.provider.length
+              ? { attachments: outgoingAttachments.provider }
+              : {})
           })
         );
         if (override) {
           pendingModelOverrides.delete(threadId);
         }
-        const visibleTranscript = transformTranscript(result.transcript, threadId);
+        const visibleTranscript = transformTranscript(
+          attachOutgoingAttachments(result.transcript, textToSend, outgoingAttachments.display),
+          threadId
+        );
         const parsedResponse = ThreadMessageResponseSchema.parse({
           ...result,
           transcript: visibleTranscript
@@ -1489,15 +1641,17 @@ function createApp(
           503
         );
       }
+      await registerKnownSharedCodexChatThread(threadId);
 
       // Slash commands the Codex desktop intercepts client-side. Sending the
       // raw text "/compact" as a turn would just be a literal user message;
       // instead we route to the matching v2 RPC so the actual command runs.
-      const slashCommand = matchBareSlashCommand(parsed.text);
+      const slashCommand =
+        outgoingAttachments.display.length === 0 ? matchBareSlashCommand(parsed.text) : undefined;
       if (slashCommand) {
         const handled = await handleSlashCommand(
           slashCommand,
-          parsed.text,
+          textToSend,
           threadId,
           options.appServer,
           hub
@@ -1507,29 +1661,50 @@ function createApp(
         }
       }
 
-      // Single source of truth for sends: the IPC mirror to the running
-      // Codex desktop window. The desktop forwards turn/start to its own
-      // app-server, so the message appears live in the desktop UI (same
-      // diff view, same model picker animation). We pass collaborationMode
-      // and any queued model/effort override through so plan mode and
-      // model selection apply on the desktop window.
+      // Prefer the IPC mirror to the running Codex desktop window. The desktop
+      // forwards turn/start to its own app-server, so the message appears live
+      // in the desktop UI. If the desktop cannot take ownership of the thread
+      // (common when the mini-window opener is blocked by macOS Accessibility or
+      // focus timing), fall back to the spawned app-server so the tablet send
+      // does not fail with "thread is not currently active on Mac".
       const override = pendingModelOverrides.get(threadId);
       const mirrorSendOptions =
-        override || parsed.collaborationMode
+        override || parsed.collaborationMode || outgoingAttachments.provider.length > 0
           ? {
               ...(override ? { model: override.model } : {}),
               ...(override?.effort ? { effort: override.effort } : {}),
-              ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {})
+              ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {}),
+              ...(outgoingAttachments.provider.length
+                ? { attachments: outgoingAttachments.provider }
+                : {})
             }
           : undefined;
-      const result = ThreadMessageResponseSchema.parse(
-        await runWithFollowerOwnership(
-          () => options.mirror!.sendMessage(threadId, parsed.text, mirrorSendOptions),
-          options.opener,
+      let result: ThreadMessageResponse;
+      try {
+        result = ThreadMessageResponseSchema.parse(
+          await runWithFollowerOwnership(
+            () => options.mirror!.sendMessage(threadId, textToSend, mirrorSendOptions),
+            options.opener,
+            threadId,
+            options.mirror
+          )
+        );
+      } catch (error) {
+        if (
+          !(error instanceof SendBlockedError) ||
+          error.reason !== 'thread_unavailable' ||
+          !options.appServer?.isConnected()
+        ) {
+          throw error;
+        }
+        console.warn('[send] IPC mirror could not focus thread; falling back to app-server', {
           threadId,
-          options.mirror
-        )
-      );
+          reason: error.reason
+        });
+        result = ThreadMessageResponseSchema.parse(
+          await options.appServer.sendMessage(threadId, textToSend, mirrorSendOptions)
+        );
+      }
 
       rememberAgentPulseTurn(threadId, result.turnId, result.mode);
 
@@ -1537,7 +1712,10 @@ function createApp(
       if (override) {
         pendingModelOverrides.delete(threadId);
       }
-      const visibleTranscript = transformTranscript(result.transcript, threadId);
+      const visibleTranscript = transformTranscript(
+        attachOutgoingAttachments(result.transcript, textToSend, outgoingAttachments.display),
+        threadId
+      );
       const response = {
         ...result,
         transcript: visibleTranscript
@@ -1563,7 +1741,7 @@ function createApp(
       // Log the underlying failure — without this, the tablet only sees the
       // generic 503 below and we lose the codex stderr / params that explain
       // *why* the send failed.
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = describeUnknownError(error);
       console.error('[send] threadId=%s failed:', context.req.param('threadId'), detail);
       return context.json({ error: `Codex send failed: ${detail}` }, 503);
     }
@@ -1766,6 +1944,7 @@ function createApp(
     if (isCopilotThreadId(parsed.threadId)) {
       return context.json({ ok: false, error: 'GitHub Copilot chats are controlled directly in Agent Pulse.' }, 405);
     }
+    await registerKnownSharedCodexChatThread(parsed.threadId);
     const result = await openThreadWithMiniRefresh(parsed.threadId);
     if (!result.ok) {
       return context.json(result, 503);
@@ -2339,7 +2518,7 @@ async function runWithFollowerOwnership<T>(
   if (mirror?.isThreadOwned && !owned) {
     debugLog('[ownership] not owned — opening thread on Mac', { threadId });
     try {
-      await opener.openThread(threadId);
+      await opener.openThread(threadId, { refreshMode: 'mini-window' });
     } catch (openError) {
       console.warn('[ownership] opener failed', { threadId, error: String(openError) });
     }
@@ -2370,12 +2549,17 @@ async function runWithFollowerOwnership<T>(
       });
       throw error;
     }
-    debugLog('[ownership] apply failed with thread_unavailable — waiting and retrying', {
+    debugLog('[ownership] apply failed with thread_unavailable — opening, waiting, and retrying', {
       threadId
     });
+    try {
+      await opener.openThread(threadId, { refreshMode: 'mini-window' });
+    } catch (openError) {
+      console.warn('[ownership] retry opener failed', { threadId, error: String(openError) });
+    }
     if (mirror?.waitForOwnership) {
       const before = Date.now();
-      const acquired = await mirror.waitForOwnership(threadId, retryDelayMs);
+      const acquired = await mirror.waitForOwnership(threadId, Math.max(retryDelayMs, 2_000));
       debugLog('[ownership] retry waitForOwnership returned', {
         threadId,
         acquired,
@@ -2563,6 +2747,169 @@ function exposeLocalAttachments(
         : {})
     }))
   });
+}
+
+function describeUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    const cause =
+      error.cause && typeof error.cause === 'object'
+        ? ` — cause: ${stringifyErrorObject(error.cause)}`
+        : '';
+    return `${error.message || error.name || 'Error'}${cause}`;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+  if (error && typeof error === 'object') {
+    return stringifyErrorObject(error);
+  }
+  return String(error);
+}
+
+function stringifyErrorObject(error: object): string {
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function prepareOutgoingAttachments(
+  attachments: ChatAttachment[],
+  threadId: string,
+  localAttachments: Map<string, LocalAttachment>
+): PreparedOutgoingAttachments {
+  if (attachments.length === 0) {
+    return { provider: [], display: [] };
+  }
+  if (attachments.length > MAX_OUTGOING_ATTACHMENTS) {
+    throw new Error(`You can attach up to ${MAX_OUTGOING_ATTACHMENTS} images.`);
+  }
+
+  const provider: ChatAttachment[] = [];
+  const display: ChatAttachment[] = [];
+  let totalBytes = 0;
+
+  attachments.forEach((attachment, index) => {
+    const id = attachment.id?.trim() || `outgoing-image-${index + 1}`;
+    const alt = attachment.alt?.trim() || `Pasted image ${index + 1}`;
+    const baseAttachment: ChatAttachment = {
+      id,
+      kind: 'image',
+      url: attachment.url,
+      alt,
+      ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {})
+    };
+
+    const dataImage = dataImageFromUrl(attachment.url);
+    if (!dataImage) {
+      provider.push(baseAttachment);
+      display.push(baseAttachment);
+      return;
+    }
+
+    totalBytes += dataImage.data.byteLength;
+    if (dataImage.data.byteLength > MAX_OUTGOING_ATTACHMENT_BYTES) {
+      throw new Error('That image is too large. Please use an image under 8 MB.');
+    }
+    if (totalBytes > MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES) {
+      throw new Error('The attached images are too large. Please send fewer images.');
+    }
+
+    const token = createHash('sha256')
+      .update(`${threadId}:${id}:${attachment.url}`)
+      .digest('hex')
+      .slice(0, 32);
+    localAttachments.set(token, {
+      data: dataImage.data,
+      contentType: dataImage.contentType,
+      expiresAt: Date.now() + 2 * 60 * 60 * 1000
+    });
+
+    provider.push({
+      ...baseAttachment,
+      mimeType: dataImage.contentType
+    });
+    display.push({
+      ...baseAttachment,
+      url: `/attachments/${token}`,
+      mimeType: dataImage.contentType
+    });
+  });
+
+  return { provider, display };
+}
+
+function dataImageFromUrl(url: string): { contentType: string; data: Buffer } | undefined {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)$/i.exec(url);
+  if (!match) {
+    return undefined;
+  }
+  const contentType = match[1]!.toLowerCase();
+  const data = Buffer.from(match[2]!.replace(/\s/g, ''), 'base64');
+  if (data.byteLength === 0) {
+    throw new Error('The attached image is empty.');
+  }
+  return { contentType, data };
+}
+
+function defaultAttachmentMessage(count: number): string {
+  return count === 1 ? 'Please review the attached image.' : 'Please review the attached images.';
+}
+
+function attachOutgoingAttachments(
+  transcript: ThreadTranscript,
+  text: string,
+  attachments: ChatAttachment[]
+): ThreadTranscript {
+  if (attachments.length === 0) {
+    return transcript;
+  }
+
+  const trimmed = text.trim();
+  const messages = [...transcript.messages];
+  let targetIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role !== 'user') {
+      continue;
+    }
+    if (trimmed && message.text.trim() === trimmed) {
+      targetIndex = index;
+      break;
+    }
+    if (targetIndex === -1) {
+      targetIndex = index;
+    }
+  }
+
+  if (targetIndex < 0) {
+    return transcript;
+  }
+
+  const target = messages[targetIndex]!;
+  const existingAttachments = (target.attachments ?? []).filter(
+    (attachment) => !attachment.url.startsWith('data:image/')
+  );
+  messages[targetIndex] = {
+    ...target,
+    attachments: mergeAttachments(existingAttachments, attachments)
+  };
+  return ThreadTranscriptSchema.parse({ ...transcript, messages });
+}
+
+function mergeAttachments(existing: ChatAttachment[], incoming: ChatAttachment[]): ChatAttachment[] {
+  const merged = [...existing];
+  const seen = new Set(existing.map((attachment) => `${attachment.id}:${attachment.url}`));
+  for (const attachment of incoming) {
+    const key = `${attachment.id}:${attachment.url}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(attachment);
+  }
+  return merged;
 }
 
 function exposeLocalAttachment(
@@ -3374,7 +3721,10 @@ function limitThreadsPerProject(threads: Thread[], limit: number): Thread[] {
 
   const grouped = new Map<string, Thread[]>();
   for (const thread of threads) {
-    const projectKey = thread.workspacePath?.trim() || thread.workspace.trim() || 'unknown';
+    const projectKey =
+      thread.workspaceKind === 'chat'
+        ? `chat:${thread.workspace.trim() || 'unknown'}`
+        : thread.workspacePath?.trim() || thread.workspace.trim() || 'unknown';
     grouped.set(projectKey, [...(grouped.get(projectKey) ?? []), thread]);
   }
 

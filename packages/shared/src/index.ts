@@ -42,6 +42,7 @@ export const ThreadSchema = z.object({
   title: z.string().min(1),
   workspace: z.string().min(1),
   workspacePath: z.string().min(1).optional(),
+  workspaceKind: z.enum(['project', 'chat']).optional(),
   status: ThreadStatusSchema,
   lastActivityAt: isoUtcTimestamp,
   lastTurnSummary: z.string(),
@@ -205,13 +206,18 @@ export const ThreadOpenRequestSchema = z.object({
 export const ThreadCreateRequestSchema = z
   .object({
     provider: AgentProviderSchema.default('codex'),
+    location: z.enum(['chat']).optional(),
     projectId: z.string().trim().min(1).optional(),
     cwd: z.string().trim().min(1).optional(),
     modelSlug: z.string().trim().min(1).optional(),
     reasoningEffort: z.string().trim().min(1).optional()
   })
-  .refine((value) => Boolean(value.projectId) !== Boolean(value.cwd), {
-    message: 'Choose a project or folder path.'
+  .refine((value) => {
+    const targetCount = [value.location === 'chat', Boolean(value.projectId), Boolean(value.cwd)]
+      .filter(Boolean).length;
+    return targetCount === 1;
+  }, {
+    message: 'Choose a chat, project, or folder path.'
   });
 
 export const CHAT_MESSAGE_ROLES = ['user', 'assistant', 'activity', 'system'] as const;
@@ -230,6 +236,7 @@ export const ChatAttachmentSchema = z.object({
   kind: z.literal('image'),
   url: z.string().min(1),
   alt: z.string().min(1).optional(),
+  mimeType: z.string().min(1).optional(),
   sourcePath: z.string().min(1).optional()
 });
 
@@ -317,10 +324,22 @@ export const COLLABORATION_MODES = ['default', 'plan'] as const;
 
 export type CollaborationModeKind = (typeof COLLABORATION_MODES)[number];
 
-export const ThreadMessageRequestSchema = z.object({
-  text: z.string().trim().min(1).max(4000),
-  collaborationMode: z.enum(COLLABORATION_MODES).optional()
-});
+export const ThreadMessageRequestSchema = z
+  .object({
+    text: z.string().trim().max(4000).optional().default(''),
+    collaborationMode: z.enum(COLLABORATION_MODES).optional(),
+    attachments: z.array(ChatAttachmentSchema).max(6).optional()
+  })
+  .superRefine((payload, context) => {
+    if (payload.text || (payload.attachments?.length ?? 0) > 0) {
+      return;
+    }
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['text'],
+      message: 'Message text or an image attachment is required.'
+    });
+  });
 
 export const ThreadMessageResponseSchema = z.object({
   ok: z.literal(true),
@@ -567,6 +586,27 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
     payload: z.object({
       threadId: z.string().min(1),
       seenAt: z.number().int().nonnegative()
+    })
+  }),
+  // Per-token assistant streaming. Emitted by providers that can deliver text
+  // word-by-word (currently Claude Code via stream_event). The tablet keeps a
+  // partial-text overlay keyed on messageId until the matching `text-end`
+  // arrives or the next full transcript snapshot supersedes it. Optional —
+  // providers without per-token streaming simply do not emit these events and
+  // the existing transcript snapshot path keeps working.
+  z.object({
+    type: z.literal('thread/assistant/text-delta'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      messageId: z.string().min(1),
+      delta: z.string()
+    })
+  }),
+  z.object({
+    type: z.literal('thread/assistant/text-end'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      messageId: z.string().min(1)
     })
   })
 ]);

@@ -50,16 +50,22 @@ export type RenderableEntry =
   | { type: 'message'; message: ChatMessage }
   | { type: 'activityGroup'; group: ActivityGroup };
 
-export function buildRenderableEntries(messages: ChatMessage[]): RenderableEntry[] {
+export function buildRenderableEntries(
+  messages: ChatMessage[],
+  options: { isLive?: boolean } = {}
+): RenderableEntry[] {
   const result: RenderableEntry[] = [];
   let turnBuffer: ChatMessage[] = [];
+  let leadingBuffer: ChatMessage[] = [];
+  let hasVisibleUserTurn = false;
+  const orderedMessages = sortMessagesByCreatedAt(messages);
 
   const flushTurn = () => {
     if (turnBuffer.length === 0) {
       return;
     }
 
-    const finalIndex = findFinalResponseIndex(turnBuffer);
+    const finalIndex = findFinalResponseIndex(turnBuffer, options);
     const finalMessage = finalIndex >= 0 ? turnBuffer[finalIndex]! : null;
     const activityMessages = finalMessage
       ? turnBuffer.filter((_, index) => index !== finalIndex)
@@ -79,21 +85,41 @@ export function buildRenderableEntries(messages: ChatMessage[]): RenderableEntry
     turnBuffer = [];
   };
 
-  for (const message of messages) {
+  for (const message of orderedMessages) {
     if (message.role === 'user') {
-      flushTurn();
+      if (hasVisibleUserTurn) {
+        flushTurn();
+      }
       result.push({ type: 'message', message });
+      hasVisibleUserTurn = true;
+      if (leadingBuffer.length > 0) {
+        turnBuffer.push(...leadingBuffer);
+        leadingBuffer = [];
+      }
       continue;
     }
 
-    turnBuffer.push(message);
+    if (!hasVisibleUserTurn) {
+      leadingBuffer.push(message);
+    } else {
+      turnBuffer.push(message);
+    }
   }
 
-  flushTurn();
+  if (hasVisibleUserTurn) {
+    flushTurn();
+  } else {
+    turnBuffer = leadingBuffer;
+    leadingBuffer = [];
+    flushTurn();
+  }
   return result;
 }
 
-export function findFinalResponseIndex(messages: ChatMessage[]): number {
+export function findFinalResponseIndex(
+  messages: ChatMessage[],
+  options: { isLive?: boolean } = {}
+): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!;
     if (
@@ -104,6 +130,10 @@ export function findFinalResponseIndex(messages: ChatMessage[]): number {
     ) {
       return index;
     }
+  }
+
+  if (options.isLive) {
+    return -1;
   }
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -119,6 +149,19 @@ export function findFinalResponseIndex(messages: ChatMessage[]): number {
   }
 
   return -1;
+}
+
+function sortMessagesByCreatedAt(messages: ChatMessage[]): ChatMessage[] {
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((a, b) => {
+      const aTime = Date.parse(a.message.createdAt);
+      const bTime = Date.parse(b.message.createdAt);
+      const safeA = Number.isFinite(aTime) ? aTime : 0;
+      const safeB = Number.isFinite(bTime) ? bTime : 0;
+      return safeA === safeB ? a.index - b.index : safeA - safeB;
+    })
+    .map((entry) => entry.message);
 }
 
 export function formatWorkLabel(

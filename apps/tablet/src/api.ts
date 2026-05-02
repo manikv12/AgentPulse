@@ -28,6 +28,7 @@ import {
   type CatalogModel,
   type CatalogPlugin,
   type CatalogSkill,
+  type ChatAttachment,
   type HelperHealth,
   type PairingDeviceOption,
   type PendingApprovalRequest,
@@ -381,6 +382,7 @@ export async function fetchProjects(session: AgentPulseSession): Promise<Project
 
 export type StartThreadTarget =
   | string
+  | { location: 'chat'; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
   | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
   | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string };
 
@@ -395,7 +397,7 @@ export async function startThread(
   });
 
   if (!response.ok) {
-    throw new Error(await responseErrorMessage(response, 'Could not create a Codex thread.'));
+    throw new Error(await responseErrorMessage(response, 'Could not create a new chat.'));
   }
 
   return ThreadCreateResponseSchema.parse(await response.json());
@@ -495,13 +497,14 @@ export async function sendThreadMessage(
   session: AgentPulseSession,
   threadId: string,
   text: string,
-  options: { collaborationMode?: CollaborationModeKind } = {}
+  options: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] } = {}
 ): Promise<ThreadMessageResponse> {
   const response = await authedFetch(`/threads/${encodeURIComponent(threadId)}/messages`, session, {
     method: 'POST',
     body: JSON.stringify({
       text,
-      ...(options.collaborationMode ? { collaborationMode: options.collaborationMode } : {})
+      ...(options.collaborationMode ? { collaborationMode: options.collaborationMode } : {}),
+      ...(options.attachments?.length ? { attachments: options.attachments } : {})
     })
   });
 

@@ -282,6 +282,103 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
+  it('returns accepted send quickly when Codex transcript refresh is slow after turn/start', async () => {
+    vi.useFakeTimers();
+    let resumeCount = 0;
+    const calls: RequestCall[] = [];
+    const transport: CodexAppServerTransport & { calls: RequestCall[] } = {
+      calls,
+      isConnected: () => true,
+      request: async <T = unknown>(method: string, params: unknown): Promise<T> => {
+        calls.push({ method, params });
+        if (method === 'thread/resume') {
+          resumeCount += 1;
+          if (resumeCount === 1) {
+            return threadResponse('thread-1', 'idle', []) as T;
+          }
+          return new Promise<T>(() => undefined);
+        }
+        if (method === 'thread/read') {
+          return new Promise<T>(() => undefined);
+        }
+        if (method === 'thread/turns/list') {
+          return { data: [], nextCursor: null, backwardsCursor: null } as T;
+        }
+        if (method === 'turn/start') {
+          return { turn: turn('turn-new', 'inProgress') } as T;
+        }
+        return {} as T;
+      }
+    };
+    const chat = new CodexAppServerChat(transport);
+
+    try {
+      const responsePromise = chat.sendMessage('thread-1', 'Continue from my phone.');
+      await vi.advanceTimersByTimeAsync(1_501);
+      const result = await responsePromise;
+
+      expect(result).toMatchObject({
+        ok: true,
+        mode: 'start',
+        turnId: 'turn-new',
+        transcript: {
+          threadId: 'thread-1',
+          provider: 'codex',
+          providerThreadId: 'thread-1',
+          activeTurnId: 'turn-new',
+          sendState: {
+            canSend: false,
+            reason: 'missing_active_turn',
+            label: 'Codex is working'
+          }
+        }
+      });
+      expect(result.transcript.messages).toEqual([
+        expect.objectContaining({
+          id: 'user:turn-new',
+          role: 'user',
+          text: 'Continue from my phone.'
+        })
+      ]);
+      expect(calls.map((call) => call.method)).toEqual([
+        'thread/resume',
+        'thread/turns/list',
+        'turn/start',
+        'thread/read'
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends image attachments as Codex image input parts', async () => {
+    const imageUrl = 'data:image/png;base64,iVBORw0KGgo=';
+    const transport = fakeTransport([
+      threadResponse('thread-1', 'idle', []),
+      threadResponse('thread-1', 'active', [turn('turn-new', 'inProgress')])
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    await chat.sendMessage('thread-1', 'Please inspect this.', {
+      attachments: [
+        {
+          id: 'pasted-image-1',
+          kind: 'image',
+          url: imageUrl,
+          alt: 'Pasted image'
+        }
+      ]
+    });
+
+    expect(transport.calls[2]?.params).toMatchObject({
+      threadId: 'thread-1',
+      input: [
+        { type: 'text', text: 'Please inspect this.', text_elements: [] },
+        { type: 'input_image', image_url: { url: imageUrl } }
+      ]
+    });
+  });
+
   it('keeps the just-started user message when thread/read returns old history with the same text', async () => {
     const oldTurn = {
       ...turn('turn-old', 'completed'),

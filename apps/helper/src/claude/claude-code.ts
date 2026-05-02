@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { accessSync, constants as fsConstants, readdirSync, statSync } from 'node:fs';
 import { readdir, readFile, rm, stat, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -68,8 +69,12 @@ type LiveClaudeSession = {
   threadId: string;
   cwd: string;
   process: ChildProcessWithoutNullStreams;
+  processAlive: boolean;
+  launchMode: 'new' | 'resume';
+  resumeRecoveryAttempted: boolean;
   activeTurnId: string;
   messages: ChatMessage[];
+  lastInputPayload?: Record<string, unknown>;
   pendingRequests: Map<string, PendingApprovalRequest>;
   toolInputs: Map<number, { id: string; name: string; inputJSON: string }>;
   assistantMessageId?: string;
@@ -97,6 +102,7 @@ export class ClaudeCodeProvider {
   private readonly now: () => Date;
   private readonly usageReader: { readUsage(): Promise<ThreadUsage | undefined> };
   private readonly liveSessions = new Map<string, LiveClaudeSession>();
+  private readonly retainedMessages = new Map<string, ChatMessage[]>();
   private readonly drafts = new Map<string, DraftClaudeThread>();
   private readonly modelOverrides = new Map<string, string>();
   private readonly effortOverrides = new Map<string, string>();
@@ -106,7 +112,7 @@ export class ClaudeCodeProvider {
 
   constructor(options: ClaudeCodeProviderOptions = {}) {
     this.claudeHome = options.claudeHome ?? path.join(homedir(), '.claude');
-    this.executable = options.executable ?? 'claude';
+    this.executable = options.executable ?? (options.spawnProcess ? 'claude' : resolveClaudeExecutable());
     this.spawnProcess = options.spawnProcess ?? spawn;
     this.now = options.now ?? (() => new Date());
     this.usageReader = options.usageReader ?? new ClaudeCodeUsageReader();
@@ -206,7 +212,13 @@ export class ClaudeCodeProvider {
     const session = await this.readSessionByNativeId(nativeSessionId);
     const live = this.liveSessions.get(threadId);
     const draft = this.drafts.get(threadId);
-    const baseMessages = session?.messages ?? [];
+    const retainedMessages = this.retainedMessages.get(threadId) ?? [];
+    const baseMessages = retainedMessages.length > 0
+      ? mergeLiveMessages(session?.messages ?? [], retainedMessages)
+      : session?.messages ?? [];
+    if (retainedMessages.length > 0 && retainedMessagesConfirmed(retainedMessages, session?.messages ?? [])) {
+      this.retainedMessages.delete(threadId);
+    }
     const messages = live
       ? mergeLiveMessages(baseMessages, live.messages)
       : mergeMessages(baseMessages, []);
@@ -246,7 +258,7 @@ export class ClaudeCodeProvider {
   async sendMessage(
     threadId: string,
     text: string,
-    options: { model?: string; effort?: string } = {}
+    options: { model?: string; effort?: string; attachments?: ChatAttachment[] } = {}
   ): Promise<ThreadMessageResponse> {
     const trimmed = text.trim();
     if (!trimmed) {
@@ -269,12 +281,19 @@ export class ClaudeCodeProvider {
       role: 'user',
       kind: 'message',
       text: trimmed,
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
       createdAt: this.now().toISOString()
     });
     live.messages.push(userMessage);
+    live.lastInputPayload = claudeUserMessagePayload(trimmed, nativeSessionId, options.attachments ?? []);
     live.isStreaming = true;
     this.emitThreadWorking(threadId);
-    this.writeInput(live, claudeUserMessagePayload(trimmed, nativeSessionId));
+    try {
+      this.writeInput(live, live.lastInputPayload);
+    } catch (error) {
+      this.failLiveSession(live, error);
+      throw new Error(claudeRuntimeErrorMessage(error));
+    }
     const transcript = await this.readTranscript(threadId);
     return ThreadMessageResponseSchema.parse({
       ok: true,
@@ -516,7 +535,7 @@ export class ClaudeCodeProvider {
     const requestedModel = normalizeClaudeModelAlias(model);
     const requestedEffort = normalizeClaudeEffort(effort);
     const existing = this.liveSessions.get(threadId);
-    if (existing && !existing.process.killed) {
+    if (existing && existing.processAlive && !existing.process.killed) {
       const modelChanged = requestedModel !== undefined && existing.model !== requestedModel;
       const effortChanged = requestedEffort !== undefined && existing.reasoningEffort !== requestedEffort;
       if (modelChanged || effortChanged) {
@@ -536,8 +555,43 @@ export class ClaudeCodeProvider {
       this.effortOverrides.set(threadId, requestedEffort);
     }
     const draft = this.drafts.get(threadId);
-    const isNewSession = Boolean(draft);
+    const launchMode: LiveClaudeSession['launchMode'] = draft ? 'new' : 'resume';
     this.threadCwds.set(threadId, cwd);
+    const child = this.spawnClaudeChild(nativeSessionId, cwd, requestedModel, requestedEffort, launchMode);
+    const live: LiveClaudeSession = {
+      nativeSessionId,
+      threadId,
+      cwd,
+      process: child,
+      processAlive: true,
+      launchMode,
+      resumeRecoveryAttempted: false,
+      activeTurnId: `claude-turn-${randomUUID()}`,
+      messages: [],
+      pendingRequests: new Map(),
+      toolInputs: new Map(),
+      assistantText: '',
+      stdoutBuffer: '',
+      stderrBuffer: '',
+      isStreaming: false,
+      isNewSession: launchMode === 'new',
+      startedAt: this.now().toISOString(),
+      ...(requestedModel ? { model: requestedModel } : {}),
+      ...(requestedEffort ? { reasoningEffort: requestedEffort } : {})
+    };
+    this.liveSessions.set(threadId, live);
+    await this.attachClaudeChild(live, child);
+    this.drafts.delete(threadId);
+    return live;
+  }
+
+  private spawnClaudeChild(
+    nativeSessionId: string,
+    cwd: string,
+    model: string | undefined,
+    effort: string | undefined,
+    launchMode: LiveClaudeSession['launchMode']
+  ): ChildProcessWithoutNullStreams {
     const args = [
       '-p',
       '--output-format',
@@ -549,41 +603,74 @@ export class ClaudeCodeProvider {
       '--replay-user-messages',
       '--permission-mode',
       'default',
-      ...(requestedModel ? ['--model', requestedModel] : []),
-      ...(requestedEffort ? ['--effort', requestedEffort] : []),
-      ...(isNewSession ? ['--session-id', nativeSessionId] : ['--resume', nativeSessionId])
+      ...(model ? ['--model', model] : []),
+      ...(effort ? ['--effort', effort] : []),
+      ...(launchMode === 'new' ? ['--session-id', nativeSessionId] : ['--resume', nativeSessionId])
     ];
-    const child = this.spawnProcess(this.executable, args, {
-      cwd,
-      env: process.env,
-      stdio: 'pipe'
-    }) as ChildProcessWithoutNullStreams;
-    const live: LiveClaudeSession = {
-      nativeSessionId,
-      threadId,
-      cwd,
-      process: child,
-      activeTurnId: `claude-turn-${randomUUID()}`,
-      messages: [],
-      pendingRequests: new Map(),
-      toolInputs: new Map(),
-      assistantText: '',
-      stdoutBuffer: '',
-      stderrBuffer: '',
-      isStreaming: false,
-      isNewSession,
-      startedAt: this.now().toISOString(),
-      ...(requestedModel ? { model: requestedModel } : {}),
-      ...(requestedEffort ? { reasoningEffort: requestedEffort } : {})
-    };
-    this.liveSessions.set(threadId, live);
+    try {
+      return this.spawnProcess(this.executable, args, {
+        cwd,
+        env: process.env,
+        stdio: 'pipe'
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      throw new Error(claudeStartErrorMessage(error, this.executable));
+    }
+  }
+
+  private async attachClaudeChild(
+    live: LiveClaudeSession,
+    child: ChildProcessWithoutNullStreams
+  ): Promise<void> {
+    live.process = child;
+    live.processAlive = true;
+    const started = this.waitForProcessStart(live);
     child.stdout.on('data', (chunk) => this.handleStdout(live, chunk));
     child.stderr.on('data', (chunk) => {
       live.stderrBuffer += chunk.toString('utf8');
     });
-    child.on('exit', (code) => this.finishLiveSession(live, code === 0 ? 'completed' : 'failed'));
-    this.drafts.delete(threadId);
-    return live;
+    child.stdin.on('error', (error) => {
+      if (live.process === child) {
+        this.failLiveSession(live, error);
+      }
+    });
+    child.on('error', (error) => {
+      if (live.process === child) {
+        this.failLiveSession(live, error);
+      }
+    });
+    child.on('exit', (code) => {
+      if (live.process !== child) {
+        return;
+      }
+      live.processAlive = false;
+      this.finishLiveSession(live, code === 0 ? 'completed' : 'failed');
+    });
+    await started.catch((error) => {
+      this.failLiveSession(live, error);
+      throw new Error(claudeStartErrorMessage(error, this.executable));
+    });
+  }
+
+  private waitForProcessStart(live: LiveClaudeSession): Promise<void> {
+    if (typeof live.process.pid === 'number') {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        live.process.off('spawn', onSpawn);
+        live.process.off('error', onError);
+        callback();
+      };
+      const onSpawn = () => settle(resolve);
+      const onError = (error: Error) => settle(() => reject(error));
+      live.process.once('spawn', onSpawn);
+      live.process.once('error', onError);
+    });
   }
 
   private handleStdout(live: LiveClaudeSession, chunk: Buffer): void {
@@ -758,7 +845,18 @@ export class ClaudeCodeProvider {
   }
 
   private appendAssistantDelta(live: LiveClaudeSession, text: string): void {
+    if (!text) return;
     this.installAssistantText(live, `${live.assistantText}${text}`);
+    // After installAssistantText runs, assistantMessageId is guaranteed to be
+    // set. Emit a per-token delta so the tablet can render the partial text
+    // immediately instead of waiting for the next transcript snapshot.
+    const messageId = live.assistantMessageId;
+    if (messageId) {
+      this.broadcast({
+        type: 'thread/assistant/text-delta',
+        payload: { threadId: live.threadId, messageId, delta: text }
+      });
+    }
   }
 
   private upsertToolMessage(live: LiveClaudeSession, id: string, name: string, inputJSON: string): void {
@@ -794,8 +892,15 @@ export class ClaudeCodeProvider {
     live.isStreaming = false;
     live.pendingRequests.clear();
     live.toolInputs.clear();
+    const closingMessageId = live.assistantMessageId;
     live.assistantMessageId = undefined;
     live.assistantText = '';
+    if (closingMessageId) {
+      this.broadcast({
+        type: 'thread/assistant/text-end',
+        payload: { threadId: live.threadId, messageId: closingMessageId }
+      });
+    }
     this.broadcast({ type: 'thread/pending-approvals/changed', payload: { threadId: live.threadId, requests: [] } });
     this.emitStatus(live.threadId, 'idle');
     this.broadcast({ type: 'thread/streaming-changed', payload: { threadId: live.threadId, isStreaming: false } });
@@ -805,6 +910,20 @@ export class ClaudeCodeProvider {
   private finishLiveSession(live: LiveClaudeSession, status: 'completed' | 'interrupted' | 'failed'): void {
     if (this.liveSessions.get(live.threadId) !== live) {
       return;
+    }
+    live.processAlive = false;
+    if (status === 'failed' && this.canRecoverMissingConversation(live)) {
+      void this.recoverMissingConversation(live);
+      return;
+    }
+    if (status !== 'completed' && live.messages.length > 0) {
+      this.installFailureMessage(live, status);
+    }
+    if (live.messages.length > 0) {
+      this.retainedMessages.set(live.threadId, mergeLiveMessages(
+        this.retainedMessages.get(live.threadId) ?? [],
+        live.messages
+      ));
     }
     live.isStreaming = false;
     live.pendingRequests.clear();
@@ -846,7 +965,63 @@ export class ClaudeCodeProvider {
   }
 
   private writeInput(live: LiveClaudeSession, payload: Record<string, unknown>): void {
+    if (!live.processAlive || live.process.stdin.destroyed) {
+      throw new Error('Claude Code is not accepting input.');
+    }
     live.process.stdin.write(`${JSON.stringify(payload)}\n`);
+  }
+
+  private failLiveSession(live: LiveClaudeSession, error: unknown): void {
+    if (this.liveSessions.get(live.threadId) !== live) {
+      return;
+    }
+    if (live.stderrBuffer.trim().length === 0) {
+      live.stderrBuffer = error instanceof Error ? error.message : String(error);
+    }
+    this.finishLiveSession(live, 'failed');
+  }
+
+  private installFailureMessage(
+    live: LiveClaudeSession,
+    status: 'interrupted' | 'failed'
+  ): void {
+    const text =
+      status === 'interrupted'
+        ? 'Claude Code was stopped.'
+        : claudeRuntimeErrorMessage(live.stderrBuffer || 'Claude Code stopped before finishing.');
+    this.installAssistantMessage(live, text, [], 'final_answer');
+  }
+
+  private canRecoverMissingConversation(live: LiveClaudeSession): boolean {
+    return (
+      live.launchMode === 'resume' &&
+      !live.resumeRecoveryAttempted &&
+      Boolean(live.lastInputPayload) &&
+      noConversationFoundError(live.stderrBuffer)
+    );
+  }
+
+  private async recoverMissingConversation(live: LiveClaudeSession): Promise<void> {
+    live.resumeRecoveryAttempted = true;
+    live.launchMode = 'new';
+    live.isNewSession = true;
+    live.stderrBuffer = '';
+    try {
+      const child = this.spawnClaudeChild(
+        live.nativeSessionId,
+        live.cwd,
+        live.model,
+        live.reasoningEffort,
+        'new'
+      );
+      await this.attachClaudeChild(live, child);
+      if (live.lastInputPayload) {
+        this.writeInput(live, live.lastInputPayload);
+      }
+      this.emitThreadWorking(live.threadId);
+    } catch (error) {
+      this.failLiveSession(live, error);
+    }
   }
 
   private async modelForSend(
@@ -1087,6 +1262,17 @@ function mergeLiveMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessag
   return [...byId.values()];
 }
 
+function retainedMessagesConfirmed(retained: ChatMessage[], base: ChatMessage[]): boolean {
+  if (retained.length === 0 || base.length === 0) {
+    return false;
+  }
+  const baseIds = new Set(base.map((message) => message.id));
+  const baseSignatures = new Set(base.map(messageContentSignature));
+  return retained.every(
+    (message) => baseIds.has(message.id) || baseSignatures.has(messageContentSignature(message))
+  );
+}
+
 function messageContentSignature(message: ChatMessage): string {
   return [
     message.role,
@@ -1108,15 +1294,45 @@ function upsertMessage(messages: ChatMessage[], message: ChatMessage): void {
   }
 }
 
-function claudeUserMessagePayload(content: string, sessionId: string): Record<string, unknown> {
+function claudeUserMessagePayload(
+  content: string,
+  sessionId: string,
+  attachments: ChatAttachment[] = []
+): Record<string, unknown> {
   return {
     type: 'user',
     session_id: sessionId,
     message: {
       role: 'user',
-      content: [{ type: 'text', text: content }]
+      content: claudeMessageContent(content, attachments)
     },
     parent_tool_use_id: null
+  };
+}
+
+function claudeMessageContent(content: string, attachments: ChatAttachment[]): Record<string, unknown>[] {
+  const blocks: Record<string, unknown>[] = [{ type: 'text', text: content }];
+  for (const attachment of attachments) {
+    const image = dataImageFromAttachment(attachment);
+    if (!image) continue;
+    blocks.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: image.mimeType,
+        data: image.data
+      }
+    });
+  }
+  return blocks;
+}
+
+function dataImageFromAttachment(attachment: ChatAttachment): { mimeType: string; data: string } | undefined {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)$/iu.exec(attachment.url);
+  if (!match) return undefined;
+  return {
+    mimeType: match[1]!.toLowerCase(),
+    data: match[2]!.replace(/\s/gu, '')
   };
 }
 
@@ -1287,6 +1503,88 @@ function mergeAttachments(
     byKey.set(attachment.sourcePath ?? attachment.url, attachment);
   }
   return [...byKey.values()];
+}
+
+function resolveClaudeExecutable(): string {
+  const explicit = [
+    process.env.AGENT_PULSE_CLAUDE_EXECUTABLE,
+    process.env.CLAUDE_CODE_EXECUTABLE,
+    process.env.CLAUDE_CODE_PATH,
+    process.env.CLAUDE_PATH
+  ].find((candidate) => candidate?.trim());
+  if (explicit) {
+    return explicit.trim();
+  }
+
+  return firstExistingExecutable(collectClaudeExecutableCandidates()) ?? 'claude';
+}
+
+function collectClaudeExecutableCandidates(): string[] {
+  const home = homedir();
+  return [
+    path.join(home, '.local', 'bin', 'claude'),
+    path.join(home, '.local', 'share', 'claude', 'latest'),
+    ...collectClaudeAppCandidates(path.join(home, 'Library', 'Application Support', 'Claude', 'claude-code')),
+    ...collectClaudeExtensionCandidates(path.join(home, '.vscode-insiders', 'extensions')),
+    ...collectClaudeExtensionCandidates(path.join(home, '.vscode', 'extensions')),
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude'
+  ];
+}
+
+function collectClaudeAppCandidates(root: string): string[] {
+  return readDirectoryEntries(root)
+    .map((entry) => path.join(root, entry, 'claude.app', 'Contents', 'MacOS', 'claude'));
+}
+
+function collectClaudeExtensionCandidates(root: string): string[] {
+  return readDirectoryEntries(root)
+    .filter((entry) => entry.includes('anthropic.claude-code'))
+    .map((entry) => path.join(root, entry, 'resources', 'native-binary', 'claude'));
+}
+
+function readDirectoryEntries(root: string): string[] {
+  try {
+    return readdirSync(root);
+  } catch {
+    return [];
+  }
+}
+
+function firstExistingExecutable(candidates: string[]): string | undefined {
+  const unique = [...new Set(candidates)];
+  const executableCandidates = unique
+    .map((candidate) => {
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+        return { candidate, mtimeMs: statSync(candidate).mtimeMs };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((entry): entry is { candidate: string; mtimeMs: number } => Boolean(entry))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return executableCandidates[0]?.candidate;
+}
+
+function claudeStartErrorMessage(error: unknown, executable: string): string {
+  const details = error instanceof Error ? error.message : String(error);
+  return `Claude Code could not start from Agent Pulse. The helper tried "${executable}" but it failed: ${details}`;
+}
+
+function claudeRuntimeErrorMessage(error: unknown): string {
+  const details = typeof error === 'string'
+    ? error.trim()
+    : error instanceof Error
+      ? error.message
+      : String(error);
+  return details
+    ? `Claude Code stopped before finishing: ${details}`
+    : 'Claude Code stopped before finishing.';
+}
+
+function noConversationFoundError(text: string): boolean {
+  return /no conversation found with session id/i.test(text);
 }
 
 function extractPlanMessagesFromClaudeMessage(message: Record<string, unknown> | undefined, index: number, createdAt: string): ChatMessage[] {
