@@ -50,6 +50,11 @@ type ClaudeCodeProviderOptions = {
   usageReader?: { readUsage(): Promise<ThreadUsage | undefined> };
 };
 
+type ClaudeThreadListOptions = {
+  defaultLimit?: number;
+  groupLimits?: Map<string, number> | Record<string, number>;
+};
+
 type ParsedClaudeSession = {
   nativeSessionId: string;
   threadId: string;
@@ -128,24 +133,25 @@ export class ClaudeCodeProvider {
     return () => this.liveStateListeners.delete(listener);
   }
 
-  async listThreads(): Promise<Thread[]> {
-    const sessions = await this.readSessions();
+  async listThreads(options: ClaudeThreadListOptions = {}): Promise<Thread[]> {
+    const sessions = await this.readSessions(options);
     const threads = sessions.map((session) => this.threadFromSession(session));
     for (const draft of this.drafts.values()) {
       if (!threads.some((thread) => thread.threadId === draft.thread.threadId)) {
         threads.unshift(draft.thread);
       }
     }
-    return limitIdleClaudeThreads(threads);
+    return limitIdleClaudeThreads(
+      threads,
+      options.defaultLimit ?? MAX_IDLE_THREADS_PER_PROJECT,
+      options.groupLimits
+    );
   }
 
   async listProjects(): Promise<Project[]> {
-    const sessions = await this.readSessions();
     const paths = new Set<string>();
-    for (const session of sessions) {
-      if (path.isAbsolute(session.workspacePath)) {
-        paths.add(session.workspacePath);
-      }
+    for (const workspacePath of await this.readProjectPaths()) {
+      paths.add(workspacePath);
     }
     for (const draft of this.drafts.values()) {
       paths.add(draft.cwd);
@@ -448,7 +454,22 @@ export class ClaudeCodeProvider {
     this.liveSessions.clear();
   }
 
-  private async readSessions(): Promise<ParsedClaudeSession[]> {
+  private async readProjectPaths(): Promise<string[]> {
+    const projectsDir = path.join(this.claudeHome, 'projects');
+    let dirs;
+    try {
+      dirs = await readdir(projectsDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    return dirs
+      .filter((dir) => dir.isDirectory())
+      .map((dir) => fallbackPathFromProjectName(dir.name))
+      .filter((workspacePath) => workspacePath && path.isAbsolute(workspacePath));
+  }
+
+  private async readSessions(options: ClaudeThreadListOptions = {}): Promise<ParsedClaudeSession[]> {
     const projectsDir = path.join(this.claudeHome, 'projects');
     let dirs;
     try {
@@ -466,9 +487,24 @@ export class ClaudeCodeProvider {
       } catch {
         continue;
       }
+      const fileCandidates: Array<{ filePath: string; mtimeMs: number }> = [];
       for (const file of files) {
         if (!file.isFile() || !file.name.endsWith('.jsonl')) continue;
         const filePath = path.join(dirPath, file.name);
+        const fileStat = await stat(filePath).catch(() => undefined);
+        if (!fileStat) continue;
+        fileCandidates.push({ filePath, mtimeMs: fileStat.mtimeMs });
+      }
+      const fallbackWorkspacePath = fallbackPathFromProjectName(dir.name);
+      const projectLimit = threadGroupLimit(
+        fallbackWorkspacePath,
+        options.defaultLimit ?? MAX_SESSIONS,
+        options.groupLimits,
+        MAX_SESSIONS
+      );
+      for (const { filePath } of fileCandidates
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .slice(0, projectLimit)) {
         const parsed = await parseClaudeSessionFile(filePath, dir.name).catch(() => undefined);
         if (parsed) {
           sessions.push(parsed);
@@ -1204,20 +1240,43 @@ function sortSessions(a: ParsedClaudeSession, b: ParsedClaudeSession): number {
   return Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt);
 }
 
-function limitIdleClaudeThreads(threads: Thread[]): Thread[] {
+function limitIdleClaudeThreads(
+  threads: Thread[],
+  defaultLimit = MAX_IDLE_THREADS_PER_PROJECT,
+  groupLimits: Map<string, number> | Record<string, number> = {}
+): Thread[] {
   const idleCounts = new Map<string, number>();
   return threads.filter((thread) => {
     if (thread.status !== 'idle' && thread.status !== 'unknown') {
       return true;
     }
     const key = thread.workspacePath ?? thread.workspace;
+    const limit = threadGroupLimit(key, defaultLimit, groupLimits, MAX_SESSIONS);
     const count = idleCounts.get(key) ?? 0;
-    if (count >= MAX_IDLE_THREADS_PER_PROJECT) {
+    if (count >= limit) {
       return false;
     }
     idleCounts.set(key, count + 1);
     return true;
   });
+}
+
+function threadGroupLimit(
+  groupKey: string,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {},
+  maxLimit = MAX_SESSIONS
+): number {
+  const explicitLimit =
+    groupLimits instanceof Map
+      ? groupLimits.get(groupKey)
+      : Object.prototype.hasOwnProperty.call(groupLimits, groupKey)
+        ? groupLimits[groupKey]
+        : undefined;
+  const limit = explicitLimit ?? defaultLimit;
+  return Number.isFinite(limit) && limit > 0
+    ? Math.min(maxLimit, Math.floor(limit))
+    : Math.min(maxLimit, defaultLimit);
 }
 
 function mergeMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessage[] {
@@ -1640,7 +1699,7 @@ function extractPlanText(inputJSON: string): string {
 }
 
 function fallbackPathFromProjectName(encoded: string): string {
-  if (!encoded.startsWith('-Users-')) {
+  if (!encoded.startsWith('-')) {
     return '';
   }
   return `/${encoded.slice(1).split('-').join('/')}`;

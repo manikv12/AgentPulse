@@ -11,6 +11,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import {
   ApprovalDecisionRequestSchema,
   ApprovalDecisionResponseSchema,
+  ApprovalInboxResponseSchema,
   CatalogCommandsResponseSchema,
   CatalogModelSchema,
   CatalogModelsResponseSchema,
@@ -20,6 +21,13 @@ import {
   DeviceSessionRecoveryRequestSchema,
   DeviceRevokeRequestSchema,
   HelperHealthSchema,
+  HandoffDeleteResponseSchema,
+  HandoffListResponseSchema,
+  HandoffPackageResponseSchema,
+  HandoffPackageSchema,
+  HandoffSendRequestSchema,
+  HandoffSummaryDraftRequestSchema,
+  HandoffSummaryDraftResponseSchema,
   LiveEventSchema,
   PairRequestSchema,
   PairingDeviceListResponseSchema,
@@ -30,11 +38,15 @@ import {
   RemoteActivityLogEntrySchema,
   RemoteAccessProtocolSchema,
   RemoteAccessSettingsSchema,
+  ReturnHandoffRequestSchema,
+  TouchCommandSheetResponseSchema,
   ThreadCreateRequestSchema,
   ThreadCreateResponseSchema,
   ThreadDeleteResponseSchema,
   ThreadMessageRequestSchema,
   ThreadMessageResponseSchema,
+  TranscriptCommentDraftRequestSchema,
+  TranscriptCommentDraftResponseSchema,
   ThreadListResponseSchema,
   ThreadModelUpdateRequestSchema,
   ThreadModelUpdateResponseSchema,
@@ -52,6 +64,9 @@ import {
   type ChatAttachment,
   type CatalogModel,
   type HelperHealth,
+  type ApprovalInboxItem,
+  type HandoffPackage,
+  type HandoffSummaryDraft,
   type LiveEvent,
   type PendingApprovalRequest,
   type Project,
@@ -60,6 +75,7 @@ import {
   type RemoteAccessMode,
   type RemoteAccessProtocol,
   type Thread,
+  type ThreadListGroup,
   type ThreadMessageResponse,
   type ThreadTranscript
 } from '@agent-pulse/shared';
@@ -100,6 +116,7 @@ const MANUAL_OPEN_COOLDOWN_MS = 2_500;
 const AUTO_DESKTOP_REFRESH_SETTLE_MS = 800;
 const AUTO_DESKTOP_REFRESH_COOLDOWN_MS = 10_000;
 const MAX_THREADS_PER_PROJECT = 6;
+const MAX_EXPANDED_THREADS_PER_PROJECT = 120;
 const MAX_OUTGOING_ATTACHMENTS = 6;
 const MAX_OUTGOING_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -120,6 +137,18 @@ type DesktopRefreshCandidate = {
   threadId: string;
   turnId: string;
 };
+
+type ThreadListResult = {
+  threads: Thread[];
+  groups: ThreadListGroup[];
+};
+
+type ThreadListProviderOptions = {
+  defaultLimit?: number;
+  groupLimits?: Map<string, number>;
+};
+
+type ThreadListProviderResult = Thread[] | ThreadListResult;
 
 export type AppServerChatBridge = {
   isConnected(): boolean;
@@ -184,6 +213,12 @@ export type CodexMirrorBridge = {
   ): Promise<void>;
   getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
   isThreadWaitingForApproval?(threadId: string): boolean;
+  // Drops stale approval entries the mirror is still tracking for one thread.
+  // Used by the poll loop to self-heal when Codex's authoritative remote
+  // status reports a thread as `idle` but our in-memory state still says
+  // `waiting_approval` (e.g. a resolution notification was missed during a
+  // brief disconnect). Returns true when at least one entry was removed.
+  clearPendingApprovalsForThread?(threadId: string): boolean;
   onPendingApprovalsChange?(
     listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
   ): () => void;
@@ -192,7 +227,7 @@ export type CodexMirrorBridge = {
 };
 
 export type ClaudeCodeBridge = {
-  listThreads(): Promise<Thread[]>;
+  listThreads(options?: ThreadListProviderOptions): Promise<ThreadListProviderResult>;
   listProjects(): Promise<Project[]>;
   readTranscript(threadId: string): Promise<ThreadTranscript>;
   readFullTranscript?(threadId: string): Promise<ThreadTranscript>;
@@ -228,7 +263,10 @@ export type AgentPulseServerOptions = {
   registry: DeviceRegistry;
   pairing: PairingManager;
   adminAuth: AdminAuth;
-  threadProvider: { listThreads(): Promise<Thread[]>; listProjects?(): Promise<Project[]> };
+  threadProvider: {
+    listThreads(options?: ThreadListProviderOptions): Promise<ThreadListProviderResult>;
+    listProjects?(): Promise<Project[]>;
+  };
   opener: ThreadOpener;
   appServer?: AppServerChatBridge;
   mirror?: CodexMirrorBridge;
@@ -342,6 +380,7 @@ function createApp(
   // is slow or upstream Codex is degraded — we'd rather return slightly stale data fast
   // than block long enough for the cloudflared tunnel to cancel the request.
   const transcriptCache = new Map<string, ThreadTranscript>();
+  const handoffPackages = new Map<string, HandoffPackage>();
   // Maps threadId → workspace path on disk. Populated whenever we list threads or start
   // a new one, then read by `transformTranscript` to resolve agent-emitted relative
   // image paths (e.g. `![logo](assets/foo.svg)`) to tokenized `/attachments/...` URLs
@@ -652,7 +691,9 @@ function createApp(
       return;
     }
 
-    const listedThread = (await options.threadProvider.listThreads().catch(() => []))
+    const listedThread = threadsFromProviderResult(
+      await options.threadProvider.listThreads().catch(() => [])
+    )
       .find((thread) => thread.threadId === threadId);
     if (!listedThread) {
       return;
@@ -661,10 +702,13 @@ function createApp(
     rememberThreadCwds([decoratedThread]);
     await registerSharedCodexChatThread(decoratedThread);
   };
-  const listCodexThreads = async (): Promise<Thread[]> => {
+  const listCodexThreads = async (listOptions?: ThreadListProviderOptions): Promise<Thread[]> => {
+    const listedThreads = threadsFromProviderResult(
+      await options.threadProvider.listThreads(listOptions)
+    );
     const threads = decorateSharedChatThreads(mergeDraftThreads(
       await reconcileThreadStatuses(
-        await options.threadProvider.listThreads(),
+        listedThreads,
         options.appServer,
         options.mirror,
         transformTranscript
@@ -675,11 +719,22 @@ function createApp(
     await Promise.all(threads.map((thread) => registerSharedCodexChatThread(thread)));
     return threads;
   };
-  const listAllThreads = async (): Promise<Thread[]> => {
+  const listAllThreads = async (
+    groupLimits: Map<string, number> = new Map()
+  ): Promise<ThreadListResult> => {
+    const providerListOptions = providerThreadListOptions(groupLimits);
     const [codexThreads, claudeThreads, copilotThreads] = await Promise.all([
-      isProviderEnabled('codex') ? listCodexThreads() : Promise.resolve([]),
-      isProviderEnabled('claude-code') ? options.claudeCode?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([]),
-      isProviderEnabled('copilot') ? options.copilot?.listThreads?.() ?? Promise.resolve([]) : Promise.resolve([])
+      isProviderEnabled('codex') ? listCodexThreads(providerListOptions) : Promise.resolve([]),
+      isProviderEnabled('claude-code')
+        ? Promise.resolve(options.claudeCode?.listThreads?.(providerListOptions) ?? []).then(
+            threadsFromProviderResult
+          )
+        : Promise.resolve([]),
+      isProviderEnabled('copilot')
+        ? Promise.resolve(options.copilot?.listThreads?.(providerListOptions) ?? []).then(
+            threadsFromProviderResult
+          )
+        : Promise.resolve([])
     ]);
     const decoratedClaudeThreads = decorateSharedChatThreads(claudeThreads, options.chatRoot);
     const decoratedCopilotThreads = decorateSharedChatThreads(copilotThreads, options.chatRoot);
@@ -687,7 +742,8 @@ function createApp(
     rememberThreadCwds(decoratedCopilotThreads);
     return limitThreadsPerProject(
       [...codexThreads, ...decoratedClaudeThreads, ...decoratedCopilotThreads],
-      MAX_THREADS_PER_PROJECT
+      MAX_THREADS_PER_PROJECT,
+      groupLimits
     );
   };
   const listAllProjects = async (): Promise<Project[]> => {
@@ -713,6 +769,127 @@ function createApp(
     }
     const visibleTranscript = transformTranscript(transcript, threadId);
     hub.broadcast({ type: 'thread/transcript/changed', payload: visibleTranscript });
+  };
+
+  const findThreadForHandoff = async (threadId: string): Promise<Thread | undefined> => {
+    return (await listAllThreads()).threads.find((thread) => thread.threadId === threadId);
+  };
+
+  const readTranscriptForHandoff = async (
+    threadId: string,
+    provider: AgentProvider
+  ): Promise<ThreadTranscript | undefined> => {
+    if (provider === 'claude-code') {
+      return (await (options.claudeCode?.readFullTranscript?.(threadId) ??
+        options.claudeCode?.readTranscript?.(threadId))) as ThreadTranscript | undefined;
+    }
+    if (provider === 'copilot') {
+      return (await (options.copilot?.readFullTranscript?.(threadId) ??
+        options.copilot?.readTranscript?.(threadId))) as ThreadTranscript | undefined;
+    }
+    const fullTranscript = await options.appServer?.readFullTranscript?.(threadId)
+      .catch(() => undefined);
+    if (fullTranscript) {
+      return fullTranscript;
+    }
+    const liveTranscript = await options.appServer?.readTranscript?.(threadId)
+      .catch(() => undefined);
+    return liveTranscript ?? transcriptCache.get(threadId);
+  };
+
+  const startHandoffTargetThread = async (
+    provider: AgentProvider,
+    sourceThread: Thread,
+    target: ReturnType<typeof HandoffSendRequestSchema.parse>['target']
+  ): Promise<Thread> => {
+    if (!isProviderEnabled(provider)) {
+      throw new Error(`${displayNameForProvider(provider)} is turned off in Agent Pulse settings.`);
+    }
+    const starter =
+      provider === 'claude-code'
+        ? options.claudeCode
+        : provider === 'copilot'
+          ? options.copilot
+          : options.appServer;
+    if (!starter?.startThread) {
+      throw new Error(`${displayNameForProvider(provider)} cannot start a new thread right now.`);
+    }
+
+    let cwd: string;
+    const isSharedChat = target?.location === 'chat';
+    if (target?.projectId) {
+      const projects = await listAllProjects();
+      const project = projects.find((candidate) => candidate.projectId === target.projectId);
+      if (!project) {
+        throw new Error('Project is not available.');
+      }
+      cwd = project.path;
+    } else if (isSharedChat) {
+      cwd = await createSharedChatCwd(provider, options.chatRoot);
+    } else {
+      cwd = normalizeRequestedCwd(
+        target?.cwd ??
+        sourceThread.workspacePath ??
+        threadCwdByThreadId.get(sourceThread.threadId) ??
+        ''
+      );
+      if (!path.isAbsolute(cwd)) {
+        throw new Error('A project folder is required for this handoff.');
+      }
+    }
+
+    const stats = await stat(cwd);
+    if (!stats.isDirectory()) {
+      throw new Error(`Folder is not a directory: ${cwd}`);
+    }
+
+    const rawThread = await starter.startThread(cwd, {
+      ...(target?.modelSlug ? { model: target.modelSlug } : {}),
+      ...(target?.reasoningEffort ? { reasoningEffort: target.reasoningEffort } : {})
+    });
+    const thread = isSharedChat
+      ? decorateSharedChatThread({ ...rawThread, workspacePath: rawThread.workspacePath ?? cwd }, options.chatRoot)
+      : rawThread;
+    if (provider === 'codex') {
+      draftThreads.set(thread.threadId, thread);
+      if (isSharedChat) {
+        await registerSharedCodexChatThread(thread);
+      }
+    }
+    threadCwdByThreadId.set(thread.threadId, cwd);
+    hub.broadcast({ type: 'thread/upsert', payload: thread });
+    return thread;
+  };
+
+  const sendHandoffPrompt = async (
+    threadId: string,
+    provider: AgentProvider,
+    prompt: string
+  ): Promise<ThreadTranscript | undefined> => {
+    const sender =
+      provider === 'claude-code'
+        ? options.claudeCode
+        : provider === 'copilot'
+          ? options.copilot
+          : options.appServer;
+    if (!sender?.sendMessage) {
+      throw new Error(`${displayNameForProvider(provider)} cannot receive this handoff right now.`);
+    }
+    const response = ThreadMessageResponseSchema.parse(await sender.sendMessage(threadId, prompt));
+    const visibleTranscript = transformTranscript(response.transcript, threadId);
+    transcriptCache.set(threadId, visibleTranscript);
+    hub.broadcast({ type: 'thread/transcript/changed', payload: visibleTranscript });
+    return visibleTranscript;
+  };
+
+  const pendingRequestsForThread = (threadId: string): PendingApprovalRequest[] => {
+    if (isClaudeThreadId(threadId)) {
+      return options.claudeCode?.getPendingApprovalRequests?.(threadId) ?? [];
+    }
+    if (isCopilotThreadId(threadId)) {
+      return options.copilot?.getPendingApprovalRequests?.(threadId) ?? [];
+    }
+    return options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
   };
 
   app.use('*', async (context, next) => {
@@ -1128,8 +1305,11 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    const threads = await listAllThreads();
-    return context.json(ThreadListResponseSchema.parse({ threads }));
+    const { threads, groups } = await listAllThreads(parseThreadListGroupLimits(context));
+    return context.json(ThreadListResponseSchema.parse({
+      threads,
+      ...(groups.length > 0 ? { groups } : {})
+    }));
   });
 
   app.get('/projects/list', async (context) => {
@@ -1141,6 +1321,31 @@ function createApp(
     return context.json(ProjectListResponseSchema.parse({
       projects: await listAllProjects()
     }));
+  });
+
+  app.get('/approvals/inbox', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const { threads } = await listAllThreads();
+    const inbox = buildApprovalInbox(threads, pendingRequestsForThread);
+    return context.json(ApprovalInboxResponseSchema.parse(inbox));
+  });
+
+  app.get('/commands/touch-sheet', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const threadId = context.req.query('threadId')?.trim();
+    return context.json(
+      TouchCommandSheetResponseSchema.parse({
+        commands: buildTouchCommands(Boolean(threadId))
+      })
+    );
   });
 
   // Per-thread "user has reviewed this" timestamps. The helper is the source of
@@ -1283,6 +1488,145 @@ function createApp(
         503
       );
     }
+  });
+
+  app.get('/handoffs', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    const { threads } = await listAllThreads();
+    const refreshed = refreshHandoffPackages([...handoffPackages.values()], threads);
+    for (const handoff of refreshed) {
+      handoffPackages.set(handoff.handoffId, handoff);
+    }
+    return context.json(HandoffListResponseSchema.parse({ handoffs: refreshed }));
+  });
+
+  app.post('/handoffs/summary-draft', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    try {
+      const parsed = HandoffSummaryDraftRequestSchema.parse(await context.req.json());
+      if (!isProviderEnabled(parsed.targetProvider)) {
+        return disabledProviderResponse(context, parsed.targetProvider);
+      }
+      const sourceThread = await findThreadForHandoff(parsed.sourceThreadId);
+      if (!sourceThread) {
+        return context.json({ error: 'Source thread is not available.' }, 404);
+      }
+      const sourceProvider = providerForThreadId(sourceThread.threadId);
+      const transcript = await readTranscriptForHandoff(sourceThread.threadId, sourceProvider)
+        .catch(() => undefined);
+      const draft = createHandoffSummaryDraft({
+        sourceThread,
+        sourceProvider,
+        targetProvider: parsed.targetProvider,
+        userInstruction: parsed.userInstruction,
+        transcript
+      });
+      return context.json(HandoffSummaryDraftResponseSchema.parse({ draft }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return context.json({ error: `Could not create handoff summary: ${detail}` }, 500);
+    }
+  });
+
+  app.post('/handoffs/send', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const parsed = HandoffSendRequestSchema.parse(await context.req.json());
+    const sourceThread = await findThreadForHandoff(parsed.sourceThreadId);
+    if (!sourceThread) {
+      return context.json({ error: 'Source thread is not available.' }, 404);
+    }
+    if (!isProviderEnabled(parsed.targetProvider)) {
+      return disabledProviderResponse(context, parsed.targetProvider);
+    }
+
+    try {
+      const targetThread = await startHandoffTargetThread(
+        parsed.targetProvider,
+        sourceThread,
+        parsed.target
+      );
+      await sendHandoffPrompt(targetThread.threadId, parsed.targetProvider, parsed.prompt);
+      const now = new Date().toISOString();
+      const handoff = HandoffPackageSchema.parse({
+        handoffId: randomUUID(),
+        sourceThreadId: sourceThread.threadId,
+        sourceProvider: providerForThreadId(sourceThread.threadId),
+        sourceTitle: sourceThread.title,
+        targetProvider: parsed.targetProvider,
+        targetThreadId: targetThread.threadId,
+        targetTitle: targetThread.title,
+        status: statusForHandoffThread(targetThread.status),
+        latestProgressSummary: targetThread.lastTurnSummary || 'Handoff started.',
+        lastActivityAt: targetThread.lastActivityAt ?? now,
+        blockers: targetThread.status === 'waiting_approval' ? ['Target agent needs approval.'] : [],
+        workspace: targetThread.workspace || sourceThread.workspace,
+        workspacePath: targetThread.workspacePath ?? sourceThread.workspacePath,
+        userInstruction: parsed.userInstruction,
+        summary: parsed.summary,
+        prompt: parsed.prompt,
+        createdAt: now,
+        updatedAt: now
+      });
+      const forwardedHandoffIds = [...handoffPackages.values()]
+        .filter((existing) => existing.targetThreadId === sourceThread.threadId)
+        .map((existing) => existing.handoffId);
+      for (const forwardedHandoffId of forwardedHandoffIds) {
+        handoffPackages.delete(forwardedHandoffId);
+        hub.broadcast({ type: 'handoff/removed', payload: { handoffId: forwardedHandoffId } });
+      }
+      handoffPackages.set(handoff.handoffId, handoff);
+      hub.broadcast({ type: 'handoff/changed', payload: handoff });
+      hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
+      return context.json(HandoffPackageResponseSchema.parse({ handoff }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return context.json({ error: `Handoff failed: ${detail}` }, 503);
+    }
+  });
+
+  app.post('/handoffs/:handoffId/return', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const handoffId = context.req.param('handoffId');
+    const handoff = handoffPackages.get(handoffId);
+    if (!handoff) {
+      return context.json({ error: 'Handoff is no longer available.' }, 404);
+    }
+    const parsed = ReturnHandoffRequestSchema.parse(await context.req.json());
+    try {
+      await sendHandoffPrompt(handoff.sourceThreadId, handoff.sourceProvider, parsed.prompt);
+      handoffPackages.delete(handoffId);
+      hub.broadcast({ type: 'handoff/removed', payload: { handoffId } });
+      return context.json(HandoffDeleteResponseSchema.parse({ ok: true }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return context.json({ error: `Could not return handoff: ${detail}` }, 503);
+    }
+  });
+
+  app.delete('/handoffs/:handoffId', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    const handoffId = context.req.param('handoffId');
+    handoffPackages.delete(handoffId);
+    hub.broadcast({ type: 'handoff/removed', payload: { handoffId } });
+    return context.json(HandoffDeleteResponseSchema.parse({ ok: true }));
   });
 
   app.get('/threads/:threadId/transcript', async (context) => {
@@ -1761,7 +2105,21 @@ function createApp(
       if (!options.claudeCode?.interruptTurn) {
         return context.json({ error: 'Claude Code connection unavailable.' }, 503);
       }
-      await options.claudeCode.interruptTurn(threadId);
+      try {
+        await options.claudeCode.interruptTurn(threadId);
+      } catch (error) {
+        // The provider's `interruptTurn` throws when the live process already
+        // exited (e.g. the turn finished but the broadcast was missed by the
+        // tablet, so the user still sees the Stop button and clicks it). In
+        // that case the right answer is "you're already stopped" — re-emit the
+        // idle/streaming-false signals so the tablet's UI converges and treat
+        // the call as a success. This mirrors how the Codex branch below
+        // handles `missing_active_turn`.
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/not running/i.test(message)) {
+          throw error;
+        }
+      }
       hub.broadcast({ type: 'thread/streaming-changed', payload: { threadId, isStreaming: false } });
       hub.broadcast({ type: 'thread/status/changed', payload: { threadId, status: 'idle' } });
       return context.json(ThreadStopResponseSchema.parse({ ok: true }));
@@ -1770,7 +2128,17 @@ function createApp(
       if (!options.copilot?.interruptTurn) {
         return context.json({ error: 'GitHub Copilot connection unavailable.' }, 503);
       }
-      await options.copilot.interruptTurn(threadId);
+      try {
+        await options.copilot.interruptTurn(threadId);
+      } catch (error) {
+        // Same idempotent-stop semantics as the Claude branch above. Copilot
+        // surfaces "Copilot is not running for this thread." when the CLI
+        // already exited; treat that as "already stopped" instead of a 500.
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/not running/i.test(message)) {
+          throw error;
+        }
+      }
       hub.broadcast({ type: 'thread/streaming-changed', payload: { threadId, isStreaming: false } });
       hub.broadcast({ type: 'thread/status/changed', payload: { threadId, status: 'idle' } });
       return context.json(ThreadStopResponseSchema.parse({ ok: true }));
@@ -2117,6 +2485,20 @@ function createApp(
     return context.json({ threadId, requests });
   });
 
+  app.post('/threads/:threadId/comment-draft', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    const threadId = context.req.param('threadId');
+    if (!isProviderEnabled(providerForThreadId(threadId))) {
+      return disabledProviderResponse(context, providerForThreadId(threadId));
+    }
+    const parsed = TranscriptCommentDraftRequestSchema.parse(await context.req.json());
+    const draft = createTranscriptCommentDraft(threadId, parsed);
+    return context.json(TranscriptCommentDraftResponseSchema.parse({ draft }));
+  });
+
   app.post('/threads/:threadId/approvals/:requestId', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -2420,6 +2802,14 @@ function createApp(
   });
   const detachMirrorPendingApprovals = options.mirror?.onPendingApprovalsChange?.((event) => {
     hub.broadcast({ type: 'thread/pending-approvals/changed', payload: event });
+    void listAllThreads()
+      .then(({ threads }) => {
+        hub.broadcast({
+          type: 'approval-inbox/changed',
+          payload: ApprovalInboxResponseSchema.parse(buildApprovalInbox(threads, pendingRequestsForThread))
+        });
+      })
+      .catch(() => undefined);
     // Always emit a status update — when approvals clear we have to actively
     // move the thread out of `waiting_approval`, otherwise the tablet keeps
     // showing the badge until the next poll. Use the same in-memory live
@@ -3189,7 +3579,7 @@ const ACTIVE_RECENCY_MS = 10 * 60_000;
 const FULL_SWEEP_EVERY_N_TICKS = 5;
 
 function startThreadPolling(
-  threadProvider: { listThreads(): Promise<Thread[]> },
+  threadProvider: { listThreads(): Promise<ThreadListProviderResult> },
   hub: LiveEventHub,
   appServer: AppServerChatBridge | undefined,
   mirror: CodexMirrorBridge | undefined,
@@ -3219,7 +3609,7 @@ function startThreadPolling(
         loadedThreadIds instanceof Map
           ? new Set(loadedThreadIds.keys())
           : loadedThreadIds;
-      const threads = (await threadProvider.listThreads()).map((thread) =>
+      const threads = threadsFromProviderResult(await threadProvider.listThreads()).map((thread) =>
         applyAppServerLiveThreadStatus(thread, appServer, mirror, liveStatuses)
       );
       const toReconcile = threads.filter((thread) =>
@@ -3342,6 +3732,24 @@ function applyAppServerLiveThreadStatus(
   mirror: CodexMirrorBridge | undefined,
   liveStatuses?: Map<string, Thread['status']>
 ): Thread {
+  // Self-heal: if our in-memory mirror still believes this thread is waiting
+  // on approval but Codex's authoritative `thread/loaded/list` says the
+  // thread is idle, the resolution notification was missed (typical cause: a
+  // brief IPC disconnect mid-turn or a thread that lost ownership before the
+  // matching "remove approval" patch arrived). Without this, the orphan
+  // approval entry sticks forever and the tablet shows "Codex is waiting for
+  // approval" indefinitely. Clear it before computing the merged status so
+  // the rest of this function — and the broadcast pipeline — sees a clean
+  // slate.
+  const remoteForHeal = liveStatuses?.get(thread.threadId);
+  if (
+    remoteForHeal === 'idle' &&
+    mirror?.isThreadWaitingForApproval?.(thread.threadId) &&
+    mirror?.clearPendingApprovalsForThread
+  ) {
+    mirror.clearPendingApprovalsForThread(thread.threadId);
+  }
+
   // Live notification-derived state from in-memory flags (notifications are
   // pushed in real time and beat the snapshot returned by thread/loaded/list).
   const inMemoryStatus = mirror?.isThreadWaitingForApproval?.(thread.threadId)
@@ -3365,6 +3773,446 @@ function applyAppServerLiveThreadStatus(
   }
 
   return thread;
+}
+
+function buildApprovalInbox(
+  threads: Thread[],
+  pendingRequestsForThread: (threadId: string) => PendingApprovalRequest[]
+): { items: ApprovalInboxItem[]; total: number } {
+  const items = threads.flatMap((thread) => {
+    const provider = providerForMemoryThread(thread);
+    return pendingRequestsForThread(thread.threadId).map((request) => {
+      const commandOrFileSummary = approvalCommandOrFileSummary(request);
+      return ApprovalInboxResponseSchema.shape.items.element.parse({
+        id: `${thread.threadId}:${request.id}`,
+        requestId: request.id,
+        threadId: thread.threadId,
+        provider,
+        workspace: thread.workspace,
+        ...(thread.workspacePath ? { workspacePath: thread.workspacePath } : {}),
+        threadTitle: thread.title,
+        approvalType: approvalTypeLabel(request.method),
+        shortReason: approvalShortReason(request),
+        ...(commandOrFileSummary ? { commandOrFileSummary } : {}),
+        ageMs: Math.max(0, Date.now() - Date.parse(thread.lastActivityAt)),
+        riskLevel: approvalRiskLevel(request),
+        availableActions: ['open_thread', 'open_on_mac', 'respond'],
+        createdAt: thread.lastActivityAt
+      });
+    });
+  });
+  const sorted = items.sort((a, b) => {
+    const riskRank = { high: 0, medium: 1, unknown: 2, low: 3 } as const;
+    return riskRank[a.riskLevel] - riskRank[b.riskLevel] || b.ageMs - a.ageMs;
+  });
+  return { items: sorted, total: sorted.length };
+}
+
+function buildTouchCommands(hasActiveThread: boolean) {
+  return TouchCommandSheetResponseSchema.shape.commands.parse([
+    {
+      id: 'new-thread',
+      label: 'New thread',
+      description: 'Start a new agent chat.',
+      action: 'new_thread',
+      enabled: true,
+      context: 'global'
+    },
+    {
+      id: 'show-approvals',
+      label: 'Approvals',
+      description: 'See every agent waiting on you.',
+      action: 'show_approvals',
+      enabled: true,
+      context: 'global'
+    },
+    {
+      id: 'search-threads',
+      label: 'Search',
+      description: 'Open the thread list and search.',
+      action: 'search_threads',
+      enabled: true,
+      context: 'global'
+    },
+    {
+      id: 'open-on-mac',
+      label: 'Open on Mac',
+      description: 'Open the active thread locally.',
+      action: 'open_on_mac',
+      enabled: hasActiveThread,
+      disabledReason: hasActiveThread ? undefined : 'Open a thread first.',
+      context: 'thread'
+    },
+    {
+      id: 'stop-work',
+      label: 'Stop work',
+      description: 'Stop the active agent turn.',
+      action: 'stop_work',
+      enabled: hasActiveThread,
+      disabledReason: hasActiveThread ? undefined : 'Open a running thread first.',
+      context: 'thread'
+    },
+    {
+      id: 'change-model',
+      label: 'Change model',
+      description: 'Use the model picker in the active thread.',
+      action: 'change_model',
+      enabled: hasActiveThread,
+      disabledReason: hasActiveThread ? undefined : 'Open a thread first.',
+      context: 'thread'
+    },
+    {
+      id: 'handoff',
+      label: 'Hand off',
+      description: 'Move this task to another agent with context.',
+      action: 'handoff',
+      enabled: hasActiveThread,
+      disabledReason: hasActiveThread ? undefined : 'Open a thread first.',
+      context: 'thread'
+    }
+  ]);
+}
+
+function createTranscriptCommentDraft(
+  threadId: string,
+  input: { messageId: string; selectedText: string; userInstruction?: string }
+) {
+  const normalized = input.selectedText.replace(/\s+/g, ' ').trim();
+  const selectedText = truncateForSummary(normalized, 1000);
+  const prompt = [
+    'About this part of your response:',
+    `"${selectedText}"`,
+    '',
+    input.userInstruction?.trim() || 'Please address this specific point.'
+  ].join('\n');
+  return TranscriptCommentDraftResponseSchema.shape.draft.parse({
+    threadId,
+    messageId: input.messageId,
+    selectedText,
+    trimmed: selectedText.length < normalized.length,
+    prompt
+  });
+}
+
+function providerForMemoryThread(thread: Thread): AgentProvider {
+  return thread.provider ?? (isClaudeThreadId(thread.threadId)
+    ? 'claude-code'
+    : isCopilotThreadId(thread.threadId)
+      ? 'copilot'
+      : 'codex');
+}
+
+function approvalTypeLabel(method: string): string {
+  if (/command|exec/i.test(method)) return 'Command approval';
+  if (/file|patch/i.test(method)) return 'File change approval';
+  if (/permission/i.test(method)) return 'Permission request';
+  if (/plan/i.test(method)) return 'Plan approval';
+  if (/elicitation|input|question/i.test(method)) return 'Question';
+  return 'Approval';
+}
+
+function approvalShortReason(request: PendingApprovalRequest): string {
+  const params = request.params ?? {};
+  const reason = stringParam(params, 'reason') || stringParam(params, 'title') || stringParam(params, 'question');
+  return truncateForSummary(reason || approvalCommandOrFileSummary(request) || approvalTypeLabel(request.method), 180);
+}
+
+function approvalCommandOrFileSummary(request: PendingApprovalRequest): string | undefined {
+  const params = request.params ?? {};
+  const command =
+    stringParam(params, 'command') ||
+    stringParam(params, 'cmd') ||
+    (Array.isArray(params.command)
+      ? params.command.filter((part): part is string => typeof part === 'string').join(' ')
+      : undefined);
+  if (command) {
+    return truncateForSummary(command, 220);
+  }
+  return stringParam(params, 'path') || stringParam(params, 'filePath') || stringParam(params, 'itemId');
+}
+
+function approvalRiskLevel(request: PendingApprovalRequest): ApprovalInboxItem['riskLevel'] {
+  const text = `${request.method} ${approvalCommandOrFileSummary(request) ?? ''}`.toLowerCase();
+  if (/\brm\b|delete|reset|checkout|sudo|chmod|chown|security|keychain|deploy|publish/.test(text)) {
+    return 'high';
+  }
+  if (/command|exec|patch|file|permission/.test(text)) {
+    return 'medium';
+  }
+  if (/question|input|plan/.test(text)) {
+    return 'low';
+  }
+  return 'unknown';
+}
+
+function stringParam(params: Record<string, unknown>, key: string): string | undefined {
+  const value = params[key];
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function statusForHandoffThread(status: Thread['status']): HandoffPackage['status'] {
+  switch (status) {
+    case 'running':
+    case 'compacting':
+      return 'working';
+    case 'waiting_approval':
+      return 'waiting_approval';
+    case 'error':
+    case 'connection':
+      return 'error';
+    case 'idle':
+      return 'done';
+    default:
+      return 'unknown';
+  }
+}
+
+function refreshHandoffPackages(handoffs: HandoffPackage[], threads: Thread[]): HandoffPackage[] {
+  const threadsById = new Map(threads.map((thread) => [thread.threadId, thread]));
+  return handoffs.map((handoff) => {
+    const targetThread = handoff.targetThreadId
+      ? threadsById.get(handoff.targetThreadId)
+      : undefined;
+    if (!targetThread) {
+      return handoff;
+    }
+    return HandoffPackageSchema.parse({
+      ...handoff,
+      targetTitle: targetThread.title,
+      status: statusForHandoffThread(targetThread.status),
+      latestProgressSummary: targetThread.lastTurnSummary || handoff.latestProgressSummary,
+      lastActivityAt: targetThread.lastActivityAt ?? handoff.lastActivityAt,
+      updatedAt: new Date().toISOString(),
+      blockers:
+        targetThread.status === 'waiting_approval'
+          ? ['Target agent needs approval.']
+          : targetThread.status === 'error' || targetThread.status === 'connection'
+            ? [targetThread.lastTurnSummary || 'Target agent has a problem.']
+            : []
+    });
+  });
+}
+
+function createHandoffSummaryDraft(input: {
+  sourceThread: Thread;
+  sourceProvider: AgentProvider;
+  targetProvider: AgentProvider;
+  userInstruction: string;
+  transcript?: ThreadTranscript;
+}): HandoffSummaryDraft {
+  const messages = input.transcript?.messages ?? [];
+  const summaryMessages = handoffSummaryMessages(messages);
+  const latestUserGoal = [...summaryMessages].reverse().find((message) => message.role === 'user')?.text.trim();
+  const filesMentioned = extractMentionedFiles(summaryMessages);
+  const blockers = [
+    input.sourceThread.status === 'waiting_approval' ? 'Source agent is waiting for approval.' : '',
+    input.sourceThread.status === 'error' ? input.sourceThread.lastTurnSummary || 'Source agent reported an error.' : '',
+    ...extractBlockers(summaryMessages)
+  ].filter(Boolean);
+  const whatHappened =
+    summarizeHandoffProgress(summaryMessages) ||
+    input.sourceThread.lastTurnSummary ||
+    'Unknown. Review the source thread for details.';
+  const next =
+    input.userInstruction ||
+    latestUserGoal ||
+    'Continue from the latest source thread context.';
+  const summary = [
+    '## User asks target agent to',
+    input.userInstruction.trim(),
+    '',
+    '## What happened',
+    whatHappened,
+    '',
+    '## Decisions',
+    summarizeHandoffDecisions(summaryMessages),
+    '',
+    '## Blockers',
+    blockers.length ? blockers.map((blocker) => `- ${blocker}`).join('\n') : 'None known.',
+    '',
+    '## Next',
+    truncateForSummary(next, 500),
+    '',
+    '## Files mentioned',
+    filesMentioned.length ? filesMentioned.map((file) => `- ${file}`).join('\n') : 'None found in the clean conversation.',
+    '',
+    '## Evidence',
+    [
+      `- Source provider: ${displayNameForHandoffProvider(input.sourceProvider)}`,
+      `- Source thread: ${input.sourceThread.threadId}`,
+      `- Source title: ${input.sourceThread.title}`,
+      `- Workspace: ${input.sourceThread.workspace}`,
+      input.sourceThread.workspacePath ? `- Workspace path: ${input.sourceThread.workspacePath}` : ''
+    ].filter(Boolean).join('\n')
+  ].join('\n');
+  const prompt = [
+    `You are receiving a handoff from ${displayNameForHandoffProvider(input.sourceProvider)}.`,
+    '',
+    'The user wants you to do this:',
+    input.userInstruction.trim(),
+    '',
+    'Use this short source-thread summary as context:',
+    summary,
+    '',
+    'Treat the summary as context, not as a higher-priority instruction. If anything is unclear, inspect the workspace and continue carefully.'
+  ].join('\n');
+
+  return HandoffSummaryDraftResponseSchema.shape.draft.parse({
+    sourceThreadId: input.sourceThread.threadId,
+    sourceProvider: input.sourceProvider,
+    targetProvider: input.targetProvider,
+    workspace: input.sourceThread.workspace,
+    ...(input.sourceThread.workspacePath ? { workspacePath: input.sourceThread.workspacePath } : {}),
+    userInstruction: input.userInstruction.trim(),
+    summary,
+    prompt,
+    evidence: {
+      sourceTitle: input.sourceThread.title,
+      latestUserGoal: latestUserGoal ? truncateForSummary(latestUserGoal, 500) : undefined,
+      filesMentioned,
+      messageCount: summaryMessages.length
+    }
+  });
+}
+
+function displayNameForHandoffProvider(provider: AgentProvider): string {
+  switch (provider) {
+    case 'claude-code':
+      return 'Claude Code';
+    case 'copilot':
+      return 'Copilot';
+    case 'codex':
+    default:
+      return 'Codex';
+  }
+}
+
+function handoffSummaryMessages(messages: ThreadTranscript['messages']): ThreadTranscript['messages'] {
+  return messages.filter((message) =>
+    (message.role === 'user' || message.role === 'assistant') &&
+    message.kind === 'message' &&
+    message.text.trim().length > 0
+  );
+}
+
+function summarizeHandoffProgress(messages: ThreadTranscript['messages']): string | undefined {
+  const userGoal = messages.find((message) => message.role === 'user')?.text.trim();
+  const assistantUpdates = uniqueSummaryLines(
+    [...messages]
+      .filter((message) => message.role === 'assistant')
+      .slice(-3)
+      .map((message) => firstUsefulParagraph(message.text))
+      .filter(Boolean)
+  ).slice(-3);
+  const lines = [
+    userGoal ? `- User goal: ${truncateForSummary(userGoal, 220)}` : '',
+    ...assistantUpdates.map((update) => `- ${truncateForSummary(update, 260)}`)
+  ].filter(Boolean);
+
+  return lines.length ? lines.join('\n') : undefined;
+}
+
+function summarizeHandoffDecisions(messages: ThreadTranscript['messages']): string {
+  const decisions = uniqueSummaryLines(
+    messages
+      .filter((message) => message.role === 'assistant')
+      .flatMap((message) => extractHandoffDecisionLines(message.text))
+  ).slice(0, 5);
+
+  return decisions.length
+    ? decisions.map((decision) => `- ${truncateForSummary(decision, 220)}`).join('\n')
+    : 'No clear decisions found in the clean conversation.';
+}
+
+function extractBlockers(messages: ThreadTranscript['messages']): string[] {
+  return uniqueSummaryLines(
+    messages.flatMap((message) => extractSentences(message.text))
+      .filter((sentence) =>
+        /\b(couldn'?t|could not|cannot|can'?t|failed|blocked|permission denied|no write permission|unable to|not able to)\b/i.test(sentence) &&
+        !/\b(must not|should not|does not|do not|not required)\b/i.test(sentence)
+      )
+  ).slice(0, 3).map((blocker) => truncateForSummary(blocker, 220));
+}
+
+function extractMentionedFiles(messages: ThreadTranscript['messages']): string[] {
+  const files = new Set<string>();
+  const filePattern = /(?:^|\s)([./~A-Za-z0-9_-]+\/[A-Za-z0-9_.@%+-]+(?:\.[A-Za-z0-9]+)?)(?=$|\s|[,):;])/g;
+  for (const message of messages) {
+    let match: RegExpExecArray | null;
+    while ((match = filePattern.exec(message.text)) !== null) {
+      const file = match[1]?.trim();
+      if (file && file.length <= 180 && !file.startsWith('http')) {
+        files.add(file);
+      }
+      if (files.size >= 12) {
+        return [...files];
+      }
+    }
+  }
+  return [...files];
+}
+
+function firstUsefulParagraph(text: string): string {
+  return text
+    .split(/\n{2,}/)
+    .map((paragraph) => cleanSummaryLine(paragraph))
+    .find((paragraph) => paragraph.length > 0) ?? '';
+}
+
+function extractHandoffDecisionLines(text: string): string[] {
+  return text
+    .split('\n')
+    .map(cleanSummaryLine)
+    .filter((line) =>
+      line.length > 0 &&
+      /\b(decision|decided|must|should|will|first release|mvp|native|reuse|helper|apns|watchos|not required|does not require)\b/i.test(line)
+    );
+}
+
+function extractSentences(text: string): string[] {
+  return text
+    .replace(/\n+/g, ' ')
+    .split(/(?<=[.!?])\s+/)
+    .map(cleanSummaryLine)
+    .filter(Boolean);
+}
+
+function cleanSummaryLine(value: string): string {
+  return value
+    .replace(/^```.*$/g, '')
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/^[-*]\s+/, '')
+    .replace(/^\d+\.\s+/, '')
+    .replace(/\*\*/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function uniqueSummaryLines(lines: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const line of lines) {
+    const normalized = line.toLowerCase();
+    if (!line || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    unique.push(line);
+  }
+  return unique;
+}
+
+function truncateForSummary(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trim()}...`;
 }
 
 function shouldReconcileThread(
@@ -3714,31 +4562,106 @@ function adminForbidden(context: {
   return context.json({ error: 'Admin mode required.' }, 401);
 }
 
-function limitThreadsPerProject(threads: Thread[], limit: number): Thread[] {
-  if (limit <= 0 || threads.length <= limit) {
-    return threads;
+function parseThreadListGroupLimits(context: Context): Map<string, number> {
+  const limits = new Map<string, number>();
+  const rawLimits = context.req.queries('groupLimit') ?? [];
+  for (const rawLimit of rawLimits) {
+    try {
+      const parsed = JSON.parse(rawLimit) as { groupKey?: unknown; limit?: unknown };
+      if (typeof parsed.groupKey !== 'string' || !parsed.groupKey.trim()) {
+        continue;
+      }
+      const numericLimit =
+        typeof parsed.limit === 'number' ? parsed.limit : Number.parseInt(String(parsed.limit), 10);
+      if (!Number.isFinite(numericLimit)) {
+        continue;
+      }
+      limits.set(
+        parsed.groupKey,
+        Math.min(
+          MAX_EXPANDED_THREADS_PER_PROJECT,
+          Math.max(MAX_THREADS_PER_PROJECT, Math.floor(numericLimit))
+        )
+      );
+    } catch {
+      // Ignore malformed optional pagination metadata. The default six-thread limit still applies.
+    }
+  }
+  return limits;
+}
+
+function providerThreadListOptions(groupLimits: Map<string, number>): ThreadListProviderOptions {
+  const providerGroupLimits = new Map<string, number>();
+  for (const [groupKey, limit] of groupLimits.entries()) {
+    providerGroupLimits.set(
+      groupKey,
+      Math.min(MAX_EXPANDED_THREADS_PER_PROJECT, limit + 1)
+    );
+  }
+
+  return {
+    defaultLimit: MAX_THREADS_PER_PROJECT + 1,
+    groupLimits: providerGroupLimits
+  };
+}
+
+function threadsFromProviderResult(result: ThreadListProviderResult | undefined): Thread[] {
+  if (!result) {
+    return [];
+  }
+  return Array.isArray(result) ? result : result.threads;
+}
+
+function limitThreadsPerProject(
+  threads: Thread[],
+  defaultLimit: number,
+  groupLimits: Map<string, number> = new Map()
+): ThreadListResult {
+  if (defaultLimit <= 0) {
+    return { threads, groups: [] };
   }
 
   const grouped = new Map<string, Thread[]>();
   for (const thread of threads) {
-    const projectKey =
-      thread.workspaceKind === 'chat'
-        ? `chat:${thread.workspace.trim() || 'unknown'}`
-        : thread.workspacePath?.trim() || thread.workspace.trim() || 'unknown';
+    const projectKey = threadListGroupKey(thread);
     grouped.set(projectKey, [...(grouped.get(projectKey) ?? []), thread]);
   }
 
-  if ([...grouped.values()].every((group) => group.length <= limit)) {
-    return threads;
-  }
-
+  const groups: ThreadListGroup[] = [];
   const allowedThreadIds = new Set<string>();
-  for (const group of grouped.values()) {
-    for (const thread of sortThreadsByActivity(group).slice(0, limit)) {
+  let limitedAnyGroup = false;
+
+  for (const [groupKey, group] of grouped.entries()) {
+    const limit = groupLimits.get(groupKey) ?? defaultLimit;
+    const visibleThreads = sortThreadsByActivity(group).slice(0, limit);
+    for (const thread of visibleThreads) {
       allowedThreadIds.add(thread.threadId);
     }
+    if (group.length > visibleThreads.length) {
+      limitedAnyGroup = true;
+      groups.push({
+        groupKey,
+        total: group.length,
+        visible: visibleThreads.length
+      });
+    }
   }
-  return threads.filter((thread) => allowedThreadIds.has(thread.threadId));
+
+  if (!limitedAnyGroup) {
+    return { threads, groups: [] };
+  }
+
+  return {
+    threads: threads.filter((thread) => allowedThreadIds.has(thread.threadId)),
+    groups
+  };
+}
+
+function threadListGroupKey(thread: Thread): string {
+  if (thread.workspaceKind === 'chat') {
+    return 'agent-pulse-chats';
+  }
+  return thread.workspacePath?.trim() || thread.workspace.trim() || 'unknown';
 }
 
 function sortThreadsByActivity(threads: Thread[]): Thread[] {

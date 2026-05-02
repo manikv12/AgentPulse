@@ -134,6 +134,78 @@ describe('CopilotProvider', () => {
     ]);
   });
 
+  it('marks parsed Copilot assistant messages as final_answer so the renderer can carve out the latest reply', async () => {
+    // Regression for the "Used the browser N times" group floating between
+    // user messages with no answer bubble. Copilot streams several
+    // `assistant.message` events per turn (intermediate progress + final big
+    // text). The JSONL parser used to set no `phase`, which made
+    // findFinalResponseIndex's Pass 1 miss every Copilot assistant message
+    // when the active turn was for a different thread (`isLive: true`),
+    // burying the final reply inside the activity group. Marking every
+    // parsed assistant text with `phase: 'final_answer'` lets Pass 1 walk
+    // backward and surface the latest one as the visible bubble; earlier
+    // ones collapse inside the group.
+    const copilotHome = await tempCopilotHome();
+    const sessionDir = path.join(copilotHome, 'session-state', 'session-multi');
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      path.join(sessionDir, 'workspace.yaml'),
+      [
+        'cwd: /Users/me/projects/CodexPulse',
+        'updated_at: 2026-04-25T16:16:00.000Z'
+      ].join('\n')
+    );
+    await writeFile(
+      path.join(sessionDir, 'events.jsonl'),
+      [
+        JSON.stringify({
+          type: 'session.start',
+          data: { selectedModel: 'gpt-5.2', context: { cwd: '/Users/me/projects/CodexPulse' } },
+          id: 'session-start',
+          timestamp: '2026-04-25T16:14:00Z'
+        }),
+        JSON.stringify({
+          type: 'user.message',
+          data: { content: 'Make a doc.' },
+          id: 'message-user',
+          timestamp: '2026-04-25T16:14:05Z'
+        }),
+        JSON.stringify({
+          type: 'assistant.message',
+          data: { messageId: 'assistant-progress-1', content: 'Drafting the doc now…', toolRequests: [] },
+          id: 'message-assistant-progress-1',
+          timestamp: '2026-04-25T16:14:10Z'
+        }),
+        JSON.stringify({
+          type: 'assistant.message',
+          data: { messageId: 'assistant-progress-2', content: 'Hit a write permission issue, trying a workaround.', toolRequests: [] },
+          id: 'message-assistant-progress-2',
+          timestamp: '2026-04-25T16:14:30Z'
+        }),
+        JSON.stringify({
+          type: 'assistant.message',
+          data: { messageId: 'assistant-final', content: 'Here is the requirements doc you asked for.', toolRequests: [] },
+          id: 'message-assistant-final',
+          timestamp: '2026-04-25T16:15:00Z'
+        })
+      ].join('\n')
+    );
+
+    const provider = new CopilotProvider({
+      copilotHome,
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const transcript = await provider.readTranscript('copilot:session-multi');
+    const assistantMessages = transcript.messages.filter(
+      (message) => message.role === 'assistant' && message.kind === 'message'
+    );
+    expect(assistantMessages).toHaveLength(3);
+    for (const message of assistantMessages) {
+      expect(message.phase).toBe('final_answer');
+    }
+  });
+
   it('deletes Copilot session-state folders from local history', async () => {
     const copilotHome = await tempCopilotHome();
     const sessionDir = path.join(copilotHome, 'session-state', 'session-delete');
@@ -350,6 +422,39 @@ describe('CopilotProvider', () => {
       url: 'data:image/png;base64,iVBORw0KGgo='
     });
 
+    provider.dispose();
+  });
+
+  it('spawns Copilot in autopilot mode with all-tools/all-paths permission so prompt-mode tool calls do not fail with "Permission denied"', async () => {
+    // Without these flags, Copilot's non-interactive (--prompt) mode emits
+    // tool.execution_complete events with `success:false, error.code:"denied",
+    // message:"Permission denied and could not request permission from user"`
+    // because there is no terminal attached for the per-tool prompt. The
+    // Copilot CLI documents --allow-all-tools as "required for non-interactive
+    // mode". This test locks in the spawn args so the regression cannot
+    // silently come back.
+    const copilotHome = await tempCopilotHome();
+    const child = fakeCopilotProcess();
+    const spawnMock = vi.fn((_command: string, _args: readonly string[], _options: unknown) => child.process);
+    const provider = new CopilotProvider({
+      copilotHome,
+      spawnProcess: spawnMock as unknown as typeof import('node:child_process').spawn,
+      now: () => new Date('2026-04-25T16:14:00Z'),
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const thread = await provider.startThread('/Users/me/projects/CodexPulse');
+    const sendPromise = provider.sendMessage(thread.threadId, 'Make a doc.');
+
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+    const args = spawnMock.mock.calls[0]![1] as string[];
+    expect(args).toContain('--mode');
+    expect(args[args.indexOf('--mode') + 1]).toBe('autopilot');
+    expect(args).toContain('--allow-all-tools');
+    expect(args).toContain('--allow-all-paths');
+
+    child.stdout.write(`${JSON.stringify({ type: 'assistant.message', content: 'Drafting.' })}\n`);
+    await sendPromise;
     provider.dispose();
   });
 

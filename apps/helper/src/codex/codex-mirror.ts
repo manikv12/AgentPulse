@@ -74,6 +74,13 @@ export type CodexMirror = {
   // with their full payloads (id, method, params). Used by the server to seed
   // the tablet on reconnect via `thread/upsert`.
   getPendingApprovalRequests(threadId: string): PendingApprovalRequest[];
+  // Drops all in-memory approval entries for one thread and emits a
+  // `pending-approvals: []` event if anything changed. Used by the poll loop
+  // to self-heal when Codex's authoritative remote status disagrees with our
+  // stale view (e.g. an "approval resolved" notification was missed during a
+  // brief disconnect, leaving the tablet stuck on "Codex is waiting for
+  // approval" indefinitely). Returns true when at least one entry was removed.
+  clearPendingApprovalsForThread(threadId: string): boolean;
   onStreamingChange(listener: (event: { threadId: string; isStreaming: boolean }) => void): () => void;
   onPendingApprovalsChange(
     listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
@@ -628,6 +635,18 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     return state ? pendingApprovalsFromState(state) : [];
   }
 
+  function clearPendingApprovalsForThread(threadId: string): boolean {
+    const state = appThreadStreamStates.get(threadId);
+    if (!state || state.approvalRequestsByKey.size === 0) {
+      return false;
+    }
+    state.approvalRequestsByKey.clear();
+    state.approvalResponseIdsByKey.clear();
+    state.lastUpdatedAtMs = now();
+    notifyPendingApprovalsIfChanged(threadId);
+    return true;
+  }
+
   function waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean> {
     if (ownedThreads.has(threadId)) {
       return Promise.resolve(true);
@@ -665,6 +684,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     isThreadCompacting,
     isThreadWaitingForApproval,
     getPendingApprovalRequests,
+    clearPendingApprovalsForThread,
     onStreamingChange(listener) {
       streamingListeners.add(listener);
       return () => {

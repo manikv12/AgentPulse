@@ -3529,6 +3529,152 @@ describe('Agent Pulse tablet UI', () => {
     ).toBeInTheDocument();
   });
 
+  it('shows a subtle show more control for project groups with older threads', () => {
+    const projectPath = '/Users/me/projects/AgentPulse';
+    const onShowMoreThreads = vi.fn();
+    const threads = Array.from({ length: 6 }, (_, index) => ({
+      threadId: `thread-${index}`,
+      title: `Project chat ${index}`,
+      workspace: 'Agent Pulse',
+      workspacePath: projectPath,
+      status: 'idle' as const,
+      lastActivityAt: new Date(Date.parse('2026-04-25T16:18:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={threads}
+        threadListGroups={[{ groupKey: projectPath, total: 7, visible: 6 }]}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: projectPath
+          }
+        ]}
+        onShowMoreThreads={onShowMoreThreads}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    const showMore = within(sidebar).getByRole('button', {
+      name: 'Show more chats in Agent Pulse'
+    });
+    expect(showMore).toHaveTextContent('Show more');
+
+    fireEvent.click(showMore);
+    expect(onShowMoreThreads).toHaveBeenCalledWith(projectPath);
+  });
+
+  it('shows sidebar loading feedback while threads are loading', () => {
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[]}
+        threadsLoaded={false}
+        projects={[]}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('Loading chats');
+  });
+
+  it('shows loading feedback on the project show more control', () => {
+    const projectPath = '/Users/me/projects/AgentPulse';
+    const threads = Array.from({ length: 6 }, (_, index) => ({
+      threadId: `thread-${index}`,
+      title: `Project chat ${index}`,
+      workspace: 'Agent Pulse',
+      workspacePath: projectPath,
+      status: 'idle' as const,
+      lastActivityAt: new Date(Date.parse('2026-04-25T16:18:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={threads}
+        threadsLoaded={false}
+        loadingThreadGroupKey={projectPath}
+        threadListGroups={[{ groupKey: projectPath, total: 7, visible: 6 }]}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: projectPath
+          }
+        ]}
+        onShowMoreThreads={vi.fn()}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('Loading chats');
+  });
+
+  it('shows a show less control for expanded project groups', () => {
+    const projectPath = '/Users/me/projects/AgentPulse';
+    const onShowLessThreads = vi.fn();
+    const threads = Array.from({ length: 8 }, (_, index) => ({
+      threadId: `expanded-thread-${index}`,
+      title: `Expanded chat ${index}`,
+      workspace: 'Agent Pulse',
+      workspacePath: projectPath,
+      status: 'idle' as const,
+      lastActivityAt: new Date(Date.parse('2026-04-25T16:18:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={threads}
+        expandedThreadGroupKeys={new Set([projectPath])}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: projectPath
+          }
+        ]}
+        onShowLessThreads={onShowLessThreads}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    const showLess = within(sidebar).getByRole('button', {
+      name: 'Show fewer chats in Agent Pulse'
+    });
+    expect(showLess).toHaveTextContent('Show less');
+
+    fireEvent.click(showLess);
+    expect(onShowLessThreads).toHaveBeenCalledWith(projectPath);
+  });
+
   it('fuzzy searches sidebar threads by title and project name', () => {
     render(
       <Dashboard

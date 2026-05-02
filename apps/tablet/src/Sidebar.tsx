@@ -1,7 +1,8 @@
-import type { HelperHealth, Project, Thread } from '@agent-pulse/shared';
+import type { HelperHealth, Project, Thread, ThreadListGroup } from '@agent-pulse/shared';
 import {
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Monitor,
   Moon,
   PanelLeftClose,
@@ -24,6 +25,7 @@ import { useThemePreference, type ThemePreference } from './theme';
 const COLLAPSED_KEY = 'agent-pulse:sidebar-collapsed';
 const COLLAPSED_GROUPS_KEY = 'agent-pulse:sidebar-collapsed-groups';
 const COLLAPSED_SECTIONS_KEY = 'agent-pulse:sidebar-collapsed-sections';
+const CHAT_GROUP_KEY = 'agent-pulse-chats';
 
 function readCollapsedFromStorage(): boolean {
   if (typeof window === 'undefined') {
@@ -78,12 +80,18 @@ function writeCollapsedSectionsToStorage(sections: Set<string>) {
 
 export type SidebarProps = {
   threads: Thread[];
+  threadListGroups?: ThreadListGroup[];
+  threadsLoading?: boolean;
+  loadingThreadGroupKey?: string;
+  expandedThreadGroupKeys?: Set<string>;
   projects?: Project[];
   activeThreadId?: string;
   seenThreadActivity?: Record<string, number>;
   workingThreadIds?: Set<string>;
   onSelectThread: (thread: Thread) => void;
   onNewThread?: (projectId?: string) => void;
+  onShowMoreThreads?: (groupKey: string) => void;
+  onShowLessThreads?: (groupKey: string) => void;
   onOpenSettings?: () => void;
   onGoHome?: () => void;
   health: HelperHealth;
@@ -93,6 +101,7 @@ export type SidebarProps = {
 
 type ProjectGroup = {
   section: 'chat' | 'project';
+  groupKey: string;
   workspace: string;
   workspacePath: string;
   project?: Project;
@@ -109,7 +118,7 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
   const groups = new Map<string, Thread[]>();
 
   for (const thread of threads) {
-    const key = thread.workspaceKind === 'chat' ? 'agent-pulse-chats' : thread.workspacePath ?? thread.workspace;
+    const key = thread.workspaceKind === 'chat' ? CHAT_GROUP_KEY : thread.workspacePath ?? thread.workspace;
     const existing = groups.get(key) ?? [];
     existing.push(thread);
     groups.set(key, existing);
@@ -127,8 +136,9 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
           projectByName.get(groupThreads[0]?.workspace ?? workspacePath);
       return {
         section: (isChatGroup ? 'chat' : 'project') as ProjectGroup['section'],
+        groupKey: isChatGroup ? CHAT_GROUP_KEY : workspacePath,
         workspace: isChatGroup ? 'Chats' : groupThreads[0]?.workspace ?? project?.name ?? workspacePath,
-        workspacePath: isChatGroup ? 'agent-pulse-chats' : project?.path ?? workspacePath,
+        workspacePath: isChatGroup ? CHAT_GROUP_KEY : project?.path ?? workspacePath,
         project,
         threads: sortThreadsByActivity(groupThreads)
       };
@@ -149,6 +159,7 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
     .filter((project) => !seenProjectPaths.has(project.path) && !groups.has(project.path))
     .map((project) => ({
       section: 'project' as const,
+      groupKey: project.path,
       workspace: project.name,
       workspacePath: project.path,
       project,
@@ -253,12 +264,18 @@ function ThemeQuickToggle({
 
 export function Sidebar({
   threads,
+  threadListGroups = [],
+  threadsLoading = false,
+  loadingThreadGroupKey,
+  expandedThreadGroupKeys = new Set<string>(),
   projects = [],
   activeThreadId,
   seenThreadActivity = {},
   workingThreadIds,
   onSelectThread,
   onNewThread,
+  onShowMoreThreads,
+  onShowLessThreads,
   onOpenSettings,
   onGoHome,
   health,
@@ -278,6 +295,10 @@ export function Sidebar({
   );
   const visibleChatGroups = visibleProjectGroups.filter((group) => group.section === 'chat');
   const visibleWorkspaceGroups = visibleProjectGroups.filter((group) => group.section === 'project');
+  const threadGroupByKey = useMemo(
+    () => new Map(threadListGroups.map((group) => [group.groupKey, group])),
+    [threadListGroups]
+  );
   const searchActive = searchQuery.trim().length > 0;
   const visibleThreadCount = visibleProjectGroups.reduce(
     (count, group) => count + group.threads.length,
@@ -376,6 +397,61 @@ export function Sidebar({
           ) : null}
           <span className="codex-sidebar-thread-time">{relativeTime(thread.lastActivityAt)}</span>
         </button>
+      </li>
+    );
+  };
+
+  const renderThreadPageActions = (group: ProjectGroup) => {
+    if (searchActive) {
+      return null;
+    }
+    const metadata = threadGroupByKey.get(group.groupKey);
+    const isExpanded = expandedThreadGroupKeys.has(group.groupKey);
+    const canShowMore = Boolean(metadata && metadata.total > metadata.visible && onShowMoreThreads);
+    const canShowLess = Boolean(isExpanded && onShowLessThreads);
+    if (!canShowMore && !canShowLess) {
+      return null;
+    }
+    const isLoading = threadsLoading && loadingThreadGroupKey === group.groupKey;
+    const hiddenCount = metadata ? Math.max(0, metadata.total - metadata.visible) : 0;
+
+    return (
+      <li className="codex-sidebar-load-more" key={`${group.groupKey}:thread-page-actions`}>
+        {isLoading ? (
+          <span className="codex-sidebar-load-more-status" role="status" aria-live="polite">
+            <span className="codex-sidebar-loading-spinner" aria-hidden="true" />
+            <span>Loading chats</span>
+          </span>
+        ) : (
+          <>
+            {canShowMore ? (
+              <button
+                type="button"
+                onClick={() => onShowMoreThreads?.(group.groupKey)}
+                aria-label={`Show more chats in ${group.workspace}`}
+              >
+                <ChevronDown size={13} aria-hidden="true" />
+                <span>Show more</span>
+                <span>
+                  {hiddenCount > 0
+                    ? `${hiddenCount} older chat${hiddenCount === 1 ? '' : 's'}`
+                    : 'older chats'}
+                </span>
+              </button>
+            ) : null}
+            {canShowLess ? (
+              <button
+                type="button"
+                onClick={() => onShowLessThreads?.(group.groupKey)}
+                aria-label={`Show fewer chats in ${group.workspace}`}
+              >
+                <ChevronUp size={13} aria-hidden="true" />
+                <span>Show less</span>
+                <span>latest 6</span>
+              </button>
+            ) : null}
+          </>
+        )}
       </li>
     );
   };
@@ -582,6 +658,12 @@ export function Sidebar({
       </div>
 
       <div className="codex-sidebar-thread-scroll" aria-label="Thread list">
+        {threadsLoading && threads.length === 0 ? (
+          <div className="codex-sidebar-loading" role="status" aria-live="polite">
+            <span className="codex-sidebar-loading-spinner" aria-hidden="true" />
+            <span>Loading chats</span>
+          </div>
+        ) : null}
         <div className={`codex-sidebar-section ${searchActive ? 'is-search-result' : ''}`}>
           <div className="codex-sidebar-section-heading">
             <button
@@ -637,6 +719,7 @@ export function Sidebar({
                         {group.threads.length === 0 ? (
                           <li className="codex-sidebar-empty-project">No chats yet</li>
                         ) : null}
+                        {renderThreadPageActions(group)}
                       </ul>
                     ) : null}
                   </div>
@@ -676,7 +759,12 @@ export function Sidebar({
           </div>
           {!chatsCollapsed ? (
             <ul className="codex-sidebar-threads codex-sidebar-chat-threads">
-              {visibleChatGroups.flatMap((group) => group.threads).map(renderThreadRow)}
+              {visibleChatGroups.map((group) => (
+                <Fragment key={group.groupKey}>
+                  {group.threads.map(renderThreadRow)}
+                  {renderThreadPageActions(group)}
+                </Fragment>
+              ))}
               {visibleChatCount === 0 ? (
                 <li className="codex-sidebar-empty-project">No chats yet</li>
               ) : null}

@@ -372,6 +372,57 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('drops stale approvals via clearPendingApprovalsForThread and notifies listeners', () => {
+    // Simulates the "stuck waiting_approval" bug: an approval entry was added
+    // but the matching resolution never arrived (e.g. lost ownership during
+    // a brief IPC disconnect). The poll loop calls clearPendingApprovalsForThread
+    // when Codex's authoritative remote status reports the thread as idle.
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onPendingApprovalsChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onPendingApprovalsChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-stuck',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['conversationState', 'requests', 0],
+            value: {
+              id: 'stale-permission-1',
+              method: 'item/permissions/requestApproval',
+              params: { reason: 'Approve permissions?' }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadWaitingForApproval('thread-stuck')).toBe(true);
+    expect(mirror.getPendingApprovalRequests('thread-stuck')).toHaveLength(1);
+
+    onPendingApprovalsChange.mockClear();
+    expect(mirror.clearPendingApprovalsForThread('thread-stuck')).toBe(true);
+
+    expect(mirror.isThreadWaitingForApproval('thread-stuck')).toBe(false);
+    expect(mirror.getPendingApprovalRequests('thread-stuck')).toEqual([]);
+    expect(onPendingApprovalsChange).toHaveBeenCalledWith({
+      threadId: 'thread-stuck',
+      requests: []
+    });
+
+    // Idempotent: calling again returns false and does not re-emit.
+    onPendingApprovalsChange.mockClear();
+    expect(mirror.clearPendingApprovalsForThread('thread-stuck')).toBe(false);
+    expect(onPendingApprovalsChange).not.toHaveBeenCalled();
+
+    mirror.dispose();
+  });
+
   it('exposes pending approval payloads via onPendingApprovalsChange and getPendingApprovalRequests', () => {
     const { ipc, setReady, emitBroadcast } = createMockIpc();
     setReady(true);

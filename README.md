@@ -86,6 +86,7 @@ More detailed product and architecture notes live here:
 
 - [docs/TOUCH_APP_REQUIREMENTS.md](docs/TOUCH_APP_REQUIREMENTS.md)
 - [docs/REMOTE_ACCESS_REQUIREMENTS.md](docs/REMOTE_ACCESS_REQUIREMENTS.md)
+- [docs/AGENT_PULSE_SUPERVISION_FEATURES.md](docs/AGENT_PULSE_SUPERVISION_FEATURES.md)
 
 ## Platform Requirements
 

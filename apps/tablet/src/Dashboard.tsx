@@ -7,14 +7,20 @@ import type {
   CollaborationModeKind,
   AgentProvider,
   HelperHealth,
+  ApprovalInboxItem,
+  HandoffPackage,
+  HandoffSummaryDraft,
   OlderThreadMessagesResponse,
   Project,
   Thread,
+  ThreadListGroup,
   ThreadMessageResponse,
-  ThreadTranscript
+  ThreadTranscript,
+  TouchCommand,
+  TranscriptCommentDraft
 } from '@agent-pulse/shared';
-import { CheckCheck, Menu, MessagesSquare, X } from 'lucide-react';
-import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
+import { CheckCheck, ClipboardCheck, Command, Menu, MessagesSquare, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import type { FetchThreadTranscriptOptions } from './api';
 import { DashboardInsights } from './DashboardInsights';
 import { ProviderMark } from './ProviderMark';
@@ -26,15 +32,45 @@ import { relativeTime, statusLabels, statusTone, isAttentionStatus, threadNeedsR
 
 const SEEN_ACTIVITY_KEY = 'agent-pulse:seen-thread-activity';
 const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
+const TOUCH_COMMAND_POSITION_KEY = 'agent-pulse:touch-command-position';
 
 export type DashboardProps = {
   health: HelperHealth;
   threads: Thread[];
+  threadListGroups?: ThreadListGroup[];
+  loadingThreadGroupKey?: string;
+  expandedThreadGroupKeys?: Set<string>;
   threadsLoaded?: boolean;
   activeThreadId?: string | null;
   onActiveThreadIdChange?: (threadId: string | undefined) => void;
   projects?: Project[];
+  handoffs?: HandoffPackage[];
+  approvalInboxItems?: ApprovalInboxItem[];
+  touchCommands?: TouchCommand[];
   onNewThread?: (target: NewThreadTarget) => Promise<Thread>;
+  onShowMoreThreads?: (groupKey: string) => void;
+  onShowLessThreads?: (groupKey: string) => void;
+  onCreateHandoffSummaryDraft?: (input: {
+    sourceThreadId: string;
+    targetProvider: AgentProvider;
+    userInstruction: string;
+  }) => Promise<HandoffSummaryDraft>;
+  onSendHandoff?: (input: {
+    sourceThreadId: string;
+    targetProvider: AgentProvider;
+    userInstruction: string;
+    summary: string;
+    prompt: string;
+  }) => Promise<HandoffPackage>;
+  onReturnHandoff?: (
+    handoffId: string,
+    input: { summary: string; prompt: string }
+  ) => Promise<void>;
+  onDismissHandoff?: (handoffId: string) => Promise<void>;
+  onCreateTranscriptCommentDraft?: (
+    threadId: string,
+    input: { messageId: string; selectedText: string; userInstruction?: string }
+  ) => Promise<TranscriptCommentDraft>;
   onOpenThreadInCodex?: (threadId: string) => Promise<void>;
   onDeleteThread?: (threadId: string) => Promise<void>;
   onOpenSettings?: () => void;
@@ -116,11 +152,24 @@ export type NewThreadTarget =
 export function Dashboard({
   health,
   threads,
+  threadListGroups = [],
+  loadingThreadGroupKey,
+  expandedThreadGroupKeys,
   threadsLoaded = true,
   activeThreadId: controlledActiveThreadId,
   onActiveThreadIdChange,
   projects = [],
+  handoffs = [],
+  approvalInboxItems = [],
+  touchCommands = [],
   onNewThread,
+  onShowMoreThreads,
+  onShowLessThreads,
+  onCreateHandoffSummaryDraft,
+  onSendHandoff,
+  onReturnHandoff,
+  onDismissHandoff,
+  onCreateTranscriptCommentDraft,
   onOpenThreadInCodex,
   onDeleteThread,
   onOpenSettings,
@@ -154,6 +203,18 @@ export function Dashboard({
   const [newThreadInitialProjectId, setNewThreadInitialProjectId] = useState<string | undefined>();
   const [newThreadError, setNewThreadError] = useState('');
   const [creatingTargetId, setCreatingTargetId] = useState<string | undefined>();
+  const [approvalInboxOpen, setApprovalInboxOpen] = useState(false);
+  const [commandSheetOpen, setCommandSheetOpen] = useState(false);
+  const [touchCommandPosition, setTouchCommandPosition] = useState<{
+    left: number;
+    top: number;
+  } | undefined>(() => readTouchCommandPosition());
+  const touchCommandDragRef = useRef<{
+    offsetX: number;
+    offsetY: number;
+    moved: boolean;
+    latestPosition?: { left: number; top: number };
+  } | null>(null);
   const [localSeenThreadActivity, setLocalSeenThreadActivity] = useState<Record<string, number>>(
     () => readSeenThreadActivity()
   );
@@ -373,12 +434,18 @@ export function Dashboard({
       ) : null}
       <Sidebar
         threads={visibleThreads}
+        threadListGroups={threadListGroups}
+        threadsLoading={!threadsLoaded}
+        loadingThreadGroupKey={loadingThreadGroupKey}
+        expandedThreadGroupKeys={expandedThreadGroupKeys}
         projects={projects}
         activeThreadId={activeThreadId}
         seenThreadActivity={seenThreadActivity}
         workingThreadIds={workingThreadIds}
         onSelectThread={handleSelectThread}
         onNewThread={handleNewThread}
+        onShowMoreThreads={onShowMoreThreads}
+        onShowLessThreads={onShowLessThreads}
         onOpenSettings={onOpenSettings}
         onGoHome={handleCloseThread}
         health={health}
@@ -428,6 +495,8 @@ export function Dashboard({
               threadReasoningEfforts[activeThread.threadId] ?? activeThread.reasoningEffort
             }
             pendingRequests={threadPendingRequests[activeThread.threadId] ?? []}
+            sourceHandoffs={handoffs.filter((handoff) => handoff.sourceThreadId === activeThread.threadId)}
+            incomingHandoffs={handoffs.filter((handoff) => handoff.targetThreadId === activeThread.threadId)}
             forceWorking={workingThreadIds.has(activeThread.threadId)}
             plugins={plugins}
             skills={skills}
@@ -451,6 +520,11 @@ export function Dashboard({
                     onApprovalDecision(activeThread.threadId, requestId, method, decision)
                 : undefined
             }
+            onCreateHandoffSummaryDraft={onCreateHandoffSummaryDraft}
+            onSendHandoff={onSendHandoff}
+            onReturnHandoff={onReturnHandoff}
+            onDismissHandoff={onDismissHandoff}
+            onCreateTranscriptCommentDraft={onCreateTranscriptCommentDraft}
           />
         ) : (
           <EmptyMain
@@ -461,15 +535,118 @@ export function Dashboard({
             seenThreadActivity={seenThreadActivity}
             onMarkAllReviewed={handleMarkAllReviewed}
             workingThreadIds={workingThreadIds}
+            approvalItems={approvalInboxItems}
+            onOpenApprovals={() => setApprovalInboxOpen(true)}
           />
         )}
       </main>
+      <button
+        type="button"
+        className={`touch-command-fab ${touchCommandPosition ? 'is-positioned' : ''}`}
+        style={
+          touchCommandPosition
+            ? { left: touchCommandPosition.left, top: touchCommandPosition.top }
+            : undefined
+        }
+        onPointerDown={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          touchCommandDragRef.current = {
+            offsetX: event.clientX - rect.left,
+            offsetY: event.clientY - rect.top,
+            moved: false,
+            latestPosition: touchCommandPosition ?? { left: rect.left, top: rect.top }
+          };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = touchCommandDragRef.current;
+          if (!drag) {
+            return;
+          }
+          const next = clampTouchCommandPosition({
+            left: event.clientX - drag.offsetX,
+            top: event.clientY - drag.offsetY
+          });
+          if (
+            Math.abs(next.left - (drag.latestPosition?.left ?? next.left)) > 2 ||
+            Math.abs(next.top - (drag.latestPosition?.top ?? next.top)) > 2
+          ) {
+            drag.moved = true;
+          }
+          drag.latestPosition = next;
+          setTouchCommandPosition(next);
+        }}
+        onPointerUp={(event) => {
+          const drag = touchCommandDragRef.current;
+          touchCommandDragRef.current = null;
+          try {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          } catch {
+            // Pointer capture may already be released by the browser.
+          }
+          if (drag?.latestPosition) {
+            saveTouchCommandPosition(drag.latestPosition);
+          }
+          if (!drag?.moved) {
+            setCommandSheetOpen(true);
+          }
+        }}
+        onClick={(event) => event.preventDefault()}
+        aria-label="Open command sheet"
+      >
+        <Command size={18} />
+        {approvalInboxItems.length > 0 ? (
+          <span className="touch-command-count">{approvalInboxItems.length}</span>
+        ) : null}
+      </button>
       {!activeThread ? (
         <DashboardInsights
           threads={visibleThreads}
           projects={projects}
           health={health}
           threadModels={threadModels}
+        />
+      ) : null}
+      {approvalInboxOpen ? (
+        <ApprovalInboxDrawer
+          items={approvalInboxItems}
+          threads={visibleThreads}
+          onSelectThread={(thread) => {
+            handleSelectThread(thread);
+            setApprovalInboxOpen(false);
+          }}
+          onClose={() => setApprovalInboxOpen(false)}
+        />
+      ) : null}
+      {commandSheetOpen ? (
+        <TouchCommandSheet
+          commands={touchCommands}
+          activeThread={activeThread}
+          onClose={() => setCommandSheetOpen(false)}
+          onNewThread={() => {
+            setCommandSheetOpen(false);
+            handleNewThread(activeThread?.workspacePath ? undefined : undefined);
+          }}
+          onShowApprovals={() => {
+            setCommandSheetOpen(false);
+            setApprovalInboxOpen(true);
+          }}
+          onSearch={() => {
+            setCommandSheetOpen(false);
+            setSidebarOpen(true);
+          }}
+          onOpenOnMac={() => {
+            setCommandSheetOpen(false);
+            if (activeThread) {
+              void onOpenThreadInCodex?.(activeThread.threadId);
+            }
+          }}
+          onStopWork={() => {
+            setCommandSheetOpen(false);
+            if (activeThread) {
+              void stopWork?.(activeThread.threadId);
+            }
+          }}
         />
       ) : null}
       {newThreadDialogOpen ? (
@@ -501,6 +678,48 @@ function targetKeyForNewThread(target: NewThreadTarget): string {
     return `chat:${target.provider ?? 'codex'}`;
   }
   return 'projectId' in target ? target.projectId : target.cwd;
+}
+
+function readTouchCommandPosition(): { left: number; top: number } | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(
+      window.localStorage.getItem(TOUCH_COMMAND_POSITION_KEY) ?? 'null'
+    ) as { left?: unknown; top?: unknown } | null;
+    if (typeof parsed?.left !== 'number' || typeof parsed.top !== 'number') {
+      return undefined;
+    }
+    return clampTouchCommandPosition({ left: parsed.left, top: parsed.top });
+  } catch {
+    return undefined;
+  }
+}
+
+function saveTouchCommandPosition(position: { left: number; top: number }): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.setItem(
+    TOUCH_COMMAND_POSITION_KEY,
+    JSON.stringify(clampTouchCommandPosition(position))
+  );
+}
+
+function clampTouchCommandPosition(position: { left: number; top: number }): {
+  left: number;
+  top: number;
+} {
+  if (typeof window === 'undefined') {
+    return position;
+  }
+  const size = 54;
+  const margin = 10;
+  return {
+    left: Math.min(Math.max(position.left, margin), window.innerWidth - size - margin),
+    top: Math.min(Math.max(position.top, margin), window.innerHeight - size - margin)
+  };
 }
 
 function readSeenThreadActivity(): Record<string, number> {
@@ -556,6 +775,142 @@ function markThreadSeen(
       [thread.threadId]: activityAt
     };
   });
+}
+
+function ApprovalInboxDrawer({
+  items,
+  threads,
+  onSelectThread,
+  onClose
+}: {
+  items: ApprovalInboxItem[];
+  threads: Thread[];
+  onSelectThread: (thread: Thread) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="approval-drawer-backdrop" role="presentation" onClick={onClose}>
+      <aside
+        className="approval-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Approvals"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="approval-drawer-header">
+          <div>
+            <h2>These agents need you.</h2>
+            <p>{items.length} waiting approval{items.length === 1 ? '' : 's'}</p>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close approvals">
+            <X size={18} />
+          </button>
+        </header>
+        <div className="approval-drawer-list">
+          {items.length === 0 ? (
+            <p className="approval-drawer-empty">No agents are waiting right now.</p>
+          ) : (
+            items.map((item) => {
+              const thread = threads.find((candidate) => candidate.threadId === item.threadId);
+              return (
+                <article key={item.id} className="approval-inbox-item" data-risk={item.riskLevel}>
+                  <div className="approval-inbox-item-main">
+                    <span className={`provider-inline provider-${providerTone(item.provider)}`}>
+                      <ProviderMark provider={item.provider} size="sm" />
+                      {providerLabel(item.provider)}
+                    </span>
+                    <h3>{item.threadTitle}</h3>
+                    <p>{item.shortReason}</p>
+                    {item.commandOrFileSummary ? <code>{item.commandOrFileSummary}</code> : null}
+                  </div>
+                  <div className="approval-inbox-item-actions">
+                    <span>{item.riskLevel} risk</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (thread) {
+                          onSelectThread(thread);
+                        }
+                      }}
+                      disabled={!thread}
+                    >
+                      Open thread
+                    </button>
+                  </div>
+                </article>
+              );
+            })
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function TouchCommandSheet({
+  commands,
+  activeThread,
+  onClose,
+  onNewThread,
+  onShowApprovals,
+  onSearch,
+  onOpenOnMac,
+  onStopWork
+}: {
+  commands: TouchCommand[];
+  activeThread?: Thread;
+  onClose: () => void;
+  onNewThread: () => void;
+  onShowApprovals: () => void;
+  onSearch: () => void;
+  onOpenOnMac: () => void;
+  onStopWork: () => void;
+}) {
+  const runCommand = (command: TouchCommand) => {
+    if (!command.enabled) return;
+    if (command.action === 'new_thread') onNewThread();
+    if (command.action === 'show_approvals') onShowApprovals();
+    if (command.action === 'search_threads') onSearch();
+    if (command.action === 'open_on_mac') onOpenOnMac();
+    if (command.action === 'stop_work') onStopWork();
+  };
+
+  return (
+    <div className="touch-sheet-backdrop" role="presentation" onClick={onClose}>
+      <section
+        className="touch-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command sheet"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="touch-sheet-header">
+          <div>
+            <h2>Actions</h2>
+            <p>{activeThread ? activeThread.title : 'Dashboard'}</p>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close actions">
+            <X size={18} />
+          </button>
+        </header>
+        <div className="touch-sheet-grid">
+          {commands.map((command) => (
+            <button
+              key={command.id}
+              type="button"
+              className="touch-sheet-action"
+              onClick={() => runCommand(command)}
+              disabled={!command.enabled}
+              title={command.disabledReason}
+            >
+              <span>{command.label}</span>
+              <small>{command.enabled ? command.description : command.disabledReason}</small>
+            </button>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function NewThreadDialog({
@@ -865,7 +1220,9 @@ function EmptyMain({
   isLoading = false,
   seenThreadActivity = {},
   onMarkAllReviewed,
-  workingThreadIds = new Set()
+  workingThreadIds = new Set(),
+  approvalItems = [],
+  onOpenApprovals
 }: {
   threads: Thread[];
   onOpenSidebar: () => void;
@@ -874,6 +1231,8 @@ function EmptyMain({
   seenThreadActivity?: Record<string, number>;
   onMarkAllReviewed?: () => void;
   workingThreadIds?: Set<string>;
+  approvalItems?: ApprovalInboxItem[];
+  onOpenApprovals?: () => void;
 }) {
   const running = threads.filter(
     t => workingThreadIds.has(t.threadId) || t.status === 'running' || t.status === 'compacting'
@@ -994,6 +1353,14 @@ function EmptyMain({
               </div>
             </div>
 
+            {approvalItems.length > 0 ? (
+              <button className="approval-inbox-banner" type="button" onClick={onOpenApprovals}>
+                <ClipboardCheck size={18} aria-hidden="true" />
+                <span>These agents need you.</span>
+                <strong>{approvalItems.length}</strong>
+              </button>
+            ) : null}
+
             {reviewThreads.length > 0 && (
               <div className="codex-home-card">
                 <div className="codex-home-card-header">
@@ -1084,33 +1451,38 @@ function EmptyMain({
               <div className="codex-home-card">
                 <h2 className="codex-home-card-title">Recent threads</h2>
                 <div className="codex-home-thread-list">
-                  {recentThreads.map((t) => (
-                    <button
-                      key={t.threadId}
-                      className={`codex-home-tile codex-home-thread-row provider-${providerTone(t.provider)}`}
-                      type="button"
-                      onClick={() => onSelectThread(t)}
-                      aria-label={`Open ${providerLabel(t.provider)} chat ${t.title}`}
-                    >
-                      <span
-                        className={`codex-home-thread-dot ${isLiveThread(t) ? 'is-working' : ''}`}
-                        style={{
-                          background: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)],
-                          color: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)]
-                        }}
-                        aria-hidden="true"
-                      />
-                      <span
-                        className={`codex-home-thread-mark provider-${providerTone(t.provider)}`}
-                        aria-hidden="true"
+                  {recentThreads.map((t) => {
+                    const showStatusDot = isLiveThread(t);
+                    return (
+                      <button
+                        key={t.threadId}
+                        className={`codex-home-tile codex-home-thread-row ${showStatusDot ? '' : 'is-reviewed'} provider-${providerTone(t.provider)}`}
+                        type="button"
+                        onClick={() => onSelectThread(t)}
+                        aria-label={`Open ${providerLabel(t.provider)} chat ${t.title}`}
                       >
-                        <ProviderMark provider={t.provider} size="sm" />
-                      </span>
-                      <span className="codex-home-thread-title">{t.title}</span>
-                      <span className="codex-home-thread-workspace">{t.workspace}</span>
-                      <span className="codex-home-thread-time">{relativeTime(t.lastActivityAt)}</span>
-                    </button>
-                  ))}
+                        {showStatusDot ? (
+                          <span
+                            className="codex-home-thread-dot is-working"
+                            style={{
+                              background: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)],
+                              color: EMPTY_MAIN_TONE_COLOR[threadDotTone(t)]
+                            }}
+                            aria-hidden="true"
+                          />
+                        ) : null}
+                        <span
+                          className={`codex-home-thread-mark provider-${providerTone(t.provider)}`}
+                          aria-hidden="true"
+                        >
+                          <ProviderMark provider={t.provider} size="sm" />
+                        </span>
+                        <span className="codex-home-thread-title">{t.title}</span>
+                        <span className="codex-home-thread-workspace">{t.workspace}</span>
+                        <span className="codex-home-thread-time">{relativeTime(t.lastActivityAt)}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}

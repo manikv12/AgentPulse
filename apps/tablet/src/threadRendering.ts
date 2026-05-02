@@ -52,13 +52,23 @@ export type RenderableEntry =
 
 export function buildRenderableEntries(
   messages: ChatMessage[],
-  options: { isLive?: boolean } = {}
+  options: { isLive?: boolean; preserveInputOrder?: boolean } = {}
 ): RenderableEntry[] {
   const result: RenderableEntry[] = [];
   let turnBuffer: ChatMessage[] = [];
   let leadingBuffer: ChatMessage[] = [];
   let hasVisibleUserTurn = false;
-  const orderedMessages = sortMessagesByCreatedAt(messages);
+  // `preserveInputOrder` is set when the caller has already arranged the
+  // messages in the exact rendering order it wants (e.g. an optimistic pending
+  // user bubble interleaved with helper-side messages whose clocks may not be
+  // monotonic with the tablet's). Sorting by createdAt in that case can flip
+  // tool messages above the just-sent user bubble whenever the tablet's clock
+  // is even slightly ahead of the helper's — the user sees the activity group
+  // jump above their message until reconciliation. Skipping the sort keeps the
+  // intentional input order intact.
+  const orderedMessages = options.preserveInputOrder
+    ? messages
+    : sortMessagesByCreatedAt(messages);
 
   const flushTurn = () => {
     if (turnBuffer.length === 0) {

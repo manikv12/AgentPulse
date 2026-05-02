@@ -142,6 +142,183 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('lists only the first page per project and expands one project on request', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const workspacePath = '/Users/test/projects/CodexPulse';
+    const threads: Thread[] = Array.from({ length: 14 }, (_, index) => ({
+      threadId: `thread-${index}`,
+      provider: 'codex',
+      title: `Thread ${index}`,
+      workspace: 'CodexPulse',
+      workspacePath,
+      status: 'idle',
+      lastActivityAt: new Date(Date.parse('2026-05-02T12:00:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+    const listThreads = vi.fn(async (options?: { defaultLimit?: number; groupLimits?: Map<string, number> }) => {
+      const limit = options?.groupLimits?.get(workspacePath) ?? options?.defaultLimit ?? threads.length;
+      return threads.slice(0, limit);
+    });
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const defaultResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(defaultResponse.status).toBe(200);
+      await expect(defaultResponse.json()).resolves.toMatchObject({
+        threads: threads.slice(0, 6),
+        groups: [{ groupKey: workspacePath, total: 7, visible: 6 }]
+      });
+
+      const expandedUrl = new URL(`${server.url}/threads/list`);
+      expandedUrl.searchParams.append('groupLimit', JSON.stringify({ groupKey: workspacePath, limit: 12 }));
+      const expandedResponse = await fetch(expandedUrl, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(expandedResponse.status).toBe(200);
+      await expect(expandedResponse.json()).resolves.toMatchObject({
+        threads: threads.slice(0, 12),
+        groups: [{ groupKey: workspacePath, total: 13, visible: 12 }]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('creates clean handoff summaries from conversation messages instead of tool logs', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-watch',
+      provider: 'codex',
+      title: 'Apple Watch requirements',
+      workspace: 'CodexPulse',
+      workspacePath: '/Users/test/CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-05-02T14:10:00Z',
+      lastTurnSummary: 'Prepared watch app requirements.'
+    };
+    const transcript: ThreadTranscript = {
+      threadId: thread.threadId,
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Can we make an Apple Watch app and save docs/WATCH_APP_REQUIREMENTS.md?',
+          createdAt: '2026-05-02T14:01:00Z'
+        },
+        {
+          id: 'tool-1',
+          role: 'activity',
+          kind: 'tool',
+          text: 'apply_patch failed with noisy raw tool payload',
+          createdAt: '2026-05-02T14:02:00Z'
+        },
+        {
+          id: 'command-1',
+          role: 'activity',
+          kind: 'command',
+          text: 'cat > docs/WATCH_APP_REQUIREMENTS.md <<EOF',
+          createdAt: '2026-05-02T14:03:00Z'
+        },
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: [
+            'I could not persist the file because this session has no write permission.',
+            '',
+            'Research-locked decisions:',
+            '- Native watchOS app with SwiftUI.',
+            '- Reuse the existing Agent Pulse helper API.',
+            '- The first release should use APNs for timely background awareness.',
+            '',
+            'Next, create docs/WATCH_APP_REQUIREMENTS.md and link it from README.md.'
+          ].join('\n'),
+          createdAt: '2026-05-02T14:04:00Z'
+        }
+      ]
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer: {
+        isConnected: () => true,
+        readTranscript: vi.fn(async () => transcript),
+        sendMessage: vi.fn()
+      },
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/handoffs/summary-draft`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          sourceThreadId: thread.threadId,
+          targetProvider: 'claude-code',
+          userInstruction: 'Implement the watch requirements doc.'
+        })
+      });
+      const body = (await response.json()) as { draft: { summary: string; evidence: { messageCount: number } } };
+
+      expect(response.status).toBe(200);
+      expect(body.draft.summary).toContain('Native watchOS app with SwiftUI.');
+      expect(body.draft.summary).toContain('Reuse the existing Agent Pulse helper API.');
+      expect(body.draft.summary).toContain('could not persist the file');
+      expect(body.draft.summary).toContain('docs/WATCH_APP_REQUIREMENTS.md');
+      expect(body.draft.summary).not.toContain('apply_patch');
+      expect(body.draft.summary).not.toContain('cat >');
+      expect(body.draft.summary).not.toContain('Messages inspected');
+      expect(body.draft.evidence.messageCount).toBe(2);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('hides disabled providers and blocks starting them', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);

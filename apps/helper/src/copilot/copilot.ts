@@ -174,6 +174,11 @@ type CopilotProviderOptions = {
   usageReader?: { readUsage(): Promise<ThreadUsage | undefined> };
 };
 
+type CopilotThreadListOptions = {
+  defaultLimit?: number;
+  groupLimits?: Map<string, number> | Record<string, number>;
+};
+
 type ParsedCopilotSession = {
   nativeSessionId: string;
   threadId: string;
@@ -186,6 +191,13 @@ type ParsedCopilotSession = {
   model?: string;
   reasoningEffort?: string;
   messages: ChatMessage[];
+};
+
+type CopilotSessionCandidate = {
+  nativeSessionId: string;
+  dirPath: string;
+  workspacePath: string;
+  lastActivityMs: number;
 };
 
 type DraftCopilotThread = {
@@ -256,8 +268,8 @@ export class CopilotProvider {
     return () => this.liveStateListeners.delete(listener);
   }
 
-  async listThreads(): Promise<Thread[]> {
-    const sessions = await this.readSessions();
+  async listThreads(options: CopilotThreadListOptions = {}): Promise<Thread[]> {
+    const sessions = await this.readSessions(options);
     const threads = sessions.map((session) => this.threadFromSession(session));
     for (const draft of this.drafts.values()) {
       if (!threads.some((thread) => thread.threadId === draft.thread.threadId)) {
@@ -268,12 +280,9 @@ export class CopilotProvider {
   }
 
   async listProjects(): Promise<Project[]> {
-    const sessions = await this.readSessions();
     const paths = new Set<string>();
-    for (const session of sessions) {
-      if (path.isAbsolute(session.workspacePath)) {
-        paths.add(session.workspacePath);
-      }
+    for (const workspacePath of await this.readProjectPaths()) {
+      paths.add(workspacePath);
     }
     for (const draft of this.drafts.values()) {
       paths.add(draft.cwd);
@@ -399,7 +408,23 @@ export class CopilotProvider {
       '--stream',
       'on',
       '--no-color',
-      ...(promptInput.hasLocalReferences ? ['--allow-all-paths'] : []),
+      // Run in autopilot, non-interactive: there is no user terminal attached
+      // to the CLI, so any tool that requires per-call approval (which is the
+      // default) fails immediately with `code: denied / message: "Permission
+      // denied and could not request permission from user"`. The Copilot CLI
+      // help text spells this out: --allow-all-tools is "required for
+      // non-interactive mode". Without these flags, the agent can read files
+      // but every write/patch/shell tool fails silently and the user only sees
+      // the agent give up partway.
+      //
+      // OpenAssist's Copilot integration uses --acp + session/set_mode
+      // autopilot to achieve the same effect over the Agent Client Protocol
+      // transport. We're on the prompt-based transport, so the equivalent is
+      // these CLI flags + --mode autopilot.
+      '--mode',
+      'autopilot',
+      '--allow-all-tools',
+      '--allow-all-paths',
       ...(model ? ['--model', model] : []),
       ...(effort ? ['--effort', effort] : [])
     ];
@@ -556,18 +581,25 @@ export class CopilotProvider {
     this.liveSessions.clear();
   }
 
-  private async readSessions(): Promise<ParsedCopilotSession[]> {
-    const stateDir = path.join(this.copilotHome, 'session-state');
-    let dirs;
-    try {
-      dirs = await readdir(stateDir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
+  private async readProjectPaths(): Promise<string[]> {
+    const candidates = await this.readSessionCandidates();
+    return [...new Set(candidates.map((candidate) => candidate.workspacePath))].filter((workspacePath) =>
+      path.isAbsolute(workspacePath)
+    );
+  }
+
+  private async readSessions(options: CopilotThreadListOptions = {}): Promise<ParsedCopilotSession[]> {
+    const candidates = await this.readSessionCandidates();
+    const selected = limitCopilotSessionCandidates(
+      candidates,
+      options.defaultLimit ?? MAX_SESSIONS,
+      options.groupLimits
+    );
     const sessions: ParsedCopilotSession[] = [];
-    for (const dir of dirs) {
-      if (!dir.isDirectory()) continue;
-      const parsed = await parseCopilotSessionDir(path.join(stateDir, dir.name), dir.name).catch(() => undefined);
+    for (const candidate of selected) {
+      const parsed = await parseCopilotSessionDir(candidate.dirPath, candidate.nativeSessionId).catch(
+        () => undefined
+      );
       if (parsed) {
         sessions.push(parsed);
       }
@@ -576,6 +608,40 @@ export class CopilotProvider {
       }
     }
     return sessions.sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt));
+  }
+
+  private async readSessionCandidates(): Promise<CopilotSessionCandidate[]> {
+    const stateDir = path.join(this.copilotHome, 'session-state');
+    let dirs;
+    try {
+      dirs = await readdir(stateDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const candidates: CopilotSessionCandidate[] = [];
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      const dirPath = path.join(stateDir, dir.name);
+      const dirStat = await stat(dirPath).catch(() => undefined);
+      if (!dirStat) continue;
+      const workspacePath = path.join(dirPath, 'workspace.yaml');
+      const workspace = parseSimpleYaml(await readFile(workspacePath, 'utf8').catch(() => ''));
+      const cwd = workspace.cwd ?? workspace.git_root ?? '';
+      if (!path.isAbsolute(cwd)) continue;
+      const lastActivity = Date.parse(
+        timestampToIso(workspace.updated_at ?? workspace.created_at, dirStat.mtime)
+      );
+      candidates.push({
+        nativeSessionId: dir.name,
+        dirPath,
+        workspacePath: cwd,
+        lastActivityMs: Number.isFinite(lastActivity) ? lastActivity : dirStat.mtimeMs
+      });
+      if (candidates.length >= MAX_SESSIONS) {
+        break;
+      }
+    }
+    return candidates.sort((a, b) => b.lastActivityMs - a.lastActivityMs);
   }
 
   private async readSessionByNativeId(nativeSessionId: string): Promise<ParsedCopilotSession | undefined> {
@@ -982,6 +1048,18 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
           id: stringField(data, 'messageId') ?? stringField(payload, 'id') ?? `copilot-assistant:${index}`,
           role: 'assistant',
           kind: 'message',
+          // Mark every parsed assistant message as final_answer so the
+          // renderer's findFinalResponseIndex (Pass 1) can carve the latest
+          // one out as the visible answer bubble. Without this, Copilot turns
+          // that emitted multiple `assistant.message` chunks (a Copilot CLI
+          // quirk where it streams progress updates as separate assistant
+          // messages before the final big answer) end up with NO message
+          // matching `phase === 'final_answer'`, so the entire 15 kB final
+          // text gets buried inside the activity group as a "progress update"
+          // item and the user only sees the collapsed "Used the browser N
+          // times" header. Pass 1 walks backward and picks the latest match,
+          // so intermediate messages naturally collapse into the group.
+          phase: 'final_answer',
           text,
           createdAt: timestamp
         }));
@@ -1050,6 +1128,41 @@ function parseSimpleYaml(content: string): Record<string, string> {
     result[key] = rawValue.replace(/^['"]|['"]$/g, '').trim();
   }
   return result;
+}
+
+function limitCopilotSessionCandidates(
+  candidates: CopilotSessionCandidate[],
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {}
+): CopilotSessionCandidate[] {
+  const counts = new Map<string, number>();
+  return candidates.filter((candidate) => {
+    const limit = threadGroupLimit(candidate.workspacePath, defaultLimit, groupLimits, MAX_SESSIONS);
+    const count = counts.get(candidate.workspacePath) ?? 0;
+    if (count >= limit) {
+      return false;
+    }
+    counts.set(candidate.workspacePath, count + 1);
+    return true;
+  });
+}
+
+function threadGroupLimit(
+  groupKey: string,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {},
+  maxLimit = MAX_SESSIONS
+): number {
+  const explicitLimit =
+    groupLimits instanceof Map
+      ? groupLimits.get(groupKey)
+      : Object.prototype.hasOwnProperty.call(groupLimits, groupKey)
+        ? groupLimits[groupKey]
+        : undefined;
+  const limit = explicitLimit ?? defaultLimit;
+  return Number.isFinite(limit) && limit > 0
+    ? Math.min(maxLimit, Math.floor(limit))
+    : Math.min(maxLimit, defaultLimit);
 }
 
 function mergeLiveMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessage[] {

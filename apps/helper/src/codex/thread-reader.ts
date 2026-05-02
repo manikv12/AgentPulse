@@ -46,6 +46,11 @@ export type CodexThreadReaderOptions = {
   chatRoot?: string;
 };
 
+export type CodexThreadListOptions = {
+  defaultLimit?: number;
+  groupLimits?: Map<string, number> | Record<string, number>;
+};
+
 export type CodexSidebarState = {
   savedWorkspaceRoots: string[];
   activeWorkspaceRoots: string[];
@@ -81,9 +86,13 @@ export class CodexThreadReader {
     this.chatRoot = options.chatRoot;
   }
 
-  async listThreads(): Promise<Thread[]> {
-    const { entries } = await this.readVisibleThreadEntries();
-    return limitCodexSidebarHistory(entries.map(({ thread }) => thread), this.maxIdleThreadsPerProject);
+  async listThreads(options: CodexThreadListOptions = {}): Promise<Thread[]> {
+    const { entries } = await this.readVisibleThreadEntries(options);
+    return limitCodexSidebarHistory(
+      entries.map(({ thread }) => thread),
+      options.defaultLimit ?? this.maxIdleThreadsPerProject,
+      options.groupLimits
+    );
   }
 
   async listProjects(): Promise<Project[]> {
@@ -195,12 +204,18 @@ export class CodexThreadReader {
     }
   }
 
-  private async readVisibleThreadEntries(): Promise<{
+  private async readVisibleThreadEntries(options: CodexThreadListOptions = {}): Promise<{
     sidebarState: CodexSidebarState;
     entries: VisibleThreadEntry[];
   }> {
     const sidebarState = await this.readSidebarState();
-    const rows = await this.readSqliteRows();
+    const rows = limitCodexRowsByWorkspace(
+      await this.readSqliteRows(),
+      sidebarState,
+      options.defaultLimit ?? this.maxIdleThreadsPerProject,
+      options.groupLimits,
+      this.chatRoot
+    );
     const entries = await Promise.all(
       rows.map(async (row) => {
         const workspaceRoot = resolveThreadWorkspaceRoot(row, sidebarState);
@@ -302,7 +317,8 @@ export function orderedCodexSidebarProjectRoots(sidebarState: CodexSidebarState)
 
 export function limitCodexSidebarHistory(
   threads: Thread[],
-  maxIdleThreadsPerProject: number
+  maxIdleThreadsPerProject: number,
+  groupLimits: Map<string, number> | Record<string, number> = {}
 ): Thread[] {
   const idleCounts = new Map<string, number>();
 
@@ -311,14 +327,56 @@ export function limitCodexSidebarHistory(
       return true;
     }
 
-    const count = idleCounts.get(thread.workspace) ?? 0;
-    if (count >= maxIdleThreadsPerProject) {
+    const key = thread.workspaceKind === 'chat'
+      ? 'agent-pulse-chats'
+      : thread.workspacePath ?? thread.workspace;
+    const limit = threadGroupLimit(key, maxIdleThreadsPerProject, groupLimits);
+    const count = idleCounts.get(key) ?? 0;
+    if (count >= limit) {
       return false;
     }
 
-    idleCounts.set(thread.workspace, count + 1);
+    idleCounts.set(key, count + 1);
     return true;
   });
+}
+
+function limitCodexRowsByWorkspace(
+  rows: SqliteThreadRow[],
+  sidebarState: CodexSidebarState,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {},
+  chatRoot?: string
+): SqliteThreadRow[] {
+  const counts = new Map<string, number>();
+  return rows.filter((row) => {
+    const workspaceRoot = resolveThreadWorkspaceRoot(row, sidebarState);
+    const key = isCodexChatWorkspaceRoot(workspaceRoot, chatRoot)
+      ? 'agent-pulse-chats'
+      : workspaceRoot;
+    const limit = threadGroupLimit(key, defaultLimit, groupLimits);
+    const count = counts.get(key) ?? 0;
+    if (count >= limit) {
+      return false;
+    }
+    counts.set(key, count + 1);
+    return true;
+  });
+}
+
+function threadGroupLimit(
+  groupKey: string,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number>
+): number {
+  const explicitLimit =
+    groupLimits instanceof Map
+      ? groupLimits.get(groupKey)
+      : Object.prototype.hasOwnProperty.call(groupLimits, groupKey)
+        ? groupLimits[groupKey]
+        : undefined;
+  const limit = explicitLimit ?? defaultLimit;
+  return Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : defaultLimit;
 }
 
 export function isUserFacingThreadSource(source: string | undefined): boolean {
