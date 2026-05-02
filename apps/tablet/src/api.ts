@@ -1,10 +1,15 @@
 import {
   ApprovalDecisionResponseSchema,
+  ApprovalInboxResponseSchema,
   CatalogCommandsResponseSchema,
   CatalogModelsResponseSchema,
   CatalogPluginsResponseSchema,
   CatalogSkillsResponseSchema,
   HelperHealthSchema,
+  HandoffDeleteResponseSchema,
+  HandoffListResponseSchema,
+  HandoffPackageResponseSchema,
+  HandoffSummaryDraftResponseSchema,
   PairingDeviceListResponseSchema,
   PairResponseSchema,
   PendingApprovalRequestSchema,
@@ -18,6 +23,8 @@ import {
   ThreadMessageResponseSchema,
   ThreadModelUpdateResponseSchema,
   ThreadStopResponseSchema,
+  TouchCommandSheetResponseSchema,
+  TranscriptCommentDraftResponseSchema,
   ThreadTranscriptSchema,
   OlderThreadMessagesResponseSchema,
   ThreadListResponseSchema,
@@ -28,16 +35,23 @@ import {
   type CatalogModel,
   type CatalogPlugin,
   type CatalogSkill,
+  type ChatAttachment,
   type HelperHealth,
+  type ApprovalInboxItem,
+  type HandoffPackage,
+  type HandoffSummaryDraft,
   type PairingDeviceOption,
   type PendingApprovalRequest,
   type Project,
   type ProjectFilesResponse,
   type RemoteAccessSettings,
   type Thread,
+  type ThreadListGroup,
   type ThreadMessageResponse,
   type ThreadDeleteResponse,
   type ThreadStopResponse,
+  type TouchCommand,
+  type TranscriptCommentDraft,
   type ThreadTranscript,
   type OlderThreadMessagesResponse
 } from '@agent-pulse/shared';
@@ -52,6 +66,15 @@ export type AgentPulseSession = {
 
 export type FetchThreadTranscriptOptions = {
   messageLimit?: number;
+};
+
+export type FetchThreadListOptions = {
+  groupLimits?: Record<string, number>;
+};
+
+export type FetchThreadListResult = {
+  threads: Thread[];
+  groups: ThreadListGroup[];
 };
 
 export type HelperSettingsSnapshot = {
@@ -310,9 +333,24 @@ export async function recoverDeviceSession(
 
 async function responseErrorMessage(response: Response, fallback: string): Promise<string> {
   try {
-    const body = (await response.json()) as { error?: unknown };
-    if (typeof body.error === 'string' && body.error.trim()) {
-      return body.error;
+    const contentType = response.headers?.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const message = await readJsonErrorMessage(response);
+      return message ?? fallback;
+    }
+
+    const jsonResponse = typeof response.clone === 'function' ? response.clone() : response;
+    const jsonMessage = await readJsonErrorMessage(jsonResponse);
+    if (jsonMessage) {
+      return jsonMessage;
+    }
+
+    if (typeof response.text === 'function') {
+      const body = await response.text();
+      const trimmed = body.replace(/\s+/g, ' ').trim();
+      if (trimmed) {
+        return `${fallback} ${response.status}: ${trimmed.slice(0, 220)}`;
+      }
     }
   } catch {
     return fallback;
@@ -321,14 +359,51 @@ async function responseErrorMessage(response: Response, fallback: string): Promi
   return fallback;
 }
 
-export async function fetchThreads(session: AgentPulseSession): Promise<Thread[]> {
-  const response = await authedFetch('/threads/list', session);
+async function readJsonErrorMessage(response: Response): Promise<string | undefined> {
+  if (typeof response.json !== 'function') {
+    return undefined;
+  }
+
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    return typeof body.error === 'string' && body.error.trim() ? body.error : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function fetchThreadList(
+  session: AgentPulseSession,
+  options: FetchThreadListOptions = {}
+): Promise<FetchThreadListResult> {
+  const response = await authedFetch(threadListUrl(options), session);
   if (!response.ok) {
     throw response;
   }
 
   const parsed = ThreadListResponseSchema.parse(await response.json());
-  return parsed.threads;
+  return {
+    threads: parsed.threads,
+    groups: parsed.groups ?? []
+  };
+}
+
+export async function fetchThreads(session: AgentPulseSession): Promise<Thread[]> {
+  return (await fetchThreadList(session)).threads;
+}
+
+function threadListUrl(options: FetchThreadListOptions): string {
+  const params = new URLSearchParams();
+  for (const [groupKey, limit] of Object.entries(options.groupLimits ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b)
+  )) {
+    if (!groupKey || !Number.isFinite(limit) || limit <= 0) {
+      continue;
+    }
+    params.append('groupLimit', JSON.stringify({ groupKey, limit: Math.floor(limit) }));
+  }
+  const query = params.toString();
+  return query ? `/threads/list?${query}` : '/threads/list';
 }
 
 export async function fetchSeenThreadActivity(
@@ -379,8 +454,48 @@ export async function fetchProjects(session: AgentPulseSession): Promise<Project
   return parsed.projects;
 }
 
+export async function fetchApprovalInbox(
+  session: AgentPulseSession
+): Promise<ApprovalInboxItem[]> {
+  const response = await authedFetch('/approvals/inbox', session);
+  if (!response.ok) {
+    throw response;
+  }
+  return ApprovalInboxResponseSchema.parse(await response.json()).items;
+}
+
+export async function fetchTouchCommands(
+  session: AgentPulseSession,
+  threadId?: string
+): Promise<TouchCommand[]> {
+  const path = threadId
+    ? `/commands/touch-sheet?threadId=${encodeURIComponent(threadId)}`
+    : '/commands/touch-sheet';
+  const response = await authedFetch(path, session);
+  if (!response.ok) {
+    throw response;
+  }
+  return TouchCommandSheetResponseSchema.parse(await response.json()).commands;
+}
+
+export async function createTranscriptCommentDraft(
+  session: AgentPulseSession,
+  threadId: string,
+  input: { messageId: string; selectedText: string; userInstruction?: string }
+): Promise<TranscriptCommentDraft> {
+  const response = await authedFetch(`/threads/${encodeURIComponent(threadId)}/comment-draft`, session, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not prepare a comment reply.'));
+  }
+  return TranscriptCommentDraftResponseSchema.parse(await response.json()).draft;
+}
+
 export type StartThreadTarget =
   | string
+  | { location: 'chat'; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
   | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
   | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string };
 
@@ -395,10 +510,82 @@ export async function startThread(
   });
 
   if (!response.ok) {
-    throw new Error(await responseErrorMessage(response, 'Could not create a Codex thread.'));
+    throw new Error(await responseErrorMessage(response, 'Could not create a new chat.'));
   }
 
   return ThreadCreateResponseSchema.parse(await response.json());
+}
+
+export async function fetchHandoffs(session: AgentPulseSession): Promise<HandoffPackage[]> {
+  const response = await authedFetch('/handoffs', session);
+  if (!response.ok) {
+    throw response;
+  }
+  return HandoffListResponseSchema.parse(await response.json()).handoffs;
+}
+
+export async function createHandoffSummaryDraft(
+  session: AgentPulseSession,
+  input: {
+    sourceThreadId: string;
+    targetProvider: AgentProvider;
+    userInstruction: string;
+  }
+): Promise<HandoffSummaryDraft> {
+  const response = await authedFetch('/handoffs/summary-draft', session, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not create a handoff summary.'));
+  }
+  return HandoffSummaryDraftResponseSchema.parse(await response.json()).draft;
+}
+
+export async function sendHandoff(
+  session: AgentPulseSession,
+  input: {
+    sourceThreadId: string;
+    targetProvider: AgentProvider;
+    userInstruction: string;
+    summary: string;
+    prompt: string;
+    target?: Exclude<StartThreadTarget, string>;
+  }
+): Promise<HandoffPackage> {
+  const response = await authedFetch('/handoffs/send', session, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not hand off this task.'));
+  }
+  return HandoffPackageResponseSchema.parse(await response.json()).handoff;
+}
+
+export async function returnHandoff(
+  session: AgentPulseSession,
+  handoffId: string,
+  input: { summary: string; prompt: string }
+): Promise<void> {
+  const response = await authedFetch(`/handoffs/${encodeURIComponent(handoffId)}/return`, session, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not return this handoff.'));
+  }
+  HandoffDeleteResponseSchema.parse(await response.json());
+}
+
+export async function deleteHandoff(session: AgentPulseSession, handoffId: string): Promise<void> {
+  const response = await authedFetch(`/handoffs/${encodeURIComponent(handoffId)}`, session, {
+    method: 'DELETE'
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not dismiss this handoff.'));
+  }
+  HandoffDeleteResponseSchema.parse(await response.json());
 }
 
 export async function openThreadInCodex(
@@ -495,13 +682,14 @@ export async function sendThreadMessage(
   session: AgentPulseSession,
   threadId: string,
   text: string,
-  options: { collaborationMode?: CollaborationModeKind } = {}
+  options: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] } = {}
 ): Promise<ThreadMessageResponse> {
   const response = await authedFetch(`/threads/${encodeURIComponent(threadId)}/messages`, session, {
     method: 'POST',
     body: JSON.stringify({
       text,
-      ...(options.collaborationMode ? { collaborationMode: options.collaborationMode } : {})
+      ...(options.collaborationMode ? { collaborationMode: options.collaborationMode } : {}),
+      ...(options.attachments?.length ? { attachments: options.attachments } : {})
     })
   });
 
@@ -524,8 +712,12 @@ export async function stopThreadWork(
     const body = (await response.json().catch(() => undefined)) as
       | { error?: unknown; reason?: unknown }
       | undefined;
+    // Generic fallback — the same /stop endpoint handles Codex, Claude Code,
+    // and Copilot threads, so the provider-specific message belongs in the
+    // helper's response body when relevant. Hardcoding "Codex" here surfaced
+    // the wrong provider name for Copilot/Claude threads.
     const message =
-      typeof body?.error === 'string' && body.error.trim() ? body.error : 'Could not stop Codex.';
+      typeof body?.error === 'string' && body.error.trim() ? body.error : 'Could not stop the agent.';
     const reason = typeof body?.reason === 'string' && body.reason.trim() ? body.reason : undefined;
     throw new AgentPulseApiError(message, response.status, reason);
   }

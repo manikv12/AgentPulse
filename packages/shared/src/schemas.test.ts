@@ -73,6 +73,34 @@ describe('shared schemas', () => {
     ).toEqual(health);
   });
 
+  it('validates per-token assistant streaming events', () => {
+    const delta = LiveEventSchema.parse({
+      type: 'thread/assistant/text-delta',
+      payload: {
+        threadId: 'claude-code:session-1',
+        messageId: 'claude-assistant:turn-1',
+        delta: 'Hel'
+      }
+    });
+    expect(delta.type).toBe('thread/assistant/text-delta');
+
+    const end = LiveEventSchema.parse({
+      type: 'thread/assistant/text-end',
+      payload: {
+        threadId: 'claude-code:session-1',
+        messageId: 'claude-assistant:turn-1'
+      }
+    });
+    expect(end.type).toBe('thread/assistant/text-end');
+
+    expect(() =>
+      LiveEventSchema.parse({
+        type: 'thread/assistant/text-delta',
+        payload: { threadId: '', messageId: 'm', delta: 'x' }
+      })
+    ).toThrow();
+  });
+
   it('validates remote access settings for the admin settings payload', () => {
     const settings = RemoteAccessSettingsSchema.parse({
       enabled: false,
@@ -139,11 +167,27 @@ describe('shared schemas', () => {
     expect(transcript.messages[0]?.text).toBe('I can work on that.');
     expect(transcript.messages[0]?.attachments?.[0]?.url).toBe('data:image/png;base64,iVBORw0KGgo=');
     expect(ThreadMessageRequestSchema.parse({ text: '  continue  ' }).text).toBe('continue');
+    expect(
+      ThreadMessageRequestSchema.parse({
+        attachments: [
+          {
+            id: 'pasted-image-1',
+            kind: 'image',
+            url: 'data:image/png;base64,iVBORw0KGgo=',
+            mimeType: 'image/png'
+          }
+        ]
+      }).attachments?.[0]?.mimeType
+    ).toBe('image/png');
     expect(() => ThreadMessageRequestSchema.parse({ text: '' })).toThrow();
     expect(() => ThreadMessageRequestSchema.parse({ text: 'x'.repeat(4001) })).toThrow();
   });
 
-  it('allows a new thread request from a saved project or a folder path', () => {
+  it('allows a new thread request from shared chats, a saved project, or a folder path', () => {
+    expect(ThreadCreateRequestSchema.parse({ location: 'chat' })).toEqual({
+      provider: 'codex',
+      location: 'chat'
+    });
     expect(ThreadCreateRequestSchema.parse({ projectId: 'project-codexpulse' })).toEqual({
       provider: 'codex',
       projectId: 'project-codexpulse'
@@ -175,6 +219,12 @@ describe('shared schemas', () => {
       reasoningEffort: 'high'
     });
     expect(() => ThreadCreateRequestSchema.parse({})).toThrow();
+    expect(() =>
+      ThreadCreateRequestSchema.parse({
+        location: 'chat',
+        projectId: 'project-codexpulse'
+      })
+    ).toThrow();
     expect(() =>
       ThreadCreateRequestSchema.parse({
         projectId: 'project-codexpulse',

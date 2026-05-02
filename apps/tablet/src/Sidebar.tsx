@@ -1,7 +1,8 @@
-import type { HelperHealth, Project, Thread } from '@agent-pulse/shared';
+import type { HelperHealth, Project, Thread, ThreadListGroup } from '@agent-pulse/shared';
 import {
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Monitor,
   Moon,
   PanelLeftClose,
@@ -23,6 +24,8 @@ import { useThemePreference, type ThemePreference } from './theme';
 
 const COLLAPSED_KEY = 'agent-pulse:sidebar-collapsed';
 const COLLAPSED_GROUPS_KEY = 'agent-pulse:sidebar-collapsed-groups';
+const COLLAPSED_SECTIONS_KEY = 'agent-pulse:sidebar-collapsed-sections';
+const CHAT_GROUP_KEY = 'agent-pulse-chats';
 
 function readCollapsedFromStorage(): boolean {
   if (typeof window === 'undefined') {
@@ -53,14 +56,42 @@ function writeCollapsedGroupsToStorage(groups: Set<string>) {
   } catch {}
 }
 
+function readCollapsedSectionsFromStorage(): Set<string> {
+  if (typeof window === 'undefined') {
+    return new Set();
+  }
+  try {
+    const data = window.localStorage.getItem(COLLAPSED_SECTIONS_KEY);
+    if (data) {
+      return new Set(JSON.parse(data));
+    }
+  } catch {}
+  return new Set();
+}
+
+function writeCollapsedSectionsToStorage(sections: Set<string>) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify([...sections]));
+  } catch {}
+}
+
 export type SidebarProps = {
   threads: Thread[];
+  threadListGroups?: ThreadListGroup[];
+  threadsLoading?: boolean;
+  loadingThreadGroupKey?: string;
+  expandedThreadGroupKeys?: Set<string>;
   projects?: Project[];
   activeThreadId?: string;
   seenThreadActivity?: Record<string, number>;
   workingThreadIds?: Set<string>;
   onSelectThread: (thread: Thread) => void;
   onNewThread?: (projectId?: string) => void;
+  onShowMoreThreads?: (groupKey: string) => void;
+  onShowLessThreads?: (groupKey: string) => void;
   onOpenSettings?: () => void;
   onGoHome?: () => void;
   health: HelperHealth;
@@ -69,6 +100,8 @@ export type SidebarProps = {
 };
 
 type ProjectGroup = {
+  section: 'chat' | 'project';
+  groupKey: string;
   workspace: string;
   workspacePath: string;
   project?: Project;
@@ -85,7 +118,7 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
   const groups = new Map<string, Thread[]>();
 
   for (const thread of threads) {
-    const key = thread.workspacePath ?? thread.workspace;
+    const key = thread.workspaceKind === 'chat' ? CHAT_GROUP_KEY : thread.workspacePath ?? thread.workspace;
     const existing = groups.get(key) ?? [];
     existing.push(thread);
     groups.set(key, existing);
@@ -96,12 +129,16 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
   const seenProjectPaths = new Set<string>();
   const groupedThreads = [...groups.entries()]
     .map(([workspacePath, groupThreads]) => {
-      const project =
-        projectByPath.get(workspacePath) ??
-        projectByName.get(groupThreads[0]?.workspace ?? workspacePath);
+      const isChatGroup = groupThreads.some((thread) => thread.workspaceKind === 'chat');
+      const project = isChatGroup
+        ? undefined
+        : projectByPath.get(workspacePath) ??
+          projectByName.get(groupThreads[0]?.workspace ?? workspacePath);
       return {
-        workspace: groupThreads[0]?.workspace ?? project?.name ?? workspacePath,
-        workspacePath: project?.path ?? workspacePath,
+        section: (isChatGroup ? 'chat' : 'project') as ProjectGroup['section'],
+        groupKey: isChatGroup ? CHAT_GROUP_KEY : workspacePath,
+        workspace: isChatGroup ? 'Chats' : groupThreads[0]?.workspace ?? project?.name ?? workspacePath,
+        workspacePath: isChatGroup ? CHAT_GROUP_KEY : project?.path ?? workspacePath,
         project,
         threads: sortThreadsByActivity(groupThreads)
       };
@@ -121,6 +158,8 @@ function groupAndSortThreads(threads: Thread[], projects: Project[] = []): Proje
   const emptyProjectGroups = projects
     .filter((project) => !seenProjectPaths.has(project.path) && !groups.has(project.path))
     .map((project) => ({
+      section: 'project' as const,
+      groupKey: project.path,
       workspace: project.name,
       workspacePath: project.path,
       project,
@@ -225,12 +264,18 @@ function ThemeQuickToggle({
 
 export function Sidebar({
   threads,
+  threadListGroups = [],
+  threadsLoading = false,
+  loadingThreadGroupKey,
+  expandedThreadGroupKeys = new Set<string>(),
   projects = [],
   activeThreadId,
   seenThreadActivity = {},
   workingThreadIds,
   onSelectThread,
   onNewThread,
+  onShowMoreThreads,
+  onShowLessThreads,
   onOpenSettings,
   onGoHome,
   health,
@@ -242,16 +287,29 @@ export function Sidebar({
   const { theme, setTheme } = useThemePreference();
   const [collapsed, setCollapsed] = useState<boolean>(() => readCollapsedFromStorage());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => readCollapsedGroupsFromStorage());
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => readCollapsedSectionsFromStorage());
   const [searchQuery, setSearchQuery] = useState('');
   const visibleProjectGroups = useMemo(
     () => filterProjectGroups(projectGroups, searchQuery),
     [projectGroups, searchQuery]
+  );
+  const visibleChatGroups = visibleProjectGroups.filter((group) => group.section === 'chat');
+  const visibleWorkspaceGroups = visibleProjectGroups.filter((group) => group.section === 'project');
+  const threadGroupByKey = useMemo(
+    () => new Map(threadListGroups.map((group) => [group.groupKey, group])),
+    [threadListGroups]
   );
   const searchActive = searchQuery.trim().length > 0;
   const visibleThreadCount = visibleProjectGroups.reduce(
     (count, group) => count + group.threads.length,
     0
   );
+  const visibleChatCount = visibleChatGroups.reduce(
+    (count, group) => count + group.threads.length,
+    0
+  );
+  const chatsCollapsed = !searchActive && collapsedSections.has('chats');
+  const projectsCollapsed = !searchActive && collapsedSections.has('projects');
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -263,6 +321,10 @@ export function Sidebar({
   useEffect(() => {
     writeCollapsedGroupsToStorage(collapsedGroups);
   }, [collapsedGroups]);
+
+  useEffect(() => {
+    writeCollapsedSectionsToStorage(collapsedSections);
+  }, [collapsedSections]);
 
   const toggleCollapsed = () => setCollapsed((prev) => !prev);
 
@@ -276,6 +338,122 @@ export function Sidebar({
       }
       return next;
     });
+  };
+
+  const toggleSection = (section: 'chats' | 'projects') => {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(section)) {
+        next.delete(section);
+      } else {
+        next.add(section);
+      }
+      return next;
+    });
+  };
+
+  const renderThreadRow = (thread: Thread) => {
+    const active = thread.threadId === activeThreadId;
+    const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
+    const isLive = isWorking || thread.status === 'compacting';
+    const isWaitingApproval = thread.status === 'waiting_approval';
+    const isCompacting = thread.status === 'compacting';
+    const needsReview = threadNeedsReview(thread, seenThreadActivity);
+    const dotTone = isLive ? 'blue' : needsReview ? 'yellow' : statusTone[thread.status];
+    const showDot =
+      isLive ||
+      needsReview ||
+      isWaitingApproval ||
+      (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
+
+    return (
+      <li key={thread.threadId}>
+        <button
+          type="button"
+          className={`codex-sidebar-thread ${active ? 'is-active' : ''}`}
+          onClick={() => onSelectThread(thread)}
+          aria-label={`Open chat for ${thread.title}`}
+        >
+          <span className="codex-sidebar-thread-dot-slot" aria-hidden="true">
+            {showDot ? (
+              <span
+                className={`codex-sidebar-thread-dot tone-${dotTone} ${isLive ? 'is-working' : ''}`}
+              />
+            ) : null}
+          </span>
+          <span
+            className={`codex-sidebar-thread-mark provider-${providerTone(thread.provider)}`}
+            aria-label={providerLabel(thread.provider)}
+          >
+            <ProviderMark provider={thread.provider} size="sm" />
+          </span>
+          <span className="codex-sidebar-thread-title">{thread.title}</span>
+          {needsReview ? (
+            <span className="codex-sidebar-thread-state is-review">Review</span>
+          ) : isWaitingApproval ? (
+            <span className="codex-sidebar-thread-state">Awaiting approval</span>
+          ) : isCompacting ? (
+            <span className="codex-sidebar-thread-state is-compacting">Compacting</span>
+          ) : null}
+          <span className="codex-sidebar-thread-time">{relativeTime(thread.lastActivityAt)}</span>
+        </button>
+      </li>
+    );
+  };
+
+  const renderThreadPageActions = (group: ProjectGroup) => {
+    if (searchActive) {
+      return null;
+    }
+    const metadata = threadGroupByKey.get(group.groupKey);
+    const isExpanded = expandedThreadGroupKeys.has(group.groupKey);
+    const canShowMore = Boolean(metadata && metadata.total > metadata.visible && onShowMoreThreads);
+    const canShowLess = Boolean(isExpanded && onShowLessThreads);
+    if (!canShowMore && !canShowLess) {
+      return null;
+    }
+    const isLoading = threadsLoading && loadingThreadGroupKey === group.groupKey;
+    const hiddenCount = metadata ? Math.max(0, metadata.total - metadata.visible) : 0;
+
+    return (
+      <li className="codex-sidebar-load-more" key={`${group.groupKey}:thread-page-actions`}>
+        {isLoading ? (
+          <span className="codex-sidebar-load-more-status" role="status" aria-live="polite">
+            <span className="codex-sidebar-loading-spinner" aria-hidden="true" />
+            <span>Loading chats</span>
+          </span>
+        ) : (
+          <>
+            {canShowMore ? (
+              <button
+                type="button"
+                onClick={() => onShowMoreThreads?.(group.groupKey)}
+                aria-label={`Show more chats in ${group.workspace}`}
+              >
+                <ChevronDown size={13} aria-hidden="true" />
+                <span>Show more</span>
+                <span>
+                  {hiddenCount > 0
+                    ? `${hiddenCount} older chat${hiddenCount === 1 ? '' : 's'}`
+                    : 'older chats'}
+                </span>
+              </button>
+            ) : null}
+            {canShowLess ? (
+              <button
+                type="button"
+                onClick={() => onShowLessThreads?.(group.groupKey)}
+                aria-label={`Show fewer chats in ${group.workspace}`}
+              >
+                <ChevronUp size={13} aria-hidden="true" />
+                <span>Show less</span>
+                <span>latest 6</span>
+              </button>
+            ) : null}
+          </>
+        )}
+      </li>
+    );
   };
 
   if (collapsed) {
@@ -327,8 +505,8 @@ export function Sidebar({
           type="button"
           onClick={() => onNewThread?.()}
           disabled={onNewThread === undefined}
-          aria-label="New thread"
-          title="New thread"
+          aria-label="New chat"
+          title="New chat"
         >
           <Plus size={18} />
         </button>
@@ -444,28 +622,28 @@ export function Sidebar({
         disabled={onNewThread === undefined}
       >
         <Plus size={16} />
-        <span>New thread</span>
+        <span>New chat</span>
       </button>
 
-      <p className="codex-sidebar-section-label">Threads</p>
+      <p className="codex-sidebar-section-label">Workspace</p>
 
       <div className={`codex-sidebar-search-shell ${searchActive ? 'is-active' : ''}`}>
         <label className="codex-sidebar-search">
           <Search size={11} aria-hidden="true" />
-          <span className="sr-only">Search threads</span>
+          <span className="sr-only">Search chats</span>
           <input
             type="search"
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.currentTarget.value)}
-            placeholder="Search threads or projects"
-            aria-label="Search threads or projects"
+            placeholder="Search chats or projects"
+            aria-label="Search chats or projects"
           />
           {searchActive ? (
             <button
               className="codex-sidebar-search-clear"
               type="button"
               onClick={() => setSearchQuery('')}
-              aria-label="Clear thread search"
+              aria-label="Clear search"
               title="Clear search"
             >
               <X size={13} />
@@ -475,105 +653,126 @@ export function Sidebar({
         <div className="codex-sidebar-search-meta" aria-live="polite">
           {searchActive
             ? `${visibleThreadCount} thread${visibleThreadCount === 1 ? '' : 's'} found`
-            : 'Search by thread or project'}
+            : 'Search by chat or project'}
         </div>
       </div>
 
       <div className="codex-sidebar-thread-scroll" aria-label="Thread list">
-        {visibleProjectGroups.map((group) => {
-          const isGroupCollapsed = !searchActive && collapsedGroups.has(group.workspacePath);
-          return (
-            <div
-              key={group.workspacePath}
-              className={`codex-sidebar-group ${searchActive ? 'is-search-result' : ''}`}
+        {threadsLoading && threads.length === 0 ? (
+          <div className="codex-sidebar-loading" role="status" aria-live="polite">
+            <span className="codex-sidebar-loading-spinner" aria-hidden="true" />
+            <span>Loading chats</span>
+          </div>
+        ) : null}
+        <div className={`codex-sidebar-section ${searchActive ? 'is-search-result' : ''}`}>
+          <div className="codex-sidebar-section-heading">
+            <button
+              className="codex-sidebar-section-toggle"
+              type="button"
+              onClick={() => toggleSection('projects')}
+              aria-expanded={!projectsCollapsed}
             >
-              <div className="codex-sidebar-group-heading">
-                <button
-                  className="codex-sidebar-group-name"
-                  type="button"
-                  onClick={() => toggleGroup(group.workspacePath)}
-                  style={{ background: 'transparent', border: 0, cursor: 'pointer', textAlign: 'left', color: 'inherit', fontFamily: 'inherit' }}
-                >
-                  <span style={{ color: 'var(--text-subtle)', display: 'grid', placeItems: 'center' }}>
-                    {isGroupCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-                  </span>
-                  {group.workspace}
-                </button>
-              {group.project ? (
-                <button
-                  className="codex-sidebar-group-new"
-                  type="button"
-                  onClick={() => onNewThread?.(group.project?.projectId)}
-                  disabled={onNewThread === undefined}
-                  aria-label={`New thread in ${group.workspace}`}
-                  title={`New thread in ${group.workspace}`}
-                >
-                  <Plus size={14} />
-                </button>
-              ) : null}
-            </div>
-            {!isGroupCollapsed ? (
-              <ul className="codex-sidebar-threads">
-                {group.threads.map((thread) => {
-                const active = thread.threadId === activeThreadId;
-                const isWorking = workingThreadIds?.has(thread.threadId) ?? false;
-                const isLive = isWorking || thread.status === 'compacting';
-                const isWaitingApproval = thread.status === 'waiting_approval';
-                const isCompacting = thread.status === 'compacting';
-                const needsReview = threadNeedsReview(thread, seenThreadActivity);
-                const dotTone = isLive ? 'blue' : needsReview ? 'yellow' : statusTone[thread.status];
-                const showDot =
-                  isLive ||
-                  needsReview ||
-                  isWaitingApproval ||
-                  (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
-
+              <span className="codex-sidebar-section-chevron" aria-hidden="true">
+                {projectsCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+              </span>
+              <span>Projects</span>
+              <span className="codex-sidebar-section-count">{visibleWorkspaceGroups.length}</span>
+            </button>
+          </div>
+          {!projectsCollapsed ? (
+            <div className="codex-sidebar-section-body">
+              {visibleWorkspaceGroups.map((group) => {
+                const isGroupCollapsed = !searchActive && collapsedGroups.has(group.workspacePath);
                 return (
-                  <li key={thread.threadId}>
-                    <button
-                      type="button"
-                      className={`codex-sidebar-thread ${active ? 'is-active' : ''}`}
-                      onClick={() => onSelectThread(thread)}
-                      aria-label={`Open chat for ${thread.title}`}
-                    >
-                      <span className="codex-sidebar-thread-dot-slot" aria-hidden="true">
-                        {showDot ? (
-                          <span
-                            className={`codex-sidebar-thread-dot tone-${dotTone} ${isLive ? 'is-working' : ''}`}
-                          />
-                        ) : null}
-                      </span>
-                      <span
-                        className={`codex-sidebar-thread-mark provider-${providerTone(thread.provider)}`}
-                        aria-label={providerLabel(thread.provider)}
+                  <div
+                    key={group.workspacePath}
+                    className={`codex-sidebar-group ${searchActive ? 'is-search-result' : ''}`}
+                  >
+                    <div className="codex-sidebar-group-heading">
+                      <button
+                        className="codex-sidebar-group-name"
+                        type="button"
+                        onClick={() => toggleGroup(group.workspacePath)}
+                        style={{ background: 'transparent', border: 0, cursor: 'pointer', textAlign: 'left', color: 'inherit', fontFamily: 'inherit' }}
                       >
-                        <ProviderMark provider={thread.provider} size="sm" />
-                      </span>
-                      <span className="codex-sidebar-thread-title">{thread.title}</span>
-                      {needsReview ? (
-                        <span className="codex-sidebar-thread-state is-review">Review</span>
-                      ) : isWaitingApproval ? (
-                        <span className="codex-sidebar-thread-state">Awaiting approval</span>
-                      ) : isCompacting ? (
-                        <span className="codex-sidebar-thread-state is-compacting">Compacting</span>
+                        <span style={{ color: 'var(--text-subtle)', display: 'grid', placeItems: 'center' }}>
+                          {isGroupCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                        </span>
+                        {group.workspace}
+                      </button>
+                      {group.project ? (
+                        <button
+                          className="codex-sidebar-group-new"
+                          type="button"
+                          onClick={() => onNewThread?.(group.project?.projectId)}
+                          disabled={onNewThread === undefined}
+                          aria-label={`New chat in ${group.workspace}`}
+                          title={`New chat in ${group.workspace}`}
+                        >
+                          <Plus size={14} />
+                        </button>
                       ) : null}
-                      <span className="codex-sidebar-thread-time">
-                        {relativeTime(thread.lastActivityAt)}
-                      </span>
-                    </button>
-                  </li>
+                    </div>
+                    {!isGroupCollapsed ? (
+                      <ul className="codex-sidebar-threads">
+                        {group.threads.map(renderThreadRow)}
+                        {group.threads.length === 0 ? (
+                          <li className="codex-sidebar-empty-project">No chats yet</li>
+                        ) : null}
+                        {renderThreadPageActions(group)}
+                      </ul>
+                    ) : null}
+                  </div>
                 );
               })}
-              {group.threads.length === 0 ? (
-                <li className="codex-sidebar-empty-project">No threads yet</li>
+              {visibleWorkspaceGroups.length === 0 ? (
+                <div className="codex-sidebar-section-empty">No projects yet</div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+
+        <div className={`codex-sidebar-section ${searchActive ? 'is-search-result' : ''}`}>
+          <div className="codex-sidebar-section-heading">
+            <button
+              className="codex-sidebar-section-toggle"
+              type="button"
+              onClick={() => toggleSection('chats')}
+              aria-expanded={!chatsCollapsed}
+            >
+              <span className="codex-sidebar-section-chevron" aria-hidden="true">
+                {chatsCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+              </span>
+              <span>Chats</span>
+              <span className="codex-sidebar-section-count">{visibleChatCount}</span>
+            </button>
+            <button
+              className="codex-sidebar-section-action"
+              type="button"
+              onClick={() => onNewThread?.()}
+              disabled={onNewThread === undefined}
+              aria-label="New shared chat"
+              title="New shared chat"
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+          {!chatsCollapsed ? (
+            <ul className="codex-sidebar-threads codex-sidebar-chat-threads">
+              {visibleChatGroups.map((group) => (
+                <Fragment key={group.groupKey}>
+                  {group.threads.map(renderThreadRow)}
+                  {renderThreadPageActions(group)}
+                </Fragment>
+              ))}
+              {visibleChatCount === 0 ? (
+                <li className="codex-sidebar-empty-project">No chats yet</li>
               ) : null}
             </ul>
           ) : null}
         </div>
-      );
-    })}
-        {visibleProjectGroups.length === 0 ? (
-          <div className="codex-sidebar-search-empty">No matching threads or projects.</div>
+        {searchActive && visibleProjectGroups.length === 0 ? (
+          <div className="codex-sidebar-search-empty">No matching chats or projects.</div>
         ) : null}
   </div>
 

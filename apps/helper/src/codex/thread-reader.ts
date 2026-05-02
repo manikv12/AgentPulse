@@ -14,6 +14,12 @@ import {
   ThreadUsageSchema,
   resolveThreadStatus
 } from '@agent-pulse/shared';
+import {
+  decorateSharedChatThread,
+  filterSharedChatProjects,
+  isSharedChatPath,
+  SHARED_CHAT_WORKSPACE
+} from '../chats/shared-chat-paths';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,6 +43,12 @@ export type CodexThreadReaderOptions = {
   maxIdleThreadsPerProject?: number;
   recentlyActiveMs?: number;
   liveSignalTtlMs?: number;
+  chatRoot?: string;
+};
+
+export type CodexThreadListOptions = {
+  defaultLimit?: number;
+  groupLimits?: Map<string, number> | Record<string, number>;
 };
 
 export type CodexSidebarState = {
@@ -61,6 +73,7 @@ export class CodexThreadReader {
   private readonly maxIdleThreadsPerProject: number;
   private readonly recentlyActiveMs: number;
   private readonly liveSignalTtlMs: number;
+  private readonly chatRoot: string | undefined;
 
   constructor(options: CodexThreadReaderOptions = {}) {
     this.codexHome = options.codexHome ?? path.join(homedir(), '.codex');
@@ -70,11 +83,16 @@ export class CodexThreadReader {
     this.maxIdleThreadsPerProject = options.maxIdleThreadsPerProject ?? 5;
     this.recentlyActiveMs = options.recentlyActiveMs ?? 2 * 60 * 1000;
     this.liveSignalTtlMs = options.liveSignalTtlMs ?? 30 * 60 * 1000;
+    this.chatRoot = options.chatRoot;
   }
 
-  async listThreads(): Promise<Thread[]> {
-    const { entries } = await this.readVisibleThreadEntries();
-    return limitCodexSidebarHistory(entries.map(({ thread }) => thread), this.maxIdleThreadsPerProject);
+  async listThreads(options: CodexThreadListOptions = {}): Promise<Thread[]> {
+    const { entries } = await this.readVisibleThreadEntries(options);
+    return limitCodexSidebarHistory(
+      entries.map(({ thread }) => thread),
+      options.defaultLimit ?? this.maxIdleThreadsPerProject,
+      options.groupLimits
+    );
   }
 
   async listProjects(): Promise<Project[]> {
@@ -91,6 +109,9 @@ export class CodexThreadReader {
       if (!path.isAbsolute(normalized) || normalized === 'Unknown workspace' || seen.has(normalized)) {
         continue;
       }
+      if (isCodexChatWorkspaceRoot(normalized, this.chatRoot)) {
+        continue;
+      }
 
       seen.add(normalized);
       projects.push(ProjectSchema.parse({
@@ -101,7 +122,7 @@ export class CodexThreadReader {
       }));
     }
 
-    return projects;
+    return filterSharedChatProjects(projects, this.chatRoot);
   }
 
   private async readSqliteRows(): Promise<SqliteThreadRow[]> {
@@ -183,26 +204,39 @@ export class CodexThreadReader {
     }
   }
 
-  private async readVisibleThreadEntries(): Promise<{
+  private async readVisibleThreadEntries(options: CodexThreadListOptions = {}): Promise<{
     sidebarState: CodexSidebarState;
     entries: VisibleThreadEntry[];
   }> {
     const sidebarState = await this.readSidebarState();
-    const rows = await this.readSqliteRows();
+    const rows = limitCodexRowsByWorkspace(
+      await this.readSqliteRows(),
+      sidebarState,
+      options.defaultLimit ?? this.maxIdleThreadsPerProject,
+      options.groupLimits,
+      this.chatRoot
+    );
     const entries = await Promise.all(
       rows.map(async (row) => {
         const workspaceRoot = resolveThreadWorkspaceRoot(row, sidebarState);
         const baseThread = mapSqliteThreadRow(row, workspaceRoot);
+        const visibleThread = decorateCodexChatThread(
+          baseThread,
+          row,
+          workspaceRoot,
+          sidebarState,
+          this.chatRoot
+        );
         const rolloutSignals = isLiveStatusFresh(row.updated_at_ms, this.now(), this.liveSignalTtlMs)
           ? await this.readSignalsForRow(row)
           : [];
-        const status = resolveThreadStatus([baseThread.status, ...rolloutSignals]);
+        const status = resolveThreadStatus([visibleThread.status, ...rolloutSignals]);
 
         return {
           row,
           workspaceRoot,
           thread: ThreadSchema.parse({
-            ...baseThread,
+            ...visibleThread,
             status
           })
         } satisfies VisibleThreadEntry;
@@ -218,7 +252,8 @@ export class CodexThreadReader {
             cwd: workspaceRoot
           },
           thread.status,
-          sidebarState
+          sidebarState,
+          this.chatRoot
         )
       )
     };
@@ -232,8 +267,13 @@ export function isLiveStatusFresh(updatedAtMs: number, now: Date, maxAgeMs: numb
 export function shouldShowInCodexSidebarProjects(
   row: Pick<SqliteThreadRow, 'id' | 'cwd'>,
   status: ThreadStatus,
-  sidebarState: CodexSidebarState
+  sidebarState: CodexSidebarState,
+  chatRoot?: string
 ): boolean {
+  if (isCodexChatWorkspaceRoot(row.cwd, chatRoot)) {
+    return true;
+  }
+
   if (status !== 'idle' && status !== 'unknown') {
     return true;
   }
@@ -247,7 +287,7 @@ export function shouldShowInCodexSidebarProjects(
   }
 
   if (sidebarState.projectlessThreadIds.has(row.id)) {
-    return false;
+    return true;
   }
 
   const cwd = normalizeWorkspacePath(row.cwd);
@@ -277,7 +317,8 @@ export function orderedCodexSidebarProjectRoots(sidebarState: CodexSidebarState)
 
 export function limitCodexSidebarHistory(
   threads: Thread[],
-  maxIdleThreadsPerProject: number
+  maxIdleThreadsPerProject: number,
+  groupLimits: Map<string, number> | Record<string, number> = {}
 ): Thread[] {
   const idleCounts = new Map<string, number>();
 
@@ -286,14 +327,56 @@ export function limitCodexSidebarHistory(
       return true;
     }
 
-    const count = idleCounts.get(thread.workspace) ?? 0;
-    if (count >= maxIdleThreadsPerProject) {
+    const key = thread.workspaceKind === 'chat'
+      ? 'agent-pulse-chats'
+      : thread.workspacePath ?? thread.workspace;
+    const limit = threadGroupLimit(key, maxIdleThreadsPerProject, groupLimits);
+    const count = idleCounts.get(key) ?? 0;
+    if (count >= limit) {
       return false;
     }
 
-    idleCounts.set(thread.workspace, count + 1);
+    idleCounts.set(key, count + 1);
     return true;
   });
+}
+
+function limitCodexRowsByWorkspace(
+  rows: SqliteThreadRow[],
+  sidebarState: CodexSidebarState,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {},
+  chatRoot?: string
+): SqliteThreadRow[] {
+  const counts = new Map<string, number>();
+  return rows.filter((row) => {
+    const workspaceRoot = resolveThreadWorkspaceRoot(row, sidebarState);
+    const key = isCodexChatWorkspaceRoot(workspaceRoot, chatRoot)
+      ? 'agent-pulse-chats'
+      : workspaceRoot;
+    const limit = threadGroupLimit(key, defaultLimit, groupLimits);
+    const count = counts.get(key) ?? 0;
+    if (count >= limit) {
+      return false;
+    }
+    counts.set(key, count + 1);
+    return true;
+  });
+}
+
+function threadGroupLimit(
+  groupKey: string,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number>
+): number {
+  const explicitLimit =
+    groupLimits instanceof Map
+      ? groupLimits.get(groupKey)
+      : Object.prototype.hasOwnProperty.call(groupLimits, groupKey)
+        ? groupLimits[groupKey]
+        : undefined;
+  const limit = explicitLimit ?? defaultLimit;
+  return Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : defaultLimit;
 }
 
 export function isUserFacingThreadSource(source: string | undefined): boolean {
@@ -314,6 +397,43 @@ export function mapSqliteThreadRow(row: SqliteThreadRow, workspaceRoot = row.cwd
     ...(row.model ? { model: row.model } : {}),
     ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {})
   });
+}
+
+function decorateCodexChatThread(
+  thread: Thread,
+  row: Pick<SqliteThreadRow, 'id' | 'cwd'>,
+  workspaceRoot: string,
+  sidebarState: CodexSidebarState,
+  chatRoot?: string
+): Thread {
+  const sharedThread = decorateSharedChatThread(thread, chatRoot);
+  if (
+    sharedThread.workspaceKind === 'chat' ||
+    isCodexChatWorkspaceRoot(row.cwd, chatRoot) ||
+    isCodexChatWorkspaceRoot(workspaceRoot, chatRoot) ||
+    sidebarState.projectlessThreadIds.has(row.id)
+  ) {
+    return ThreadSchema.parse({
+      ...sharedThread,
+      workspace: SHARED_CHAT_WORKSPACE,
+      workspaceKind: 'chat'
+    });
+  }
+
+  return sharedThread;
+}
+
+function isCodexChatWorkspaceRoot(candidate: string | undefined, chatRoot?: string): boolean {
+  if (!candidate?.trim()) {
+    return false;
+  }
+
+  const normalized = normalizeWorkspacePath(candidate);
+  return (
+    isSharedChatPath(normalized, chatRoot) ||
+    normalized === normalizeWorkspacePath(homedir()) ||
+    isPathInside(defaultCodexProjectlessRoot(), normalized)
+  );
 }
 
 export function resolveThreadWorkspaceRoot(
@@ -640,6 +760,10 @@ function readStringRecord(value: unknown): Record<string, string> {
 
 function normalizeWorkspacePath(value: string): string {
   return path.normalize(value.replace(/^~(?=$|\/)/, homedir()));
+}
+
+function defaultCodexProjectlessRoot(): string {
+  return path.join(homedir(), 'Documents', 'Codex');
 }
 
 export function projectIdForPath(value: string): string {

@@ -264,7 +264,16 @@ describe('ClaudeCodeProvider', () => {
 
     const response = await provider.sendMessage(thread.threadId, 'Hello Claude', {
       model: 'claude-sonnet',
-      effort: 'high'
+      effort: 'high',
+      attachments: [
+        {
+          id: 'pasted-image-1',
+          kind: 'image',
+          url: 'data:image/png;base64,iVBORw0KGgo=',
+          mimeType: 'image/png',
+          alt: 'Pasted image'
+        }
+      ]
     });
 
     expect(response.ok).toBe(true);
@@ -288,7 +297,17 @@ describe('ClaudeCodeProvider', () => {
       session_id: thread.providerThreadId,
       message: {
         role: 'user',
-        content: [{ type: 'text', text: 'Hello Claude' }]
+        content: [
+          { type: 'text', text: 'Hello Claude' },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: 'iVBORw0KGgo='
+            }
+          }
+        ]
       }
     });
 
@@ -313,6 +332,200 @@ describe('ClaudeCodeProvider', () => {
       kind: 'image',
       sourcePath: imagePath
     });
+  });
+
+  it('keeps the draft ready when the Claude Code executable cannot start', async () => {
+    const claudeHome = await tempClaudeHome();
+    const child = fakeClaudeProcess({ pid: undefined });
+    const spawnProcess = vi.fn(() => {
+      queueMicrotask(() => (child.process as unknown as EventEmitter).emit('error', new Error('spawn claude ENOENT')));
+      return child.process;
+    });
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      spawnProcess,
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const thread = await provider.startThread('/Users/me/projects/CodexPulse');
+    const pending = provider.sendMessage(thread.threadId, 'Hello Claude');
+
+    await expect(pending).rejects.toThrow('Claude Code could not start from Agent Pulse');
+    const transcript = await provider.readTranscript(thread.threadId);
+    expect(transcript.activeTurnId).toBeNull();
+    expect(transcript.sendState).toEqual({ canSend: true, reason: 'ready', label: 'Send' });
+    await expect(provider.listThreads()).resolves.toMatchObject([
+      {
+        threadId: thread.threadId,
+        title: 'New Claude chat',
+        status: 'idle'
+      }
+    ]);
+  });
+
+  it('clears the running state if Claude Code dies after a send starts', async () => {
+    const claudeHome = await tempClaudeHome();
+    const child = fakeClaudeProcess();
+    const spawnProcess = vi.fn(() => child.process);
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      spawnProcess,
+      now: () => new Date('2026-04-25T16:14:00Z'),
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const thread = await provider.startThread('/Users/me/projects/CodexPulse');
+    await expect(provider.sendMessage(thread.threadId, 'Hello Claude')).resolves.toMatchObject({
+      ok: true
+    });
+
+    (child.process as unknown as EventEmitter).emit('error', new Error('Claude crashed'));
+
+    const transcript = await provider.readTranscript(thread.threadId);
+    expect(transcript.activeTurnId).toBeNull();
+    expect(transcript.sendState).toEqual({ canSend: true, reason: 'ready', label: 'Send' });
+    expect(transcript.messages.map((message) => message.text)).toEqual([
+      'Hello Claude',
+      'Claude Code stopped before finishing: Claude crashed'
+    ]);
+    expect(transcript.messages.at(-1)).toMatchObject({
+      role: 'assistant',
+      kind: 'message',
+      phase: 'final_answer'
+    });
+  });
+
+  it('retries a missing resumed Claude conversation as a session-owned turn', async () => {
+    const claudeHome = await tempClaudeHome();
+    const projectDir = path.join(claudeHome, 'projects', '-Users-me-projects-CodexPulse');
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      path.join(projectDir, 'session-retry.jsonl'),
+      JSON.stringify({
+        type: 'user',
+        sessionId: 'session-retry',
+        uuid: 'message-user',
+        timestamp: '2026-04-25T16:14:00Z',
+        cwd: '/Users/me/projects/CodexPulse',
+        entrypoint: 'claude-desktop',
+        message: { role: 'user', content: [{ type: 'text', text: 'Old desktop prompt' }] }
+      })
+    );
+
+    const firstChild = fakeClaudeProcess();
+    const secondChild = fakeClaudeProcess();
+    const spawnProcess = vi
+      .fn()
+      .mockReturnValueOnce(firstChild.process)
+      .mockReturnValueOnce(secondChild.process);
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      spawnProcess,
+      now: () => new Date('2026-04-25T16:20:00Z'),
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    await provider.sendMessage('claude-code:session-retry', 'Continue from Agent Pulse');
+    expect(spawnProcess.mock.calls[0]?.[1]).toEqual(expect.arrayContaining(['--resume', 'session-retry']));
+    expect(firstChild.writes).toHaveLength(1);
+
+    firstChild.stderr.write('Error: No conversation found with session ID: session-retry\n');
+    (firstChild.process as unknown as EventEmitter).emit('exit', 1);
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(2));
+
+    expect(spawnProcess.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--session-id', 'session-retry']));
+    await vi.waitFor(() => expect(secondChild.writes).toHaveLength(1));
+    expect(JSON.parse(secondChild.writes[0] ?? '{}')).toMatchObject({
+      type: 'user',
+      session_id: 'session-retry',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Continue from Agent Pulse' }]
+      }
+    });
+
+    const retryingTranscript = await provider.readTranscript('claude-code:session-retry');
+    expect(retryingTranscript.sendState).toMatchObject({
+      canSend: false,
+      label: 'Claude is working'
+    });
+    expect(retryingTranscript.messages.map((message) => message.text)).not.toContain(
+      'Claude Code stopped before finishing: Error: No conversation found with session ID: session-retry'
+    );
+
+    secondChild.stdout.write(`${JSON.stringify({ type: 'result', result: 'Recovered reply' })}\n`);
+
+    const completedTranscript = await provider.readTranscript('claude-code:session-retry');
+    expect(completedTranscript.messages.at(-1)).toMatchObject({
+      role: 'assistant',
+      kind: 'message',
+      text: 'Recovered reply',
+      phase: 'final_answer'
+    });
+  });
+
+  it('emits per-token text-delta and text-end events for live Claude streaming', async () => {
+    const claudeHome = await tempClaudeHome();
+    const child = fakeClaudeProcess();
+    const spawnProcess = vi.fn(() => child.process);
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      spawnProcess,
+      now: () => new Date('2026-04-25T16:14:00Z'),
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const events: { type: string; payload: unknown }[] = [];
+    provider.onLiveEvent((event) => {
+      if (
+        event.type === 'thread/assistant/text-delta' ||
+        event.type === 'thread/assistant/text-end'
+      ) {
+        events.push({ type: event.type, payload: event.payload });
+      }
+    });
+
+    const thread = await provider.startThread('/Users/me/projects/CodexPulse');
+    await provider.sendMessage(thread.threadId, 'Hi Claude');
+
+    // Two streaming text deltas, then a result.
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'Hel' }
+        }
+      })}\n`
+    );
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'lo!' }
+        }
+      })}\n`
+    );
+    child.stdout.write(`${JSON.stringify({ type: 'result', result: 'Hello!' })}\n`);
+
+    const deltas = events.filter((event) => event.type === 'thread/assistant/text-delta');
+    const ends = events.filter((event) => event.type === 'thread/assistant/text-end');
+    expect(deltas.map((event) => (event.payload as { delta: string }).delta)).toEqual(['Hel', 'lo!']);
+    expect(ends).toHaveLength(1);
+
+    const messageIds = new Set(
+      events.map((event) => (event.payload as { messageId: string }).messageId)
+    );
+    expect(messageIds.size).toBe(1);
+    const messageId = [...messageIds][0]!;
+
+    const transcript = await provider.readTranscript(thread.threadId);
+    const assistantMessage = transcript.messages.find((message) => message.id === messageId);
+    expect(assistantMessage?.text).toBe('Hello!');
+    expect(assistantMessage?.phase).toBe('final_answer');
   });
 
   it('marks live Claude assistant output as commentary until the turn finishes', async () => {
@@ -480,16 +693,18 @@ describe('ClaudeCodeProvider', () => {
   });
 });
 
-function fakeClaudeProcess() {
+function fakeClaudeProcess(options: { pid?: number } = {}) {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   const stdin = new PassThrough();
   const writes: string[] = [];
+  const pid = Object.prototype.hasOwnProperty.call(options, 'pid') ? options.pid : 12345;
   stdin.on('data', (chunk) => writes.push(chunk.toString('utf8').trim()));
   const process = Object.assign(new EventEmitter(), {
     stdout,
     stderr,
     stdin,
+    pid,
     killed: false,
     kill: vi.fn(() => {
       process.killed = true;
@@ -497,5 +712,5 @@ function fakeClaudeProcess() {
       return true;
     })
   });
-  return { process: process as never, stdout, writes };
+  return { process: process as never, stdout, stderr, writes };
 }

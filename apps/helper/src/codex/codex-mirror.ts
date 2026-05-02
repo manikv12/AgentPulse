@@ -1,4 +1,5 @@
 import type {
+  ChatAttachment,
   ChatMessage,
   PendingApprovalRequest,
   ThreadMessageResponse,
@@ -44,6 +45,7 @@ export type CodexMirrorSendOptions = {
   // omit them when collaborationMode is undefined.
   model?: string;
   effort?: string;
+  attachments?: ChatAttachment[];
 };
 
 export type CodexMirror = {
@@ -72,6 +74,13 @@ export type CodexMirror = {
   // with their full payloads (id, method, params). Used by the server to seed
   // the tablet on reconnect via `thread/upsert`.
   getPendingApprovalRequests(threadId: string): PendingApprovalRequest[];
+  // Drops all in-memory approval entries for one thread and emits a
+  // `pending-approvals: []` event if anything changed. Used by the poll loop
+  // to self-heal when Codex's authoritative remote status disagrees with our
+  // stale view (e.g. an "approval resolved" notification was missed during a
+  // brief disconnect, leaving the tablet stuck on "Codex is waiting for
+  // approval" indefinitely). Returns true when at least one entry was removed.
+  clearPendingApprovalsForThread(threadId: string): boolean;
   onStreamingChange(listener: (event: { threadId: string; isStreaming: boolean }) => void): () => void;
   onPendingApprovalsChange(
     listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
@@ -93,6 +102,11 @@ export type ApprovalResponse = 'accept' | 'acceptForSession' | 'decline' | unkno
 const DEFAULT_HOST_ID = 'local';
 const DEFAULT_UNOWNED_STREAMING_STALE_MS = 20_000;
 const ACTIVE_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
+const THREAD_UNAVAILABLE_ERROR_MARKERS = [
+  'no-client-found',
+  'client-not-found',
+  'client-cannot-handle-request'
+];
 const APPROVAL_REQUEST_METHODS = new Set([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
@@ -409,17 +423,17 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     try {
       return await ipc.sendRequest<T>(method, params);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'ipc-error';
-      if (message === 'no-client-found' || message === 'client-not-found' || message === 'client-cannot-handle-request') {
+      const message = describeIpcError(error);
+      if (THREAD_UNAVAILABLE_ERROR_MARKERS.some((marker) => message.includes(marker))) {
         throw new SendBlockedError(
           'thread_unavailable',
           'Codex could not deliver the request — the thread is not currently focused on the Mac. Try again in a moment.'
         );
       }
-      if (message === 'timeout' || message === 'request-timeout') {
+      if (message.includes('timeout') || message.includes('request-timeout')) {
         throw new SendBlockedError('thread_unavailable', 'Codex took too long to respond. Try again.');
       }
-      throw error;
+      throw error instanceof Error ? error : new Error(message);
     }
   }
 
@@ -450,7 +464,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         conversationId: threadId,
         turnStartParams: {
           threadId,
-          input: userTextInput(text),
+          input: userTextInput(text, sendOptions?.attachments),
           ...(collaborationModePayload ? { collaborationMode: collaborationModePayload } : {})
         }
       }
@@ -458,13 +472,17 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     return response.result;
   }
 
-  async function steerTurn(threadId: string, text: string): Promise<{ turn: { id: string } }> {
+  async function steerTurn(
+    threadId: string,
+    text: string,
+    attachments: ChatAttachment[] | undefined
+  ): Promise<{ turn: { id: string } }> {
     const response = await sendFollowerRequest<{ result: { turn?: { id: string }; turnId?: string } }>(
       'thread-follower-steer-turn',
       {
         conversationId: threadId,
-        input: userTextInput(text),
-        attachments: [],
+        input: userTextInput(text, attachments),
+        attachments: attachments ?? [],
         restoreMessage: null
       }
     );
@@ -488,7 +506,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     options?: CodexMirrorSendOptions
   ): Promise<ThreadMessageResponse> {
     const trimmed = text.trim();
-    if (!trimmed) {
+    if (!trimmed && !options?.attachments?.length) {
       throw new SendBlockedError('ready', 'Cannot send an empty message.');
     }
     if (!ipc.isReady()) {
@@ -500,10 +518,10 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
 
     const isStreaming = isThreadStreaming(threadId);
     const result = isStreaming
-      ? await steerTurn(threadId, trimmed)
+      ? await steerTurn(threadId, trimmed, options?.attachments)
       : await startTurn(threadId, trimmed, options);
 
-    const transcript = await readTranscript(threadId).catch(() =>
+    const transcript = await readTranscriptAfterAcceptedSend(threadId).catch(() =>
       buildFallbackTranscript(threadId, trimmed, isStreaming, result.turn.id)
     );
 
@@ -513,6 +531,10 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       turnId: result.turn.id,
       transcript
     });
+  }
+
+  async function readTranscriptAfterAcceptedSend(threadId: string): Promise<ThreadTranscript> {
+    return promiseWithTimeout(readTranscript(threadId), 1_500, 'Codex accepted the message, but transcript refresh was slow.');
   }
 
   async function interruptTurn(threadId: string): Promise<void> {
@@ -613,6 +635,18 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     return state ? pendingApprovalsFromState(state) : [];
   }
 
+  function clearPendingApprovalsForThread(threadId: string): boolean {
+    const state = appThreadStreamStates.get(threadId);
+    if (!state || state.approvalRequestsByKey.size === 0) {
+      return false;
+    }
+    state.approvalRequestsByKey.clear();
+    state.approvalResponseIdsByKey.clear();
+    state.lastUpdatedAtMs = now();
+    notifyPendingApprovalsIfChanged(threadId);
+    return true;
+  }
+
   function waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean> {
     if (ownedThreads.has(threadId)) {
       return Promise.resolve(true);
@@ -650,6 +684,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     isThreadCompacting,
     isThreadWaitingForApproval,
     getPendingApprovalRequests,
+    clearPendingApprovalsForThread,
     onStreamingChange(listener) {
       streamingListeners.add(listener);
       return () => {
@@ -1264,14 +1299,63 @@ function asObject(value: unknown): JsonRecord | null {
     : null;
 }
 
-function userTextInput(text: string) {
-  return [
-    {
+function describeIpcError(error: unknown): string {
+  const parts: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === 'string' && value.trim()) {
+      parts.push(value.trim());
+      return;
+    }
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      for (const key of ['message', 'error', 'code', 'type', 'reason']) {
+        push(record[key]);
+      }
+      try {
+        parts.push(JSON.stringify(value));
+      } catch {
+        parts.push(String(value));
+      }
+    }
+  };
+
+  push(error);
+  if (error instanceof Error) {
+    push(error.cause);
+  }
+
+  return parts.find(Boolean) ?? 'ipc-error';
+}
+
+function userTextInput(text: string, attachments: ChatAttachment[] = []) {
+  const input: Record<string, unknown>[] = [];
+  if (text.trim()) {
+    input.push({
       type: 'text',
       text,
       text_elements: []
+    });
+  }
+  for (const attachment of attachments) {
+    if (!attachment.url) {
+      continue;
     }
-  ];
+    input.push({
+      type: 'input_image',
+      image_url: {
+        url: attachment.url
+      }
+    });
+  }
+  return input.length > 0
+    ? input
+    : [
+        {
+          type: 'text',
+          text,
+          text_elements: []
+        }
+      ];
 }
 
 function buildFallbackTranscript(
@@ -1287,9 +1371,9 @@ function buildFallbackTranscript(
         label: 'Codex is running. Wait for it to finish.'
       }
     : {
-        canSend: true,
-        reason: 'ready',
-        label: 'Ready'
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Codex is working'
       };
   const message: ChatMessage = {
     id: `pending-${turnId}`,
@@ -1300,8 +1384,24 @@ function buildFallbackTranscript(
   };
   return {
     threadId,
-    activeTurnId: wasStreaming ? turnId : null,
+    provider: 'codex',
+    providerThreadId: threadId,
+    activeTurnId: turnId,
     sendState,
     messages: [message]
   };
+}
+
+function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })
+  ]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  });
 }

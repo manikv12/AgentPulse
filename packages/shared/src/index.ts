@@ -42,6 +42,7 @@ export const ThreadSchema = z.object({
   title: z.string().min(1),
   workspace: z.string().min(1),
   workspacePath: z.string().min(1).optional(),
+  workspaceKind: z.enum(['project', 'chat']).optional(),
   status: ThreadStatusSchema,
   lastActivityAt: isoUtcTimestamp,
   lastTurnSummary: z.string(),
@@ -205,13 +206,18 @@ export const ThreadOpenRequestSchema = z.object({
 export const ThreadCreateRequestSchema = z
   .object({
     provider: AgentProviderSchema.default('codex'),
+    location: z.enum(['chat']).optional(),
     projectId: z.string().trim().min(1).optional(),
     cwd: z.string().trim().min(1).optional(),
     modelSlug: z.string().trim().min(1).optional(),
     reasoningEffort: z.string().trim().min(1).optional()
   })
-  .refine((value) => Boolean(value.projectId) !== Boolean(value.cwd), {
-    message: 'Choose a project or folder path.'
+  .refine((value) => {
+    const targetCount = [value.location === 'chat', Boolean(value.projectId), Boolean(value.cwd)]
+      .filter(Boolean).length;
+    return targetCount === 1;
+  }, {
+    message: 'Choose a chat, project, or folder path.'
   });
 
 export const CHAT_MESSAGE_ROLES = ['user', 'assistant', 'activity', 'system'] as const;
@@ -230,6 +236,7 @@ export const ChatAttachmentSchema = z.object({
   kind: z.literal('image'),
   url: z.string().min(1),
   alt: z.string().min(1).optional(),
+  mimeType: z.string().min(1).optional(),
   sourcePath: z.string().min(1).optional()
 });
 
@@ -317,10 +324,22 @@ export const COLLABORATION_MODES = ['default', 'plan'] as const;
 
 export type CollaborationModeKind = (typeof COLLABORATION_MODES)[number];
 
-export const ThreadMessageRequestSchema = z.object({
-  text: z.string().trim().min(1).max(4000),
-  collaborationMode: z.enum(COLLABORATION_MODES).optional()
-});
+export const ThreadMessageRequestSchema = z
+  .object({
+    text: z.string().trim().max(4000).optional().default(''),
+    collaborationMode: z.enum(COLLABORATION_MODES).optional(),
+    attachments: z.array(ChatAttachmentSchema).max(6).optional()
+  })
+  .superRefine((payload, context) => {
+    if (payload.text || (payload.attachments?.length ?? 0) > 0) {
+      return;
+    }
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['text'],
+      message: 'Message text or an image attachment is required.'
+    });
+  });
 
 export const ThreadMessageResponseSchema = z.object({
   ok: z.literal(true),
@@ -347,8 +366,17 @@ export const DeviceRevokeRequestSchema = z.object({
   deviceId: z.string().min(1)
 });
 
+export const ThreadListGroupSchema = z.object({
+  groupKey: z.string().min(1),
+  total: z.number().int().nonnegative(),
+  visible: z.number().int().nonnegative()
+});
+
+export type ThreadListGroup = z.infer<typeof ThreadListGroupSchema>;
+
 export const ThreadListResponseSchema = z.object({
-  threads: z.array(ThreadSchema)
+  threads: z.array(ThreadSchema),
+  groups: z.array(ThreadListGroupSchema).optional()
 });
 
 export const ProjectListResponseSchema = z.object({
@@ -357,6 +385,175 @@ export const ProjectListResponseSchema = z.object({
 
 export const ThreadCreateResponseSchema = z.object({
   thread: ThreadSchema
+});
+
+export const HANDOFF_STATUSES = [
+  'starting',
+  'working',
+  'waiting_approval',
+  'blocked',
+  'done',
+  'stopped',
+  'error',
+  'unknown'
+] as const;
+
+export const HandoffStatusSchema = z.enum(HANDOFF_STATUSES);
+export type HandoffStatus = z.infer<typeof HandoffStatusSchema>;
+
+export const HandoffSummaryDraftRequestSchema = z.object({
+  sourceThreadId: z.string().min(1),
+  targetProvider: AgentProviderSchema,
+  userInstruction: z.string().trim().min(1).max(2000)
+});
+
+export const HandoffSummaryDraftSchema = z.object({
+  sourceThreadId: z.string().min(1),
+  sourceProvider: AgentProviderSchema,
+  targetProvider: AgentProviderSchema,
+  workspace: z.string().min(1),
+  workspacePath: z.string().min(1).optional(),
+  branch: z.string().min(1).optional(),
+  userInstruction: z.string().min(1),
+  summary: z.string().min(1),
+  prompt: z.string().min(1),
+  evidence: z.object({
+    sourceTitle: z.string().min(1).optional(),
+    latestUserGoal: z.string().min(1).optional(),
+    failedCommand: z.string().min(1).optional(),
+    filesMentioned: z.array(z.string().min(1)).default([]),
+    messageCount: z.number().int().nonnegative()
+  })
+});
+
+export type HandoffSummaryDraft = z.infer<typeof HandoffSummaryDraftSchema>;
+
+export const HandoffSummaryDraftResponseSchema = z.object({
+  draft: HandoffSummaryDraftSchema
+});
+
+export const HandoffSendRequestSchema = z.object({
+  sourceThreadId: z.string().min(1),
+  targetProvider: AgentProviderSchema,
+  userInstruction: z.string().trim().min(1).max(2000),
+  summary: z.string().trim().min(1).max(6000),
+  prompt: z.string().trim().min(1).max(9000),
+  target: ThreadCreateRequestSchema.optional()
+});
+
+export const LinkedHandoffStatusSchema = z.object({
+  handoffId: z.string().min(1),
+  sourceThreadId: z.string().min(1),
+  sourceProvider: AgentProviderSchema,
+  targetProvider: AgentProviderSchema,
+  targetThreadId: z.string().min(1).optional(),
+  targetTitle: z.string().min(1).optional(),
+  status: HandoffStatusSchema,
+  latestProgressSummary: z.string().min(1).optional(),
+  lastActivityAt: isoUtcTimestamp,
+  blockers: z.array(z.string().min(1)).default([])
+});
+
+export type LinkedHandoffStatus = z.infer<typeof LinkedHandoffStatusSchema>;
+
+export const HandoffPackageSchema = LinkedHandoffStatusSchema.extend({
+  workspace: z.string().min(1),
+  workspacePath: z.string().min(1).optional(),
+  branch: z.string().min(1).optional(),
+  sourceTitle: z.string().min(1).optional(),
+  userInstruction: z.string().min(1),
+  summary: z.string().min(1),
+  prompt: z.string().min(1),
+  createdAt: isoUtcTimestamp,
+  updatedAt: isoUtcTimestamp,
+  returnedAt: isoUtcTimestamp.optional()
+});
+
+export type HandoffPackage = z.infer<typeof HandoffPackageSchema>;
+
+export const HandoffPackageResponseSchema = z.object({
+  handoff: HandoffPackageSchema
+});
+
+export const HandoffListResponseSchema = z.object({
+  handoffs: z.array(HandoffPackageSchema)
+});
+
+export const ReturnHandoffRequestSchema = z.object({
+  summary: z.string().trim().min(1).max(6000),
+  prompt: z.string().trim().min(1).max(9000)
+});
+
+export const HandoffDeleteResponseSchema = z.object({
+  ok: z.literal(true)
+});
+
+export const ApprovalInboxItemSchema = z.object({
+  id: z.string().min(1),
+  requestId: z.string().min(1),
+  threadId: z.string().min(1),
+  provider: AgentProviderSchema,
+  workspace: z.string().min(1),
+  workspacePath: z.string().min(1).optional(),
+  threadTitle: z.string().min(1),
+  approvalType: z.string().min(1),
+  shortReason: z.string().min(1),
+  commandOrFileSummary: z.string().min(1).optional(),
+  ageMs: z.number().int().nonnegative(),
+  riskLevel: z.enum(['low', 'medium', 'high', 'unknown']),
+  availableActions: z.array(z.enum(['open_thread', 'open_on_mac', 'respond'])),
+  createdAt: isoUtcTimestamp
+});
+
+export type ApprovalInboxItem = z.infer<typeof ApprovalInboxItemSchema>;
+
+export const ApprovalInboxResponseSchema = z.object({
+  items: z.array(ApprovalInboxItemSchema),
+  total: z.number().int().nonnegative()
+});
+
+export const TranscriptCommentDraftRequestSchema = z.object({
+  messageId: z.string().min(1),
+  selectedText: z.string().trim().min(1).max(4000),
+  userInstruction: z.string().trim().max(2000).optional()
+});
+
+export const TranscriptCommentDraftSchema = z.object({
+  threadId: z.string().min(1),
+  messageId: z.string().min(1),
+  selectedText: z.string().min(1),
+  trimmed: z.boolean(),
+  prompt: z.string().min(1)
+});
+
+export type TranscriptCommentDraft = z.infer<typeof TranscriptCommentDraftSchema>;
+
+export const TranscriptCommentDraftResponseSchema = z.object({
+  draft: TranscriptCommentDraftSchema
+});
+
+export const TouchCommandSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().min(1).optional(),
+  action: z.enum([
+    'new_thread',
+    'open_on_mac',
+    'stop_work',
+    'change_model',
+    'show_approvals',
+    'search_threads',
+    'handoff'
+  ]),
+  enabled: z.boolean(),
+  disabledReason: z.string().min(1).optional(),
+  context: z.enum(['global', 'thread']).default('global')
+});
+
+export type TouchCommand = z.infer<typeof TouchCommandSchema>;
+
+export const TouchCommandSheetResponseSchema = z.object({
+  commands: z.array(TouchCommandSchema)
 });
 
 export const CatalogPluginSchema = z.object({
@@ -567,6 +764,39 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
     payload: z.object({
       threadId: z.string().min(1),
       seenAt: z.number().int().nonnegative()
+    })
+  }),
+  z.object({
+    type: z.literal('handoff/changed'),
+    payload: HandoffPackageSchema
+  }),
+  z.object({
+    type: z.literal('handoff/removed'),
+    payload: z.object({ handoffId: z.string().min(1) })
+  }),
+  z.object({
+    type: z.literal('approval-inbox/changed'),
+    payload: ApprovalInboxResponseSchema
+  }),
+  // Per-token assistant streaming. Emitted by providers that can deliver text
+  // word-by-word (currently Claude Code via stream_event). The tablet keeps a
+  // partial-text overlay keyed on messageId until the matching `text-end`
+  // arrives or the next full transcript snapshot supersedes it. Optional —
+  // providers without per-token streaming simply do not emit these events and
+  // the existing transcript snapshot path keeps working.
+  z.object({
+    type: z.literal('thread/assistant/text-delta'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      messageId: z.string().min(1),
+      delta: z.string()
+    })
+  }),
+  z.object({
+    type: z.literal('thread/assistant/text-end'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      messageId: z.string().min(1)
     })
   })
 ]);

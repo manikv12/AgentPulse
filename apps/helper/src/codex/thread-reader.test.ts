@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   CodexThreadReader,
@@ -390,7 +390,7 @@ describe('Codex thread reader', () => {
     ).toBe(true);
   });
 
-  it('hides old projectless chats that are not part of the Codex sidebar projects', () => {
+  it('keeps projectless Codex chats visible so they can live in Chats', () => {
     const sidebar = parseCodexSidebarState(
       JSON.stringify({
         'electron-saved-workspace-roots': ['/Users/me/projects/OpenAssist'],
@@ -407,7 +407,77 @@ describe('Codex thread reader', () => {
         'idle',
         sidebar
       )
-    ).toBe(false);
+    ).toBe(true);
+  });
+
+  it('groups raw Agent Pulse chat folders under Chats even when Codex collapses them to the home root', async () => {
+    const home = homedir();
+    const chatRoot = path.join(home, 'Library', 'Application Support', 'Agent Pulse', 'Chats');
+    const chatCwd = path.join(chatRoot, 'codex', '2026-05-01-smoke-test');
+    const reader = new CodexThreadReader({ chatRoot }) as any;
+    const sidebar = parseCodexSidebarState(
+      JSON.stringify({
+        'electron-saved-workspace-roots': [home],
+        'project-order': [home]
+      })
+    );
+
+    reader.readSidebarState = async () => sidebar;
+    reader.readSqliteRows = async () => [
+      {
+        id: 'thread-shared-chat',
+        title: 'Agent Pulse smoke test',
+        cwd: chatCwd,
+        source: 'vscode',
+        updated_at_ms: 1777133990620,
+        archived: 0,
+        rollout_path: ''
+      }
+    ];
+    reader.readSignalsForRow = async () => [];
+
+    await expect(reader.listThreads()).resolves.toMatchObject([
+      {
+        threadId: 'thread-shared-chat',
+        workspace: 'Chats',
+        workspaceKind: 'chat'
+      }
+    ]);
+    await expect(reader.listProjects()).resolves.toEqual([]);
+  });
+
+  it('groups the home workspace bucket under Chats instead of Projects', async () => {
+    const home = homedir();
+    const reader = new CodexThreadReader() as any;
+    const sidebar = parseCodexSidebarState(
+      JSON.stringify({
+        'electron-saved-workspace-roots': [home],
+        'project-order': [home]
+      })
+    );
+
+    reader.readSidebarState = async () => sidebar;
+    reader.readSqliteRows = async () => [
+      {
+        id: 'thread-home-chat',
+        title: 'Regular chat',
+        cwd: home,
+        source: 'vscode',
+        updated_at_ms: 1777133990620,
+        archived: 0,
+        rollout_path: ''
+      }
+    ];
+    reader.readSignalsForRow = async () => [];
+
+    await expect(reader.listThreads()).resolves.toMatchObject([
+      {
+        threadId: 'thread-home-chat',
+        workspace: 'Chats',
+        workspaceKind: 'chat'
+      }
+    ]);
+    await expect(reader.listProjects()).resolves.toEqual([]);
   });
 
   it('still shows running or attention threads even when they are projectless', () => {

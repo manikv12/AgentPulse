@@ -90,6 +90,82 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('returns accepted send quickly when the transcript refresh is slow', async () => {
+    vi.useFakeTimers();
+    const { ipc, sendRequest, setReady } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(() => new Promise<ThreadTranscript>(() => undefined)) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    sendRequest.mockResolvedValueOnce({ result: { turn: { id: 'turn-slow' } } });
+
+    try {
+      const responsePromise = mirror.sendMessage('thread-1', 'hello from phone');
+      await vi.advanceTimersByTimeAsync(1_501);
+      const response = await responsePromise;
+
+      expect(response).toMatchObject({
+        ok: true,
+        mode: 'start',
+        turnId: 'turn-slow',
+        transcript: {
+          threadId: 'thread-1',
+          provider: 'codex',
+          providerThreadId: 'thread-1',
+          activeTurnId: 'turn-slow',
+          sendState: {
+            canSend: false,
+            reason: 'thread_changed',
+            label: 'Codex is working'
+          }
+        }
+      });
+      expect(response.transcript.messages).toEqual([
+        expect.objectContaining({
+          id: 'pending-turn-slow',
+          role: 'user',
+          text: 'hello from phone'
+        })
+      ]);
+    } finally {
+      vi.useRealTimers();
+      mirror.dispose();
+    }
+  });
+
+  it('includes pasted image attachments in follower start-turn input', async () => {
+    const { ipc, sendRequest, setReady } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+    const imageUrl = 'data:image/png;base64,iVBORw0KGgo=';
+
+    sendRequest.mockResolvedValueOnce({ result: { turn: { id: 'turn-100' } } });
+
+    await mirror.sendMessage('thread-1', 'look at this', {
+      attachments: [
+        {
+          id: 'pasted-image-1',
+          kind: 'image',
+          url: imageUrl,
+          alt: 'Pasted image'
+        }
+      ]
+    });
+
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-start-turn', {
+      conversationId: 'thread-1',
+      turnStartParams: {
+        threadId: 'thread-1',
+        input: [
+          { type: 'text', text: 'look at this', text_elements: [] },
+          { type: 'input_image', image_url: { url: imageUrl } }
+        ]
+      }
+    });
+    mirror.dispose();
+  });
+
   it('switches to thread-follower-steer-turn when the thread is currently streaming', async () => {
     const { ipc, sendRequest, setReady, emitBroadcast } = createMockIpc();
     setReady(true);
@@ -293,6 +369,57 @@ describe('codex mirror', () => {
       threadId: 'thread-approval',
       isStreaming: false
     });
+    mirror.dispose();
+  });
+
+  it('drops stale approvals via clearPendingApprovalsForThread and notifies listeners', () => {
+    // Simulates the "stuck waiting_approval" bug: an approval entry was added
+    // but the matching resolution never arrived (e.g. lost ownership during
+    // a brief IPC disconnect). The poll loop calls clearPendingApprovalsForThread
+    // when Codex's authoritative remote status reports the thread as idle.
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onPendingApprovalsChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onPendingApprovalsChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-stuck',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['conversationState', 'requests', 0],
+            value: {
+              id: 'stale-permission-1',
+              method: 'item/permissions/requestApproval',
+              params: { reason: 'Approve permissions?' }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadWaitingForApproval('thread-stuck')).toBe(true);
+    expect(mirror.getPendingApprovalRequests('thread-stuck')).toHaveLength(1);
+
+    onPendingApprovalsChange.mockClear();
+    expect(mirror.clearPendingApprovalsForThread('thread-stuck')).toBe(true);
+
+    expect(mirror.isThreadWaitingForApproval('thread-stuck')).toBe(false);
+    expect(mirror.getPendingApprovalRequests('thread-stuck')).toEqual([]);
+    expect(onPendingApprovalsChange).toHaveBeenCalledWith({
+      threadId: 'thread-stuck',
+      requests: []
+    });
+
+    // Idempotent: calling again returns false and does not re-emit.
+    onPendingApprovalsChange.mockClear();
+    expect(mirror.clearPendingApprovalsForThread('thread-stuck')).toBe(false);
+    expect(onPendingApprovalsChange).not.toHaveBeenCalled();
+
     mirror.dispose();
   });
 
@@ -738,6 +865,25 @@ describe('codex mirror', () => {
     sendRequest.mockRejectedValueOnce(new Error('no-client-found'));
 
     await expect(mirror.sendMessage('thread-1', 'hi')).rejects.toBeInstanceOf(SendBlockedError);
+    mirror.dispose();
+  });
+
+  it('translates structured follower ownership errors into SendBlockedError', async () => {
+    const { ipc, sendRequest, setReady } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    const structuredError = new Error('{"code":"client-cannot-handle-request"}');
+    structuredError.cause = {
+      code: 'client-cannot-handle-request',
+      message: 'Thread is not owned by this Codex window.'
+    };
+    sendRequest.mockRejectedValueOnce(structuredError);
+
+    await expect(mirror.sendMessage('thread-1', 'hi')).rejects.toMatchObject({
+      reason: 'thread_unavailable'
+    });
     mirror.dispose();
   });
 

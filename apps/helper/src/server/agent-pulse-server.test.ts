@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -19,6 +19,10 @@ function createAdminAuth(): AdminAuth {
       'admin.json'
     )
   });
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 describe('Agent Pulse helper API', () => {
@@ -133,6 +137,183 @@ describe('Agent Pulse helper API', () => {
         headers: authHeaders(pairedBody.token, pairedBody.deviceId)
       });
       expect(afterRevoke.status).toBe(403);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('lists only the first page per project and expands one project on request', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const workspacePath = '/Users/test/projects/CodexPulse';
+    const threads: Thread[] = Array.from({ length: 14 }, (_, index) => ({
+      threadId: `thread-${index}`,
+      provider: 'codex',
+      title: `Thread ${index}`,
+      workspace: 'CodexPulse',
+      workspacePath,
+      status: 'idle',
+      lastActivityAt: new Date(Date.parse('2026-05-02T12:00:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+    const listThreads = vi.fn(async (options?: { defaultLimit?: number; groupLimits?: Map<string, number> }) => {
+      const limit = options?.groupLimits?.get(workspacePath) ?? options?.defaultLimit ?? threads.length;
+      return threads.slice(0, limit);
+    });
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const defaultResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(defaultResponse.status).toBe(200);
+      await expect(defaultResponse.json()).resolves.toMatchObject({
+        threads: threads.slice(0, 6),
+        groups: [{ groupKey: workspacePath, total: 7, visible: 6 }]
+      });
+
+      const expandedUrl = new URL(`${server.url}/threads/list`);
+      expandedUrl.searchParams.append('groupLimit', JSON.stringify({ groupKey: workspacePath, limit: 12 }));
+      const expandedResponse = await fetch(expandedUrl, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(expandedResponse.status).toBe(200);
+      await expect(expandedResponse.json()).resolves.toMatchObject({
+        threads: threads.slice(0, 12),
+        groups: [{ groupKey: workspacePath, total: 13, visible: 12 }]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('creates clean handoff summaries from conversation messages instead of tool logs', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-watch',
+      provider: 'codex',
+      title: 'Apple Watch requirements',
+      workspace: 'CodexPulse',
+      workspacePath: '/Users/test/CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-05-02T14:10:00Z',
+      lastTurnSummary: 'Prepared watch app requirements.'
+    };
+    const transcript: ThreadTranscript = {
+      threadId: thread.threadId,
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Can we make an Apple Watch app and save docs/WATCH_APP_REQUIREMENTS.md?',
+          createdAt: '2026-05-02T14:01:00Z'
+        },
+        {
+          id: 'tool-1',
+          role: 'activity',
+          kind: 'tool',
+          text: 'apply_patch failed with noisy raw tool payload',
+          createdAt: '2026-05-02T14:02:00Z'
+        },
+        {
+          id: 'command-1',
+          role: 'activity',
+          kind: 'command',
+          text: 'cat > docs/WATCH_APP_REQUIREMENTS.md <<EOF',
+          createdAt: '2026-05-02T14:03:00Z'
+        },
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: [
+            'I could not persist the file because this session has no write permission.',
+            '',
+            'Research-locked decisions:',
+            '- Native watchOS app with SwiftUI.',
+            '- Reuse the existing Agent Pulse helper API.',
+            '- The first release should use APNs for timely background awareness.',
+            '',
+            'Next, create docs/WATCH_APP_REQUIREMENTS.md and link it from README.md.'
+          ].join('\n'),
+          createdAt: '2026-05-02T14:04:00Z'
+        }
+      ]
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer: {
+        isConnected: () => true,
+        readTranscript: vi.fn(async () => transcript),
+        sendMessage: vi.fn()
+      },
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/handoffs/summary-draft`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          sourceThreadId: thread.threadId,
+          targetProvider: 'claude-code',
+          userInstruction: 'Implement the watch requirements doc.'
+        })
+      });
+      const body = (await response.json()) as { draft: { summary: string; evidence: { messageCount: number } } };
+
+      expect(response.status).toBe(200);
+      expect(body.draft.summary).toContain('Native watchOS app with SwiftUI.');
+      expect(body.draft.summary).toContain('Reuse the existing Agent Pulse helper API.');
+      expect(body.draft.summary).toContain('could not persist the file');
+      expect(body.draft.summary).toContain('docs/WATCH_APP_REQUIREMENTS.md');
+      expect(body.draft.summary).not.toContain('apply_patch');
+      expect(body.draft.summary).not.toContain('cat >');
+      expect(body.draft.summary).not.toContain('Messages inspected');
+      expect(body.draft.evidence.messageCount).toBe(2);
     } finally {
       await server.stop();
     }
@@ -985,6 +1166,12 @@ describe('Agent Pulse helper API', () => {
       mobileSendEnabled: true,
       remoteAccess: remoteAccessSettings()
     };
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
     const server = await startAgentPulseServer({
       settings,
       settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
@@ -1050,6 +1237,12 @@ describe('Agent Pulse helper API', () => {
       lanEnabled: false,
       mobileSendEnabled: true,
       remoteAccess: remoteAccessSettings()
+    };
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
     };
     const server = await startAgentPulseServer({
       settings,
@@ -2491,6 +2684,307 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('accepts pasted image attachments and exposes them on the sent user message', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Look at this.',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => {
+        throw new Error('app-server send must not be used when the mirror is connected.');
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'mirror-turn-1',
+        transcript
+      })),
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const imageBytes = Buffer.from('89504e470d0a1a0a', 'hex');
+      const imageUrl = `data:image/png;base64,${imageBytes.toString('base64')}`;
+      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          text: 'Look at this.',
+          attachments: [
+            {
+              id: 'pasted-image-1',
+              kind: 'image',
+              url: imageUrl,
+              alt: 'Pasted image 1',
+              mimeType: 'image/png'
+            }
+          ]
+        })
+      });
+      const sent = (await sendResponse.json()) as { transcript: ThreadTranscript };
+      const attachment = sent.transcript.messages[0]?.attachments?.[0];
+
+      expect(sendResponse.status).toBe(200);
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Look at this.', {
+        attachments: [
+          {
+            id: 'pasted-image-1',
+            kind: 'image',
+            url: imageUrl,
+            alt: 'Pasted image 1',
+            mimeType: 'image/png'
+          }
+        ]
+      });
+      expect(attachment).toMatchObject({
+        id: 'pasted-image-1',
+        kind: 'image',
+        alt: 'Pasted image 1',
+        mimeType: 'image/png'
+      });
+      expect(attachment?.url).toMatch(/^\/attachments\/[a-f0-9]+$/);
+
+      const imageResponse = await fetch(`${server.url}${attachment?.url}`);
+      expect(imageResponse.status).toBe(200);
+      expect(imageResponse.headers.get('content-type')).toBe('image/png');
+      await expect(imageResponse.arrayBuffer()).resolves.toEqual(
+        imageBytes.buffer.slice(imageBytes.byteOffset, imageBytes.byteOffset + imageBytes.byteLength)
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('re-opens Codex and retries when the mirror reports the thread is not active', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => {
+        throw new Error('app-server send must not be used when the mirror can retry.');
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new SendBlockedError(
+            'thread_unavailable',
+            'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+          )
+        )
+        .mockResolvedValueOnce({
+          ok: true as const,
+          mode: 'start' as const,
+          turnId: 'mirror-turn-1',
+          transcript
+        }),
+      isThreadOwned: () => false,
+      waitForOwnership: vi.fn(async () => true)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Hello from phone.' })
+      });
+
+      expect(sendResponse.status).toBe(200);
+      expect(opener.openThread).toHaveBeenCalledTimes(2);
+      expect(opener.openThread).toHaveBeenNthCalledWith(1, 'thread-1', {
+        refreshMode: 'mini-window'
+      });
+      expect(opener.openThread).toHaveBeenNthCalledWith(2, 'thread-1', {
+        refreshMode: 'mini-window'
+      });
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4000);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2000);
+      expect(mirror.sendMessage).toHaveBeenCalledTimes(2);
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('falls back to app-server send when Codex desktop never owns the thread', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'app-server-turn-1',
+        transcript
+      }))
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(async () => {
+        throw new SendBlockedError(
+          'thread_unavailable',
+          'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+        );
+      }),
+      isThreadOwned: () => false,
+      waitForOwnership: vi.fn(async () => false)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Hello from phone.', collaborationMode: 'plan' })
+      });
+
+      expect(sendResponse.status).toBe(200);
+      await expect(sendResponse.json()).resolves.toEqual({
+        ok: true,
+        mode: 'start',
+        turnId: 'app-server-turn-1',
+        transcript: {
+          ...transcript,
+          provider: 'codex'
+        }
+      });
+      expect(mirror.sendMessage).toHaveBeenCalledTimes(2);
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', {
+        collaborationMode: 'plan'
+      });
+      expect(opener.openThread).toHaveBeenCalledTimes(2);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4000);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2000);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('stops Codex work through app-server', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -3922,6 +4416,144 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('starts provider chats in the shared Agent Pulse chat folder', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const chatRoot = mkdtempSync(path.join(tmpdir(), 'agent-pulse-chats-'));
+    const codexStateDir = mkdtempSync(path.join(tmpdir(), 'agent-pulse-codex-state-'));
+    const codexGlobalStatePath = path.join(codexStateDir, '.codex-global-state.json');
+    writeFileSync(
+      codexGlobalStatePath,
+      JSON.stringify({
+        'projectless-thread-ids': ['thread-existing'],
+        'thread-workspace-root-hints': {
+          'thread-existing': '/Users/me/Documents/Codex'
+        }
+      }),
+      'utf8'
+    );
+    const chatProjectPath = path.join(chatRoot, 'codex', '2026-05-01-old-chat');
+    const normalProjectPath = mkdtempSync(path.join(tmpdir(), 'agent-pulse-project-'));
+    mkdirSync(chatProjectPath, { recursive: true });
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      startThread: vi.fn(async (cwd: string): Promise<Thread> => ({
+        threadId: 'thread-chat',
+        provider: 'codex',
+        title: 'New thread',
+        workspace: path.basename(cwd),
+        workspacePath: cwd,
+        status: 'idle',
+        lastActivityAt: '2026-05-01T10:00:00Z',
+        lastTurnSummary: ''
+      }))
+    };
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      isThreadOwned: () => false,
+      waitForOwnership: vi.fn(async () => true)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [],
+        listProjects: async () => [
+          {
+            projectId: 'chat-folder',
+            name: 'Old chat folder',
+            path: chatProjectPath,
+            providers: ['codex']
+          },
+          {
+            projectId: 'normal-project',
+            name: 'Normal project',
+            path: normalProjectPath,
+            providers: ['codex']
+          }
+        ]
+      },
+      opener,
+      mirror,
+      appServer,
+      chatRoot,
+      codexGlobalStatePath,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const projectsResponse = await fetch(`${server.url}/projects/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+      await expect(projectsResponse.json()).resolves.toEqual({
+        projects: [
+          {
+            projectId: 'normal-project',
+            name: 'Normal project',
+            path: normalProjectPath,
+            providers: ['codex']
+          }
+        ]
+      });
+
+      const createResponse = await fetch(`${server.url}/threads/new`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ location: 'chat', provider: 'codex' })
+      });
+      expect(createResponse.status).toBe(200);
+
+      const startedCwd = appServer.startThread.mock.calls[0]?.[0];
+      expect(startedCwd).toMatch(new RegExp(`^${escapeRegex(path.join(chatRoot, 'codex'))}`));
+      expect(existsSync(startedCwd ?? '')).toBe(true);
+      expect(opener.openThread).toHaveBeenCalledWith('thread-chat', { refreshMode: 'mini-window' });
+      expect(mirror.waitForOwnership).toHaveBeenCalledWith('thread-chat', 4000);
+      const codexState = JSON.parse(readFileSync(codexGlobalStatePath, 'utf8')) as Record<string, unknown>;
+      expect(codexState['projectless-thread-ids']).toEqual(['thread-existing', 'thread-chat']);
+      expect(codexState['thread-workspace-root-hints']).toMatchObject({
+        'thread-existing': '/Users/me/Documents/Codex',
+        'thread-chat': chatRoot
+      });
+      await expect(createResponse.json()).resolves.toEqual({
+        thread: {
+          threadId: 'thread-chat',
+          provider: 'codex',
+          title: 'New thread',
+          workspace: 'Chats',
+          workspacePath: startedCwd,
+          workspaceKind: 'chat',
+          status: 'idle',
+          lastActivityAt: '2026-05-01T10:00:00Z',
+          lastTurnSummary: ''
+        }
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('discards a new Codex draft thread without archiving provider history', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -4109,6 +4741,91 @@ describe('Agent Pulse helper API', () => {
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({ ok: true });
       expect(claudeCode.deleteThread).toHaveBeenCalledWith('claude-code:thread-delete');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('backfills Codex projectless registration for existing shared chats', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const chatRoot = mkdtempSync(path.join(tmpdir(), 'agent-pulse-chats-'));
+    const codexStateDir = mkdtempSync(path.join(tmpdir(), 'agent-pulse-codex-state-'));
+    const codexGlobalStatePath = path.join(codexStateDir, '.codex-global-state.json');
+    writeFileSync(codexGlobalStatePath, JSON.stringify({}), 'utf8');
+    const chatWorkspacePath = path.join(chatRoot, 'codex', '2026-05-01-existing-chat');
+    mkdirSync(chatWorkspacePath, { recursive: true });
+    const existingThread: Thread = {
+      threadId: 'thread-existing-chat',
+      provider: 'codex',
+      title: 'Existing shared chat',
+      workspace: path.basename(chatWorkspacePath),
+      workspacePath: chatWorkspacePath,
+      status: 'idle',
+      lastActivityAt: '2026-05-01T10:00:00Z',
+      lastTurnSummary: ''
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [existingThread]
+      },
+      opener,
+      chatRoot,
+      codexGlobalStatePath,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const openResponse = await fetch(`${server.url}/thread/open`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ threadId: 'thread-existing-chat', mode: 'open' })
+      });
+      expect(openResponse.status).toBe(200);
+      expect(opener.openThread).toHaveBeenCalledWith('thread-existing-chat', {
+        refreshMode: 'mini-window'
+      });
+
+      const listResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(listResponse.status).toBe(200);
+      await expect(listResponse.json()).resolves.toEqual({
+        threads: [
+          {
+            ...existingThread,
+            workspace: 'Chats',
+            workspaceKind: 'chat'
+          }
+        ]
+      });
+      const codexState = JSON.parse(readFileSync(codexGlobalStatePath, 'utf8')) as Record<string, unknown>;
+      expect(codexState['projectless-thread-ids']).toEqual(['thread-existing-chat']);
+      expect(codexState['thread-workspace-root-hints']).toEqual({
+        'thread-existing-chat': chatRoot
+      });
     } finally {
       await server.stop();
     }

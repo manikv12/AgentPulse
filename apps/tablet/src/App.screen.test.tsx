@@ -209,6 +209,72 @@ describe('App screen routing', () => {
     expect(sessionStorage.getItem('agent-pulse-admin-token')).toBeNull();
   });
 
+  it('keeps settings open when the device session expires in the background', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'stale-token',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+    sessionStorage.setItem('agent-pulse-admin-token', 'admin-token');
+    window.location.hash = '#/settings';
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          return jsonResponse({
+            status: 'ok',
+            codexAppServer: 'connected',
+            version: '0.1.0',
+            uptimeSec: 60
+          });
+        }
+
+        if (url === '/threads/list') {
+          return new Response(JSON.stringify({ error: 'invalid' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          });
+        }
+
+        if (url === '/device/session/recover') {
+          return new Response(JSON.stringify({ error: 'invalid' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          });
+        }
+
+        if (url === '/settings/get') {
+          return jsonResponse({
+            settings: {
+              port: 61482,
+              lanEnabled: false,
+              mobileSendEnabled: false
+            },
+            devices: []
+          });
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    vi.stubGlobal('WebSocket', createMockWebSocket());
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Agent Pulse settings' })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(localStorage.getItem('agent-pulse-session')).toBeNull();
+      expect(screen.getByRole('heading', { name: 'Agent Pulse settings' })).toBeInTheDocument();
+    });
+    expect(screen.queryByRole('heading', { name: 'How will you use this?' })).not.toBeInTheDocument();
+  });
+
   it('keeps settings in the URL when settings is opened from the thread dashboard', async () => {
     localStorage.setItem(
       'agent-pulse-session',

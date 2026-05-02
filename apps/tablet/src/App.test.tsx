@@ -657,6 +657,80 @@ describe('Agent Pulse tablet UI', () => {
     expect(sockets.at(-1)?.url).toContain('token=fresh-token-1234567890');
   });
 
+  it('keeps the saved session and goes offline when session recovery times out', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'stale-token',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const threadListTokens: string[] = [];
+    const sockets: Array<{ url: string; close: ReturnType<typeof vi.fn> }> = [];
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      readonly close = vi.fn();
+
+      constructor(readonly url: string | URL) {
+        sockets.push({ url: String(url), close: this.close });
+      }
+    }
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          const headers = new Headers(init?.headers);
+          const token = (headers.get('authorization') ?? '').replace(/^Bearer\s+/, '');
+          threadListTokens.push(token);
+          return new Response(JSON.stringify({ error: 'invalid' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          });
+        }
+
+        if (url === '/device/session/recover') {
+          throw new Error('recover timed out');
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Helper offline' })).toBeInTheDocument();
+    expect(threadListTokens).toEqual(['stale-token']);
+    expect(JSON.parse(localStorage.getItem('agent-pulse-session') ?? '{}')).toMatchObject({
+      token: 'stale-token',
+      deviceId: 'device-1'
+    });
+    expect(screen.queryByRole('heading', { name: 'How will you use this?' })).not.toBeInTheDocument();
+    expect(sockets).toHaveLength(1);
+    await waitFor(() => {
+      expect(sockets[0]?.close).toHaveBeenCalled();
+    });
+  });
+
   it('shows reconnect pins for paired devices in admin settings', async () => {
     sessionStorage.setItem('agent-pulse-admin-token', 'admin-token');
     window.location.hash = '#/settings';
@@ -3438,7 +3512,8 @@ describe('Agent Pulse tablet UI', () => {
 
     expect(screen.getByRole('heading', { level: 1, name: 'Agent Pulse' })).toBeInTheDocument();
     const sidebar = screen.getByTestId('codex-sidebar');
-    expect(within(sidebar).getByText('Threads')).toBeInTheDocument();
+    expect(within(sidebar).getByText('Projects')).toBeInTheDocument();
+    expect(within(sidebar).getByText('Chats')).toBeInTheDocument();
     expect(within(sidebar).getByLabelText('Thread list')).toBeInTheDocument();
     expect(within(sidebar).getAllByText('Agent Pulse').length).toBeGreaterThanOrEqual(1);
     expect(within(sidebar).getByText('OpenAssist')).toBeInTheDocument();
@@ -3452,6 +3527,152 @@ describe('Agent Pulse tablet UI', () => {
     expect(
       within(sidebar).getByRole('button', { name: 'Open chat for Write docs' })
     ).toBeInTheDocument();
+  });
+
+  it('shows a subtle show more control for project groups with older threads', () => {
+    const projectPath = '/Users/me/projects/AgentPulse';
+    const onShowMoreThreads = vi.fn();
+    const threads = Array.from({ length: 6 }, (_, index) => ({
+      threadId: `thread-${index}`,
+      title: `Project chat ${index}`,
+      workspace: 'Agent Pulse',
+      workspacePath: projectPath,
+      status: 'idle' as const,
+      lastActivityAt: new Date(Date.parse('2026-04-25T16:18:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={threads}
+        threadListGroups={[{ groupKey: projectPath, total: 7, visible: 6 }]}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: projectPath
+          }
+        ]}
+        onShowMoreThreads={onShowMoreThreads}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    const showMore = within(sidebar).getByRole('button', {
+      name: 'Show more chats in Agent Pulse'
+    });
+    expect(showMore).toHaveTextContent('Show more');
+
+    fireEvent.click(showMore);
+    expect(onShowMoreThreads).toHaveBeenCalledWith(projectPath);
+  });
+
+  it('shows sidebar loading feedback while threads are loading', () => {
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[]}
+        threadsLoaded={false}
+        projects={[]}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('Loading chats');
+  });
+
+  it('shows loading feedback on the project show more control', () => {
+    const projectPath = '/Users/me/projects/AgentPulse';
+    const threads = Array.from({ length: 6 }, (_, index) => ({
+      threadId: `thread-${index}`,
+      title: `Project chat ${index}`,
+      workspace: 'Agent Pulse',
+      workspacePath: projectPath,
+      status: 'idle' as const,
+      lastActivityAt: new Date(Date.parse('2026-04-25T16:18:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={threads}
+        threadsLoaded={false}
+        loadingThreadGroupKey={projectPath}
+        threadListGroups={[{ groupKey: projectPath, total: 7, visible: 6 }]}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: projectPath
+          }
+        ]}
+        onShowMoreThreads={vi.fn()}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    expect(within(sidebar).getByRole('status')).toHaveTextContent('Loading chats');
+  });
+
+  it('shows a show less control for expanded project groups', () => {
+    const projectPath = '/Users/me/projects/AgentPulse';
+    const onShowLessThreads = vi.fn();
+    const threads = Array.from({ length: 8 }, (_, index) => ({
+      threadId: `expanded-thread-${index}`,
+      title: `Expanded chat ${index}`,
+      workspace: 'Agent Pulse',
+      workspacePath: projectPath,
+      status: 'idle' as const,
+      lastActivityAt: new Date(Date.parse('2026-04-25T16:18:00Z') - index * 60_000).toISOString(),
+      lastTurnSummary: ''
+    }));
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={threads}
+        expandedThreadGroupKeys={new Set([projectPath])}
+        projects={[
+          {
+            projectId: 'project-agent-pulse',
+            name: 'Agent Pulse',
+            path: projectPath
+          }
+        ]}
+        onShowLessThreads={onShowLessThreads}
+      />
+    );
+
+    const sidebar = screen.getByTestId('codex-sidebar');
+    const showLess = within(sidebar).getByRole('button', {
+      name: 'Show fewer chats in Agent Pulse'
+    });
+    expect(showLess).toHaveTextContent('Show less');
+
+    fireEvent.click(showLess);
+    expect(onShowLessThreads).toHaveBeenCalledWith(projectPath);
   });
 
   it('fuzzy searches sidebar threads by title and project name', () => {
@@ -3497,7 +3718,7 @@ describe('Agent Pulse tablet UI', () => {
     );
 
     const sidebar = screen.getByTestId('codex-sidebar');
-    const search = within(sidebar).getByRole('searchbox', { name: 'Search threads or projects' });
+    const search = within(sidebar).getByRole('searchbox', { name: 'Search chats or projects' });
 
     fireEvent.change(search, { target: { value: 'opn ast' } });
     expect(within(sidebar).getByText('1 thread found')).toBeInTheDocument();
@@ -3516,9 +3737,9 @@ describe('Agent Pulse tablet UI', () => {
       within(sidebar).queryByRole('button', { name: 'Open chat for Review permission request' })
     ).not.toBeInTheDocument();
 
-    fireEvent.click(within(sidebar).getByRole('button', { name: 'Clear thread search' }));
+    fireEvent.click(within(sidebar).getByRole('button', { name: 'Clear search' }));
     expect(search).toHaveValue('');
-    expect(within(sidebar).getByText('Search by thread or project')).toBeInTheDocument();
+    expect(within(sidebar).getByText('Search by chat or project')).toBeInTheDocument();
   });
 
   it('shows waiting approval instead of working when the thread status is approval-blocked', async () => {
@@ -3712,6 +3933,186 @@ describe('Agent Pulse tablet UI', () => {
     );
   });
 
+  it('keeps unsent composer drafts separated by thread', async () => {
+    const transcriptA: ThreadTranscript = {
+      threadId: 'thread-a',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const transcriptB: ThreadTranscript = {
+      ...transcriptA,
+      threadId: 'thread-b'
+    };
+    const sendMessage = vi.fn();
+    const { rerender } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-a',
+          title: 'Thread A',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcriptA}
+        sendMessage={sendMessage}
+      />
+    );
+
+    const textareaA = screen.getByLabelText('Message Codex') as HTMLTextAreaElement;
+    fireEvent.change(textareaA, {
+      target: { value: 'Draft only for A' }
+    });
+    expect(textareaA.value).toBe('Draft only for A');
+
+    rerender(
+      <ThreadView
+        thread={{
+          threadId: 'thread-b',
+          title: 'Thread B',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcriptB}
+        sendMessage={sendMessage}
+      />
+    );
+
+    const textareaB = screen.getByLabelText('Message Codex') as HTMLTextAreaElement;
+    expect(textareaB.value).toBe('');
+    fireEvent.change(textareaB, {
+      target: { value: 'Draft only for B' }
+    });
+
+    rerender(
+      <ThreadView
+        thread={{
+          threadId: 'thread-a',
+          title: 'Thread A',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcriptA}
+        sendMessage={sendMessage}
+      />
+    );
+    expect((screen.getByLabelText('Message Codex') as HTMLTextAreaElement).value).toBe(
+      'Draft only for A'
+    );
+  });
+
+  it('lets the user paste an image and sends it as an attachment', async () => {
+    class MockFileReader {
+      result: string | ArrayBuffer | null = null;
+      onload: ((event: ProgressEvent<FileReader>) => void) | null = null;
+      onerror: (() => void) | null = null;
+
+      readAsDataURL() {
+        this.result = 'data:image/png;base64,iVBORw0KGgo=';
+        this.onload?.({ target: this } as unknown as ProgressEvent<FileReader>);
+      }
+    }
+    vi.stubGlobal('FileReader', MockFileReader);
+    const transcript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const sendMessage = vi.fn().mockResolvedValue({
+      ok: true,
+      mode: 'start',
+      turnId: 'turn-1',
+      transcript: {
+        ...transcript,
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            kind: 'message',
+            text: 'See this.',
+            createdAt: '2026-04-25T16:14:00Z',
+            attachments: [
+              {
+                id: 'pasted-image-1',
+                kind: 'image',
+                url: '/attachments/token',
+                alt: 'Pasted image 1'
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Paste image',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    const textarea = screen.getByLabelText('Message Codex');
+    const file = new File([new Uint8Array([1, 2, 3])], 'screenshot.png', {
+      type: 'image/png'
+    });
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [
+          {
+            kind: 'file',
+            type: 'image/png',
+            getAsFile: () => file
+          }
+        ]
+      }
+    });
+
+    expect(await screen.findByAltText('Pasted image 1')).toBeInTheDocument();
+    fireEvent.change(textarea, {
+      target: { value: 'See this.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenCalledWith(
+        'running-1',
+        'See this.',
+        expect.objectContaining({
+          attachments: [
+            expect.objectContaining({
+              kind: 'image',
+              url: 'data:image/png;base64,iVBORw0KGgo=',
+              alt: 'Pasted image 1',
+              mimeType: 'image/png'
+            })
+          ]
+        })
+      )
+    );
+  });
+
   it('lets the user start implementation from a plan request card', async () => {
     const transcript: ThreadTranscript = {
       threadId: 'running-1',
@@ -3761,17 +4162,7 @@ describe('Agent Pulse tablet UI', () => {
     );
   });
 
-  it('offers an app-server fallback to implement a visible plan', async () => {
-    const afterSendTranscript: ThreadTranscript = {
-      threadId: 'running-1',
-      activeTurnId: 'turn-2',
-      sendState: {
-        canSend: false,
-        reason: 'thread_changed',
-        label: 'Codex is working'
-      },
-      messages: []
-    };
+  it('does not show an implement popup for normal plan activity', async () => {
     const transcript: ThreadTranscript = {
       threadId: 'running-1',
       activeTurnId: null,
@@ -3790,12 +4181,7 @@ describe('Agent Pulse tablet UI', () => {
         }
       ]
     };
-    const sendMessage = vi.fn().mockResolvedValue({
-      ok: true,
-      mode: 'start',
-      turnId: 'turn-2',
-      transcript: afterSendTranscript
-    });
+    const sendMessage = vi.fn();
 
     render(
       <ThreadView
@@ -3812,11 +4198,8 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Implement plan' }));
-
-    await waitFor(() =>
-      expect(sendMessage).toHaveBeenCalledWith('running-1', 'Please implement this plan.')
-    );
+    expect(screen.queryByRole('button', { name: 'Implement plan' })).not.toBeInTheDocument();
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it('restores the previously open chat after a reload once threads finish loading', async () => {
@@ -3884,7 +4267,7 @@ describe('Agent Pulse tablet UI', () => {
     expect(fetchTranscript).toHaveBeenCalledWith('running-1', { messageLimit: 40 });
   });
 
-  it('keeps the latest two messages as the live tail and requires a hard top pull for more history', async () => {
+  it('keeps the latest two messages as the live tail and auto-loads more history near the top', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-1',
       activeTurnId: null,
@@ -3950,11 +4333,6 @@ describe('Agent Pulse tablet UI', () => {
     });
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
-
-    expect(fetchOlderMessages).not.toHaveBeenCalled();
-    fireEvent.wheel(scroller, { deltaY: -30 });
-    expect(fetchOlderMessages).not.toHaveBeenCalled();
-    fireEvent.wheel(scroller, { deltaY: -70 });
 
     await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
     expect(fetchTranscript).toHaveBeenCalledWith('thread-1', { messageLimit: 40 });
@@ -4050,6 +4428,17 @@ describe('Agent Pulse tablet UI', () => {
         y: 120,
         toJSON: () => ({})
       } as DOMRect)
+      .mockReturnValueOnce({
+        top: 120,
+        bottom: 160,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 120,
+        toJSON: () => ({})
+      } as DOMRect)
       .mockReturnValue({
         top: 300,
         bottom: 340,
@@ -4064,13 +4453,164 @@ describe('Agent Pulse tablet UI', () => {
 
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
-    fireEvent.wheel(scroller, { deltaY: -90 });
 
     expect(await screen.findByText('Older assistant message')).toBeInTheDocument();
     await waitFor(() => expect(scroller.scrollTop).toBe(180));
   });
 
-  it('does not auto-load older pages when the latest two messages do not fill the viewport', async () => {
+  it('keeps the visible message steady while the older-message loader appears', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'message-3',
+          role: 'user',
+          kind: 'message',
+          text: 'Latest user message',
+          createdAt: '2026-04-25T16:16:00Z'
+        },
+        {
+          id: 'message-4',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Newest assistant message',
+          createdAt: '2026-04-25T16:17:00Z'
+        }
+      ]
+    }));
+    let resolveOlderMessages: ((value: {
+      threadId: string;
+      messages: ThreadTranscript['messages'];
+      hasMore: boolean;
+    }) => void) | undefined;
+    const fetchOlderMessages = vi.fn(
+      () =>
+        new Promise<{
+          threadId: string;
+          messages: ThreadTranscript['messages'];
+          hasMore: boolean;
+        }>((resolve) => {
+          resolveOlderMessages = resolve;
+        })
+    );
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-1',
+          title: 'Thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:17:00Z',
+          lastTurnSummary: ''
+        }}
+        fetchTranscript={fetchTranscript}
+        fetchOlderMessages={fetchOlderMessages}
+      />
+    );
+
+    expect(await screen.findByText('Newest assistant message')).toBeInTheDocument();
+
+    const scroller = container.querySelector('.codex-thread-messages') as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { value: 1000, configurable: true },
+      clientHeight: { value: 400, configurable: true }
+    });
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({
+      top: 0,
+      bottom: 400,
+      left: 0,
+      right: 320,
+      width: 320,
+      height: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    } as DOMRect);
+    const anchor = screen
+      .getByText('Latest user message')
+      .closest('[data-scroll-anchor="true"]') as HTMLElement;
+    vi.spyOn(anchor, 'getBoundingClientRect')
+      .mockReturnValueOnce({
+        top: 120,
+        bottom: 160,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 120,
+        toJSON: () => ({})
+      } as DOMRect)
+      .mockReturnValueOnce({
+        top: 150,
+        bottom: 190,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 150,
+        toJSON: () => ({})
+      } as DOMRect)
+      .mockReturnValueOnce({
+        top: 150,
+        bottom: 190,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 150,
+        toJSON: () => ({})
+      } as DOMRect)
+      .mockReturnValue({
+        top: 300,
+        bottom: 340,
+        left: 0,
+        right: 320,
+        width: 320,
+        height: 40,
+        x: 0,
+        y: 300,
+        toJSON: () => ({})
+      } as DOMRect);
+
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+
+    expect(await screen.findByText('Loading older messages…')).toBeInTheDocument();
+    await waitFor(() => expect(scroller.scrollTop).toBe(30));
+
+    await act(async () => {
+      resolveOlderMessages?.({
+        threadId: 'thread-1',
+        messages: [
+          {
+            id: 'message-1',
+            role: 'user',
+            kind: 'message',
+            text: 'Older user message',
+            createdAt: '2026-04-25T16:14:00Z'
+          },
+          {
+            id: 'message-2',
+            role: 'assistant',
+            kind: 'message',
+            text: 'Older assistant message',
+            createdAt: '2026-04-25T16:15:00Z'
+          }
+        ],
+        hasMore: false
+      });
+    });
+
+    expect(await screen.findByText('Older assistant message')).toBeInTheDocument();
+    await waitFor(() => expect(scroller.scrollTop).toBe(180));
+  });
+
+  it('auto-loads older messages when the latest messages do not fill the viewport', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-1',
       activeTurnId: null,
@@ -4122,10 +4662,11 @@ describe('Agent Pulse tablet UI', () => {
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
 
-    expect(fetchOlderMessages).not.toHaveBeenCalled();
+    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-3', 40));
+    expect(await screen.findByText('Beginning of conversation.')).toBeInTheDocument();
   });
 
-  it('loads older pages from a hard touch pull at the top', async () => {
+  it('keeps the manual older-message control as a fallback', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-1',
       activeTurnId: null,
@@ -4181,9 +4722,9 @@ describe('Agent Pulse tablet UI', () => {
       scrollHeight: { value: 1000, configurable: true },
       clientHeight: { value: 400, configurable: true }
     });
-    scroller.scrollTop = 0;
-    fireEvent.touchStart(scroller, { touches: [{ clientY: 100 }] });
-    fireEvent.touchMove(scroller, { touches: [{ clientY: 175 }] });
+    scroller.scrollTop = 240;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load earlier messages' }));
 
     await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
   });
@@ -4839,6 +5380,79 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.queryByText(/web_search completed/)).not.toBeInTheDocument();
   });
 
+  it('keeps leading live activity attached to the first visible user message', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'copilot:thread-live',
+      provider: 'copilot',
+      activeTurnId: 'copilot-turn-live',
+      sendState: {
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Copilot is working'
+      },
+      messages: [
+        {
+          id: 'search-1',
+          role: 'activity',
+          kind: 'tool',
+          text: 'web_search completed',
+          createdAt: '2026-04-25T16:14:05Z'
+        },
+        {
+          id: 'assistant-draft',
+          role: 'assistant',
+          kind: 'message',
+          text: 'I found a possible source.',
+          createdAt: '2026-04-25T16:14:10Z'
+        },
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Can you check this?',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'browser-1',
+          role: 'activity',
+          kind: 'tool',
+          text: 'browser.open completed',
+          createdAt: '2026-04-25T16:14:12Z'
+        }
+      ]
+    };
+
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'copilot:thread-live',
+          provider: 'copilot',
+          title: 'New Copilot chat',
+          workspace: 'CodexPulse',
+          status: 'running',
+          lastActivityAt: '2026-04-25T16:14:12Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+      />
+    );
+
+    expect(screen.getByText('Can you check this?')).toBeInTheDocument();
+    expect(screen.getByText('I found a possible source.')).toBeInTheDocument();
+    expect(container.querySelector('.codex-message--assistant')).toBeNull();
+
+    const renderedOrder = Array.from(
+      container.querySelectorAll('.codex-message--user, .codex-activity-group, .codex-message--assistant')
+    ).map((node) =>
+      node.classList.contains('codex-message--user')
+        ? 'user'
+        : node.classList.contains('codex-activity-group')
+          ? 'activity'
+          : 'assistant'
+    );
+    expect(renderedOrder).toEqual(['user', 'activity']);
+  });
+
   it('keeps activity provider colors and assistant icons for Codex, Claude, and Copilot', () => {
     const cases = [
       { provider: 'codex' as const, tone: 'codex', avatar: '.codex-mark' },
@@ -5033,7 +5647,63 @@ describe('Agent Pulse tablet UI', () => {
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/local Claude history/i));
   });
 
-  it('uses a project dropdown before creating a new Codex thread', async () => {
+  it('uses shared chats by default before creating a new Codex thread', async () => {
+    const newThread = {
+      threadId: 'thread-new',
+      title: 'New thread',
+      workspace: 'Chats',
+      workspaceKind: 'chat' as const,
+      status: 'idle' as const,
+      lastActivityAt: '2026-04-26T10:00:00Z',
+      lastTurnSummary: ''
+    };
+    const onNewThread = vi.fn(async () => newThread);
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[]}
+        projects={[
+          {
+            projectId: 'project-openassist',
+            name: 'OpenAssist',
+            path: '/Users/me/projects/OpenAssist'
+          },
+          {
+            projectId: 'project-codexpulse',
+            name: 'CodexPulse',
+            path: '/Users/me/projects/CodexPulse'
+          }
+        ]}
+        onNewThread={onNewThread}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'New chat' });
+    expect(within(dialog).getByText('Start a new chat')).toBeInTheDocument();
+    expect(within(dialog).getByRole('radio', { name: 'Chats' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start chat' }));
+
+    await waitFor(() =>
+      expect(onNewThread).toHaveBeenCalledWith({
+        location: 'chat',
+        provider: 'codex'
+      })
+    );
+    expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
+  });
+
+  it('can still create a new Codex thread in a selected project', async () => {
     const newThread = {
       threadId: 'thread-new',
       title: 'New thread',
@@ -5069,15 +5739,15 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'New thread' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
 
-    const dialog = await screen.findByRole('dialog', { name: 'New thread' });
-    expect(within(dialog).getByText('Start a new thread')).toBeInTheDocument();
+    const dialog = await screen.findByRole('dialog', { name: 'New chat' });
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Project folder' }));
     fireEvent.change(within(dialog).getByRole('combobox', { name: 'Project' }), {
       target: { value: 'project-codexpulse' }
     });
     expect(within(dialog).queryByLabelText('Folder path')).not.toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Start thread' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start chat' }));
 
     await waitFor(() =>
       expect(onNewThread).toHaveBeenCalledWith({
@@ -5133,9 +5803,9 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'New thread in OpenAssist' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New chat in OpenAssist' }));
 
-    const dialog = await screen.findByRole('dialog', { name: 'New thread' });
+    const dialog = await screen.findByRole('dialog', { name: 'New chat' });
     expect(within(dialog).getByRole('combobox', { name: 'Project' })).toHaveValue('project-openassist');
     expect(within(dialog).getByRole('radio', { name: 'Codex' })).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole('radio', { name: 'Claude' }));
@@ -5145,7 +5815,7 @@ describe('Agent Pulse tablet UI', () => {
     expect(within(modelSelect).getByRole('option', { name: 'Claude Sonnet' })).toBeInTheDocument();
 
     fireEvent.change(modelSelect, { target: { value: 'sonnet' } });
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Start thread' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start chat' }));
 
     await waitFor(() =>
       expect(onNewThread).toHaveBeenCalledWith({
@@ -5199,9 +5869,9 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'New thread' }));
-    const dialog = await screen.findByRole('dialog', { name: 'New thread' });
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Start thread' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New chat' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start chat' }));
 
     expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Close thread chat' }));
@@ -5210,11 +5880,12 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.queryByRole('button', { name: /Open chat for New thread/ })).not.toBeInTheDocument();
   });
 
-  it('shows an empty dropdown state when no Codex projects are listed', async () => {
+  it('starts a shared chat even when no saved projects are listed', async () => {
     const newThread = {
       threadId: 'thread-new',
       title: 'New thread',
-      workspace: 'CodexPulse',
+      workspace: 'Chats',
+      workspaceKind: 'chat' as const,
       status: 'idle' as const,
       lastActivityAt: '2026-04-26T10:00:00Z',
       lastTurnSummary: ''
@@ -5235,15 +5906,21 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    const newThreadButton = screen.getByRole('button', { name: 'New thread' });
+    const newThreadButton = screen.getByRole('button', { name: 'New chat' });
     expect(newThreadButton).not.toBeDisabled();
     fireEvent.click(newThreadButton);
 
-    const dialog = await screen.findByRole('dialog', { name: 'New thread' });
-    expect(within(dialog).getByText('No saved projects are available yet.')).toBeInTheDocument();
+    const dialog = await screen.findByRole('dialog', { name: 'New chat' });
+    expect(within(dialog).getByRole('radio', { name: 'Project folder' })).toBeDisabled();
     expect(within(dialog).queryByLabelText('Folder path')).not.toBeInTheDocument();
-    expect(within(dialog).getByRole('button', { name: 'Start thread' })).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: 'Start chat' })).not.toBeDisabled();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start chat' }));
 
-    expect(onNewThread).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(onNewThread).toHaveBeenCalledWith({
+        location: 'chat',
+        provider: 'codex'
+      })
+    );
   });
 });

@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readdir, readFile, rm, stat } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   CatalogModelSchema,
@@ -11,6 +12,7 @@ import {
   ThreadSchema,
   ThreadTranscriptSchema,
   type CatalogModel,
+  type ChatAttachment,
   type ChatMessage,
   type LiveEvent,
   type PendingApprovalRequest,
@@ -28,6 +30,11 @@ const THREAD_PREFIX = `${COPILOT_PROVIDER}:`;
 const MAX_SESSIONS = 5_000;
 const DEFAULT_REASONING_EFFORT = 'medium';
 const COPILOT_START_GRACE_MS = 800;
+// If the Copilot CLI produces no stdout output at all for this long, treat the turn as
+// stuck and fail it. This catches the case where the child process is alive but silent
+// (e.g. the JSON shape we don't recognise, or the CLI is waiting on input we will never
+// send) so the thread doesn't spin on "Running" forever.
+const COPILOT_IDLE_TIMEOUT_MS = 5 * 60_000;
 const COPILOT_UNAVAILABLE_MODELS_CACHE_TTL_MS = 30_000;
 const REASONING_LEVELS = [
   { effort: 'low', description: 'Fast Copilot reasoning.' },
@@ -167,6 +174,11 @@ type CopilotProviderOptions = {
   usageReader?: { readUsage(): Promise<ThreadUsage | undefined> };
 };
 
+type CopilotThreadListOptions = {
+  defaultLimit?: number;
+  groupLimits?: Map<string, number> | Record<string, number>;
+};
+
 type ParsedCopilotSession = {
   nativeSessionId: string;
   threadId: string;
@@ -179,6 +191,13 @@ type ParsedCopilotSession = {
   model?: string;
   reasoningEffort?: string;
   messages: ChatMessage[];
+};
+
+type CopilotSessionCandidate = {
+  nativeSessionId: string;
+  dirPath: string;
+  workspacePath: string;
+  lastActivityMs: number;
 };
 
 type DraftCopilotThread = {
@@ -200,12 +219,14 @@ type LiveCopilotSession = {
   startedAt: string;
   model?: string;
   reasoningEffort?: string;
+  attachmentTempDir?: string;
   startGate: {
     settled: boolean;
     timer?: NodeJS.Timeout;
     resolve?: () => void;
     reject?: (error: Error) => void;
   };
+  idleTimer?: NodeJS.Timeout;
 };
 
 type CopilotFailureSummary = {
@@ -231,7 +252,7 @@ export class CopilotProvider {
 
   constructor(options: CopilotProviderOptions = {}) {
     this.copilotHome = options.copilotHome ?? path.join(homedir(), '.copilot');
-    this.executable = options.executable ?? 'copilot';
+    this.executable = options.executable ?? (options.spawnProcess ? 'copilot' : resolveCopilotExecutable());
     this.spawnProcess = options.spawnProcess ?? spawn;
     this.now = options.now ?? (() => new Date());
     this.usageReader = options.usageReader ?? new CopilotUsageReader({ copilotHome: this.copilotHome });
@@ -247,8 +268,8 @@ export class CopilotProvider {
     return () => this.liveStateListeners.delete(listener);
   }
 
-  async listThreads(): Promise<Thread[]> {
-    const sessions = await this.readSessions();
+  async listThreads(options: CopilotThreadListOptions = {}): Promise<Thread[]> {
+    const sessions = await this.readSessions(options);
     const threads = sessions.map((session) => this.threadFromSession(session));
     for (const draft of this.drafts.values()) {
       if (!threads.some((thread) => thread.threadId === draft.thread.threadId)) {
@@ -259,12 +280,9 @@ export class CopilotProvider {
   }
 
   async listProjects(): Promise<Project[]> {
-    const sessions = await this.readSessions();
     const paths = new Set<string>();
-    for (const session of sessions) {
-      if (path.isAbsolute(session.workspacePath)) {
-        paths.add(session.workspacePath);
-      }
+    for (const workspacePath of await this.readProjectPaths()) {
+      paths.add(workspacePath);
     }
     for (const draft of this.drafts.values()) {
       paths.add(draft.cwd);
@@ -353,7 +371,7 @@ export class CopilotProvider {
   async sendMessage(
     threadId: string,
     text: string,
-    options: { model?: string; effort?: string } = {}
+    options: { model?: string; effort?: string; attachments?: ChatAttachment[] } = {}
   ): Promise<ThreadMessageResponse> {
     const trimmed = text.trim();
     if (!trimmed) {
@@ -377,25 +395,50 @@ export class CopilotProvider {
       role: 'user',
       kind: 'message',
       text: trimmed,
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
       createdAt: this.now().toISOString()
     });
+    const promptInput = await copilotPromptWithAttachmentReferences(trimmed, options.attachments ?? []);
     const args = [
       `--resume=${nativeSessionId}`,
       '--prompt',
-      trimmed,
+      promptInput.prompt,
       '--output-format',
       'json',
       '--stream',
       'on',
       '--no-color',
+      // Run in autopilot, non-interactive: there is no user terminal attached
+      // to the CLI, so any tool that requires per-call approval (which is the
+      // default) fails immediately with `code: denied / message: "Permission
+      // denied and could not request permission from user"`. The Copilot CLI
+      // help text spells this out: --allow-all-tools is "required for
+      // non-interactive mode". Without these flags, the agent can read files
+      // but every write/patch/shell tool fails silently and the user only sees
+      // the agent give up partway.
+      //
+      // OpenAssist's Copilot integration uses --acp + session/set_mode
+      // autopilot to achieve the same effect over the Agent Client Protocol
+      // transport. We're on the prompt-based transport, so the equivalent is
+      // these CLI flags + --mode autopilot.
+      '--mode',
+      'autopilot',
+      '--allow-all-tools',
+      '--allow-all-paths',
       ...(model ? ['--model', model] : []),
       ...(effort ? ['--effort', effort] : [])
     ];
-    const child = this.spawnProcess(this.executable, args, {
-      cwd,
-      env: process.env,
-      stdio: 'pipe'
-    }) as ChildProcessWithoutNullStreams;
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = this.spawnProcess(this.executable, args, {
+        cwd,
+        env: copilotSpawnEnv(),
+        stdio: 'pipe'
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      await cleanupCopilotAttachmentTempDirForPrompt(promptInput);
+      throw new Error(copilotStartErrorMessage(error, this.executable));
+    }
     const live: LiveCopilotSession = {
       nativeSessionId,
       threadId,
@@ -409,18 +452,32 @@ export class CopilotProvider {
       startedAt: this.now().toISOString(),
       ...(model ? { model } : {}),
       ...(effort ? { reasoningEffort: effort } : {}),
+      ...(promptInput.tempDir ? { attachmentTempDir: promptInput.tempDir } : {}),
       startGate: {
         settled: false
       }
     };
-    this.drafts.delete(threadId);
     this.liveSessions.set(threadId, live);
+    const startPromise = this.awaitLiveStart(live);
+    this.armIdleWatchdog(live);
     child.stdout.on('data', (chunk) => this.handleStdout(live, chunk));
     child.stderr.on('data', (chunk) => {
       live.stderrBuffer += chunk.toString('utf8');
+      this.armIdleWatchdog(live);
+    });
+    child.stdin.on('error', (error) => {
+      if (this.liveSessions.get(threadId) !== live) return;
+      live.stderrBuffer = live.stderrBuffer || copilotStartErrorMessage(error, this.executable);
+      this.finishLiveSession(live, 'failed');
+    });
+    child.on('error', (error) => {
+      if (this.liveSessions.get(threadId) !== live) return;
+      live.stderrBuffer = live.stderrBuffer || copilotStartErrorMessage(error, this.executable);
+      this.finishLiveSession(live, 'failed');
     });
     child.on('exit', (code) => this.finishLiveSession(live, code === 0 ? 'completed' : 'failed', code ?? undefined));
-    await this.awaitLiveStart(live);
+    await startPromise;
+    this.drafts.delete(threadId);
     this.emitThreadWorking(threadId);
     return ThreadMessageResponseSchema.parse({
       ok: true,
@@ -446,6 +503,7 @@ export class CopilotProvider {
     if (live) {
       this.liveSessions.delete(threadId);
       live.process.kill('SIGTERM');
+      cleanupCopilotAttachmentTempDir(live);
     }
     this.modelOverrides.delete(threadId);
     this.effortOverrides.delete(threadId);
@@ -518,22 +576,30 @@ export class CopilotProvider {
   dispose(): void {
     for (const live of this.liveSessions.values()) {
       live.process.kill('SIGTERM');
+      cleanupCopilotAttachmentTempDir(live);
     }
     this.liveSessions.clear();
   }
 
-  private async readSessions(): Promise<ParsedCopilotSession[]> {
-    const stateDir = path.join(this.copilotHome, 'session-state');
-    let dirs;
-    try {
-      dirs = await readdir(stateDir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
+  private async readProjectPaths(): Promise<string[]> {
+    const candidates = await this.readSessionCandidates();
+    return [...new Set(candidates.map((candidate) => candidate.workspacePath))].filter((workspacePath) =>
+      path.isAbsolute(workspacePath)
+    );
+  }
+
+  private async readSessions(options: CopilotThreadListOptions = {}): Promise<ParsedCopilotSession[]> {
+    const candidates = await this.readSessionCandidates();
+    const selected = limitCopilotSessionCandidates(
+      candidates,
+      options.defaultLimit ?? MAX_SESSIONS,
+      options.groupLimits
+    );
     const sessions: ParsedCopilotSession[] = [];
-    for (const dir of dirs) {
-      if (!dir.isDirectory()) continue;
-      const parsed = await parseCopilotSessionDir(path.join(stateDir, dir.name), dir.name).catch(() => undefined);
+    for (const candidate of selected) {
+      const parsed = await parseCopilotSessionDir(candidate.dirPath, candidate.nativeSessionId).catch(
+        () => undefined
+      );
       if (parsed) {
         sessions.push(parsed);
       }
@@ -542,6 +608,40 @@ export class CopilotProvider {
       }
     }
     return sessions.sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt));
+  }
+
+  private async readSessionCandidates(): Promise<CopilotSessionCandidate[]> {
+    const stateDir = path.join(this.copilotHome, 'session-state');
+    let dirs;
+    try {
+      dirs = await readdir(stateDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const candidates: CopilotSessionCandidate[] = [];
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      const dirPath = path.join(stateDir, dir.name);
+      const dirStat = await stat(dirPath).catch(() => undefined);
+      if (!dirStat) continue;
+      const workspacePath = path.join(dirPath, 'workspace.yaml');
+      const workspace = parseSimpleYaml(await readFile(workspacePath, 'utf8').catch(() => ''));
+      const cwd = workspace.cwd ?? workspace.git_root ?? '';
+      if (!path.isAbsolute(cwd)) continue;
+      const lastActivity = Date.parse(
+        timestampToIso(workspace.updated_at ?? workspace.created_at, dirStat.mtime)
+      );
+      candidates.push({
+        nativeSessionId: dir.name,
+        dirPath,
+        workspacePath: cwd,
+        lastActivityMs: Number.isFinite(lastActivity) ? lastActivity : dirStat.mtimeMs
+      });
+      if (candidates.length >= MAX_SESSIONS) {
+        break;
+      }
+    }
+    return candidates.sort((a, b) => b.lastActivityMs - a.lastActivityMs);
   }
 
   private async readSessionByNativeId(nativeSessionId: string): Promise<ParsedCopilotSession | undefined> {
@@ -581,6 +681,7 @@ export class CopilotProvider {
 
   private handleStdout(live: LiveCopilotSession, chunk: Buffer): void {
     this.resolveLiveStart(live);
+    this.armIdleWatchdog(live);
     live.stdoutBuffer += chunk.toString('utf8');
     let newlineIndex = live.stdoutBuffer.indexOf('\n');
     while (newlineIndex >= 0) {
@@ -600,21 +701,72 @@ export class CopilotProvider {
     } catch {
       return;
     }
+    const data = asRecord(payload.data);
     const text =
+      stringField(data, 'content') ??
+      stringField(data, 'transformedContent') ??
       stringField(payload, 'content') ??
       stringField(payload, 'text') ??
-      stringField(payload, 'message') ??
-      stringField(asRecord(payload.data), 'content');
+      stringField(payload, 'message');
     const type = stringField(payload, 'type')?.toLowerCase();
-    if (type?.includes('assistant') && text) {
+    // The Copilot CLI emits a stream of typed events. The shapes are documented inline in
+    // parseCopilotSessionDir below, which is the same parser used to read finished sessions
+    // off disk. Keep the two in sync — anything we recognise there should produce a usable
+    // live update here too.
+    if (type === 'assistant.message' || type?.includes('assistant.message') || (type?.includes('assistant') && text)) {
+      const reasoningText = stringField(data, 'reasoningText');
+      if (reasoningText) {
+        upsertMessage(live.messages, ChatMessageSchema.parse({
+          id: `copilot-reasoning:${live.activeTurnId}`,
+          role: 'activity',
+          kind: 'reasoning',
+          text: reasoningText,
+          createdAt: this.now().toISOString()
+        }));
+      }
+      if (text) {
+        upsertMessage(live.messages, ChatMessageSchema.parse({
+          id: `copilot-assistant:${live.activeTurnId}`,
+          role: 'assistant',
+          kind: 'message',
+          phase: 'final_answer',
+          text,
+          createdAt: this.now().toISOString()
+        }));
+      }
+      if (reasoningText || text) {
+        this.emitTranscript(live.threadId);
+      }
+      return;
+    }
+    if (type === 'tool.execution_start') {
+      const toolCallId = stringField(data, 'toolCallId') ?? `${live.activeTurnId}:${live.messages.length}`;
+      const name = stringField(data, 'toolName') ?? 'Using tool';
+      const args = stringifyJSON(data?.arguments);
       upsertMessage(live.messages, ChatMessageSchema.parse({
-        id: `copilot-assistant:${live.activeTurnId}`,
-        role: 'assistant',
-        kind: 'message',
-        text,
+        id: `copilot-tool-start:${toolCallId}`,
+        role: 'activity',
+        kind: 'tool',
+        text: args && args !== '{}' ? `${name}\n${args}` : name,
         createdAt: this.now().toISOString()
       }));
       this.emitTranscript(live.threadId);
+      return;
+    }
+    if (type === 'tool.execution_complete') {
+      const toolCallId = stringField(data, 'toolCallId') ?? `${live.activeTurnId}:${live.messages.length}`;
+      const name = stringField(data, 'toolName') ?? 'Tool result';
+      const result = asRecord(data?.result);
+      const resultText = stringField(result, 'content') ?? stringField(result, 'detailedContent') ?? '';
+      upsertMessage(live.messages, ChatMessageSchema.parse({
+        id: `copilot-tool-complete:${toolCallId}`,
+        role: 'activity',
+        kind: 'tool',
+        text: resultText ? `${name} completed\n${resultText}` : `${name} completed`,
+        createdAt: this.now().toISOString()
+      }));
+      this.emitTranscript(live.threadId);
+      return;
     }
   }
 
@@ -625,6 +777,10 @@ export class CopilotProvider {
   ): void {
     if (this.liveSessions.get(live.threadId) !== live) {
       return;
+    }
+    if (live.idleTimer) {
+      clearTimeout(live.idleTimer);
+      live.idleTimer = undefined;
     }
     live.isStreaming = false;
     if (status === 'failed') {
@@ -644,6 +800,7 @@ export class CopilotProvider {
       this.resolveLiveStart(live);
     }
     this.liveSessions.delete(live.threadId);
+    cleanupCopilotAttachmentTempDir(live);
     this.emitStatus(live.threadId, status === 'failed' ? 'error' : 'idle');
     this.broadcast({ type: 'thread/streaming-changed', payload: { threadId: live.threadId, isStreaming: false } });
     this.emitTranscript(live.threadId);
@@ -682,6 +839,28 @@ export class CopilotProvider {
       live.startGate.timer = undefined;
     }
     live.startGate.reject?.(error);
+  }
+
+  private armIdleWatchdog(live: LiveCopilotSession): void {
+    if (live.idleTimer) {
+      clearTimeout(live.idleTimer);
+    }
+    live.idleTimer = setTimeout(() => this.handleIdleTimeout(live), COPILOT_IDLE_TIMEOUT_MS);
+  }
+
+  private handleIdleTimeout(live: LiveCopilotSession): void {
+    if (this.liveSessions.get(live.threadId) !== live) {
+      return;
+    }
+    // Seed stderr with a clear reason so summarizeCopilotFailure surfaces a friendly
+    // message in the transcript instead of "exited before the turn started".
+    if (!live.stderrBuffer.trim()) {
+      live.stderrBuffer = 'GitHub Copilot stopped responding. The turn was cancelled after no output for several minutes.';
+    }
+    if (!live.process.killed) {
+      live.process.kill('SIGTERM');
+    }
+    this.finishLiveSession(live, 'failed');
   }
 
   private async refreshUnavailableModels(): Promise<void> {
@@ -869,6 +1048,18 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
           id: stringField(data, 'messageId') ?? stringField(payload, 'id') ?? `copilot-assistant:${index}`,
           role: 'assistant',
           kind: 'message',
+          // Mark every parsed assistant message as final_answer so the
+          // renderer's findFinalResponseIndex (Pass 1) can carve the latest
+          // one out as the visible answer bubble. Without this, Copilot turns
+          // that emitted multiple `assistant.message` chunks (a Copilot CLI
+          // quirk where it streams progress updates as separate assistant
+          // messages before the final big answer) end up with NO message
+          // matching `phase === 'final_answer'`, so the entire 15 kB final
+          // text gets buried inside the activity group as a "progress update"
+          // item and the user only sees the collapsed "Used the browser N
+          // times" header. Pass 1 walks backward and picks the latest match,
+          // so intermediate messages naturally collapse into the group.
+          phase: 'final_answer',
           text,
           createdAt: timestamp
         }));
@@ -939,9 +1130,44 @@ function parseSimpleYaml(content: string): Record<string, string> {
   return result;
 }
 
+function limitCopilotSessionCandidates(
+  candidates: CopilotSessionCandidate[],
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {}
+): CopilotSessionCandidate[] {
+  const counts = new Map<string, number>();
+  return candidates.filter((candidate) => {
+    const limit = threadGroupLimit(candidate.workspacePath, defaultLimit, groupLimits, MAX_SESSIONS);
+    const count = counts.get(candidate.workspacePath) ?? 0;
+    if (count >= limit) {
+      return false;
+    }
+    counts.set(candidate.workspacePath, count + 1);
+    return true;
+  });
+}
+
+function threadGroupLimit(
+  groupKey: string,
+  defaultLimit: number,
+  groupLimits: Map<string, number> | Record<string, number> = {},
+  maxLimit = MAX_SESSIONS
+): number {
+  const explicitLimit =
+    groupLimits instanceof Map
+      ? groupLimits.get(groupKey)
+      : Object.prototype.hasOwnProperty.call(groupLimits, groupKey)
+        ? groupLimits[groupKey]
+        : undefined;
+  const limit = explicitLimit ?? defaultLimit;
+  return Number.isFinite(limit) && limit > 0
+    ? Math.min(maxLimit, Math.floor(limit))
+    : Math.min(maxLimit, defaultLimit);
+}
+
 function mergeLiveMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessage[] {
   if (live.length === 0) {
-    return [...base].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    return sortMessagesByCreatedAt(base);
   }
   const liveSignatures = new Map<string, number>();
   for (const message of live) {
@@ -958,11 +1184,24 @@ function mergeLiveMessages(base: ChatMessage[], live: ChatMessage[]): ChatMessag
     }
     baseWithoutEchoes.push(message);
   }
-  return [...baseWithoutEchoes, ...live];
+  return sortMessagesByCreatedAt([...baseWithoutEchoes, ...live]);
 }
 
 function messageContentSignature(message: ChatMessage): string {
   return [message.role, message.kind, message.text.trim()].join('\u001f');
+}
+
+function sortMessagesByCreatedAt(messages: ChatMessage[]): ChatMessage[] {
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((a, b) => {
+      const aTime = Date.parse(a.message.createdAt);
+      const bTime = Date.parse(b.message.createdAt);
+      const safeA = Number.isFinite(aTime) ? aTime : 0;
+      const safeB = Number.isFinite(bTime) ? bTime : 0;
+      return safeA === safeB ? a.index - b.index : safeA - safeB;
+    })
+    .map((entry) => entry.message);
 }
 
 function upsertMessage(messages: ChatMessage[], message: ChatMessage): void {
@@ -1027,6 +1266,174 @@ function normalizeCopilotEffort(effort: string | undefined): string | undefined 
   const trimmed = effort?.trim().toLowerCase();
   if (!trimmed) return undefined;
   return REASONING_LEVELS.some((entry) => entry.effort === trimmed) ? trimmed : undefined;
+}
+
+async function copilotPromptWithAttachmentReferences(
+  prompt: string,
+  attachments: ChatAttachment[]
+): Promise<{ prompt: string; hasLocalReferences: boolean; tempDir?: string }> {
+  let tempDir: string | undefined;
+  const references: Array<{ index: number; filePath: string; mimeType?: string }> = [];
+  try {
+    for (const [index, attachment] of attachments.entries()) {
+      const sourcePath = attachment.sourcePath?.trim();
+      if (sourcePath) {
+        references.push({
+          index: index + 1,
+          filePath: sourcePath,
+          ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {})
+        });
+        continue;
+      }
+      const image = dataImageFromAttachment(attachment);
+      if (!image) continue;
+      tempDir ??= await mkdtemp(path.join(tmpdir(), 'agent-pulse-copilot-images-'));
+      const filePath = path.join(
+        tempDir,
+        `image-${index + 1}-${randomUUID()}.${extensionForImageMimeType(image.mimeType)}`
+      );
+      await writeFile(filePath, Buffer.from(image.data, 'base64'));
+      references.push({ index: index + 1, filePath, mimeType: image.mimeType });
+    }
+  } catch (error) {
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+    throw error;
+  }
+  if (!references.length) {
+    return { prompt, hasLocalReferences: false, ...(tempDir ? { tempDir } : {}) };
+  }
+  const attachmentLines = references.map((reference) => {
+    const typeLabel = reference.mimeType ? ` (${reference.mimeType})` : '';
+    return `- Image ${reference.index}${typeLabel}: ${reference.filePath}`;
+  });
+  return {
+    prompt: [
+      prompt,
+      '',
+      'Attached image files:',
+      ...attachmentLines,
+      '',
+      'Please inspect these image file paths as part of this message.'
+    ].join('\n'),
+    hasLocalReferences: true,
+    ...(tempDir ? { tempDir } : {})
+  };
+}
+
+function dataImageFromAttachment(attachment: ChatAttachment): { mimeType: string; data: string } | undefined {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)$/iu.exec(attachment.url);
+  if (!match) return undefined;
+  return {
+    mimeType: match[1]!.toLowerCase(),
+    data: match[2]!.replace(/\s/gu, '')
+  };
+}
+
+function extensionForImageMimeType(mimeType: string): string {
+  switch (mimeType.toLowerCase()) {
+    case 'image/jpeg':
+    case 'image/jpg':
+      return 'jpg';
+    case 'image/png':
+      return 'png';
+    case 'image/webp':
+      return 'webp';
+    case 'image/gif':
+      return 'gif';
+    default:
+      return mimeType.split('/')[1]?.replace(/[^a-z0-9]/giu, '') || 'png';
+  }
+}
+
+function cleanupCopilotAttachmentTempDir(live: LiveCopilotSession): void {
+  const tempDir = live.attachmentTempDir;
+  if (!tempDir) return;
+  live.attachmentTempDir = undefined;
+  void rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+}
+
+async function cleanupCopilotAttachmentTempDirForPrompt(
+  promptInput: { tempDir?: string }
+): Promise<void> {
+  if (!promptInput.tempDir) return;
+  await rm(promptInput.tempDir, { recursive: true, force: true }).catch(() => undefined);
+}
+
+function resolveCopilotExecutable(): string {
+  const explicit = [
+    process.env.AGENT_PULSE_COPILOT_EXECUTABLE,
+    process.env.GITHUB_COPILOT_EXECUTABLE,
+    process.env.COPILOT_EXECUTABLE,
+    process.env.COPILOT_PATH
+  ].find((candidate) => candidate?.trim());
+  if (explicit) {
+    return explicit.trim();
+  }
+
+  return firstExistingExecutable(collectCopilotExecutableCandidates()) ?? 'copilot';
+}
+
+function collectCopilotExecutableCandidates(): string[] {
+  const home = homedir();
+  const pathCandidates = (process.env.PATH ?? '')
+    .split(path.delimiter)
+    .filter(Boolean)
+    .flatMap((dir) => [path.join(dir, 'copilot'), path.join(dir, 'github-copilot')]);
+  return [
+    ...pathCandidates,
+    path.join(home, '.npm-global', 'bin', 'copilot'),
+    path.join(home, '.local', 'bin', 'copilot'),
+    path.join(home, '.yarn', 'bin', 'copilot'),
+    path.join(home, '.bun', 'bin', 'copilot'),
+    path.join(home, '.volta', 'bin', 'copilot'),
+    path.join(home, '.nvm', 'current', 'bin', 'copilot'),
+    '/opt/homebrew/bin/copilot',
+    '/usr/local/bin/copilot'
+  ];
+}
+
+function firstExistingExecutable(candidates: string[]): string | undefined {
+  const executableCandidates = [...new Set(candidates)]
+    .map((candidate) => {
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+        return { candidate, mtimeMs: statSync(candidate).mtimeMs };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((entry): entry is { candidate: string; mtimeMs: number } => Boolean(entry))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return executableCandidates[0]?.candidate;
+}
+
+function copilotSpawnEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PATH: copilotSpawnPath()
+  };
+}
+
+function copilotSpawnPath(): string {
+  const home = homedir();
+  const additions = [
+    path.join(home, '.npm-global', 'bin'),
+    path.join(home, '.local', 'bin'),
+    path.join(home, '.yarn', 'bin'),
+    path.join(home, '.bun', 'bin'),
+    path.join(home, '.volta', 'bin'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin'
+  ];
+  return [...new Set([...additions, ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean)])]
+    .join(path.delimiter);
+}
+
+function copilotStartErrorMessage(error: unknown, executable: string): string {
+  const details = error instanceof Error ? error.message : String(error);
+  return `GitHub Copilot could not start from Agent Pulse. The helper tried "${executable}" but it failed: ${details}`;
 }
 
 async function readUnavailableCopilotModels(logDir: string): Promise<Set<string>> {
