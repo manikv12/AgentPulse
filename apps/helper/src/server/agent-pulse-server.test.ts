@@ -59,6 +59,380 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('transcribes voice audio through the ChatGPT Codex session and retries expired auth', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const resolveTranscriptionAuthContext = vi
+      .fn()
+      .mockResolvedValueOnce({ authMode: 'chatgpt', token: 'expired-token' })
+      .mockResolvedValueOnce({ authMode: 'chatgpt', token: 'fresh-token' });
+    const voiceFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'expired' }), { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ text: 'Voice draft text.' }), { status: 200 }));
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      mirror: {
+        isConnected: () => true,
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext
+      },
+      voiceTranscriptionFetch: voiceFetch as unknown as typeof fetch,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const health = await fetch(`${server.url}/health/get`);
+      await expect(health.json()).resolves.toMatchObject({
+        voiceTranscription: { available: true, maxBytes: 24_000_000 }
+      });
+
+      const form = new FormData();
+      form.set('audio', new File([new Uint8Array([1, 2, 3])], 'voice.webm', { type: 'audio/webm' }));
+      const response = await fetch(`${server.url}/voice/transcriptions`, {
+        method: 'POST',
+        headers: authHeaders(token, deviceId),
+        body: form
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ text: 'Voice draft text.' });
+      expect(resolveTranscriptionAuthContext).toHaveBeenCalledTimes(2);
+      expect(voiceFetch).toHaveBeenNthCalledWith(
+        1,
+        'https://chatgpt.com/backend-api/transcribe',
+        expect.objectContaining({
+          method: 'POST',
+          headers: { Authorization: 'Bearer expired-token' },
+          body: expect.any(FormData)
+        })
+      );
+      expect(voiceFetch).toHaveBeenNthCalledWith(
+        2,
+        'https://chatgpt.com/backend-api/transcribe',
+        expect.objectContaining({
+          method: 'POST',
+          headers: { Authorization: 'Bearer fresh-token' },
+          body: expect.any(FormData)
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('routes OpenAI API-key transcription auth to audio/transcriptions', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const voiceFetch = vi.fn(async () =>
+      new Response(JSON.stringify({ transcript: 'OpenAI routed text.' }), { status: 200 })
+    );
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      mirror: {
+        isConnected: () => true,
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: vi.fn(async () => ({
+          authMode: 'openai' as const,
+          token: 'sk-test-voice-token'
+        }))
+      },
+      voiceTranscriptionFetch: voiceFetch as unknown as typeof fetch,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const form = new FormData();
+      form.set('audio', new File([new Uint8Array([1, 2, 3])], 'voice.webm', { type: 'audio/webm' }));
+      const response = await fetch(`${server.url}/voice/transcriptions`, {
+        method: 'POST',
+        headers: authHeaders(token, deviceId),
+        body: form
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ text: 'OpenAI routed text.' });
+      expect(voiceFetch).toHaveBeenCalledWith(
+        'https://api.openai.com/v1/audio/transcriptions',
+        expect.objectContaining({
+          method: 'POST',
+          headers: { Authorization: 'Bearer sk-test-voice-token' },
+          body: expect.any(FormData)
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('uses app-server transcription auth before the focus-sensitive IPC mirror', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const voiceFetch = vi.fn(async () =>
+      new Response(JSON.stringify({ text: 'App-server auth text.' }), { status: 200 })
+    );
+    const appServerResolveTranscriptionAuthContext = vi.fn(async () => ({
+      authMode: 'chatgpt' as const,
+      token: 'app-server-token'
+    }));
+    const mirrorResolveTranscriptionAuthContext = vi.fn(async () => {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+      );
+    });
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer: {
+        isConnected: () => true,
+        readTranscript: vi.fn(),
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: appServerResolveTranscriptionAuthContext
+      },
+      mirror: {
+        isConnected: () => true,
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: mirrorResolveTranscriptionAuthContext
+      },
+      voiceTranscriptionFetch: voiceFetch as unknown as typeof fetch,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const form = new FormData();
+      form.set('audio', new File([new Uint8Array([1, 2, 3])], 'voice.webm', { type: 'audio/webm' }));
+      const response = await fetch(`${server.url}/voice/transcriptions`, {
+        method: 'POST',
+        headers: authHeaders(token, deviceId),
+        body: form
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ text: 'App-server auth text.' });
+      expect(appServerResolveTranscriptionAuthContext).toHaveBeenCalledWith(true);
+      expect(mirrorResolveTranscriptionAuthContext).not.toHaveBeenCalled();
+      expect(voiceFetch).toHaveBeenCalledWith(
+        'https://chatgpt.com/backend-api/transcribe',
+        expect.objectContaining({
+          headers: { Authorization: 'Bearer app-server-token' }
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('tries OpenAI-compatible transcription before the focus-sensitive mirror when ChatGPT rejects Codex auth', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const voiceFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'bad app token' }), { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'bad app token again' }), { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ text: 'OpenAI fallback text.' }), { status: 200 }));
+    const appServerResolveTranscriptionAuthContext = vi
+      .fn()
+      .mockResolvedValueOnce({ authMode: 'chatgpt' as const, token: 'app-server-token-1' })
+      .mockResolvedValueOnce({ authMode: 'chatgpt' as const, token: 'app-server-token-2' });
+    const mirrorResolveTranscriptionAuthContext = vi.fn(async () => ({
+      authMode: 'chatgpt' as const,
+      token: 'mirror-token'
+    }));
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer: {
+        isConnected: () => true,
+        readTranscript: vi.fn(),
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: appServerResolveTranscriptionAuthContext
+      },
+      mirror: {
+        isConnected: () => true,
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: mirrorResolveTranscriptionAuthContext
+      },
+      voiceTranscriptionFetch: voiceFetch as unknown as typeof fetch,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const form = new FormData();
+      form.set('audio', new File([new Uint8Array([1, 2, 3])], 'voice.webm', { type: 'audio/webm' }));
+      const response = await fetch(`${server.url}/voice/transcriptions`, {
+        method: 'POST',
+        headers: authHeaders(token, deviceId),
+        body: form
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ text: 'OpenAI fallback text.' });
+      expect(appServerResolveTranscriptionAuthContext).toHaveBeenCalledTimes(2);
+      expect(mirrorResolveTranscriptionAuthContext).not.toHaveBeenCalled();
+      expect(voiceFetch).toHaveBeenNthCalledWith(
+        3,
+        'https://api.openai.com/v1/audio/transcriptions',
+        expect.objectContaining({
+          headers: { Authorization: 'Bearer app-server-token-2' },
+          body: expect.any(FormData)
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('rejects non-audio voice transcription uploads', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      mirror: {
+        isConnected: () => true,
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: vi.fn(async () => ({
+          authMode: 'chatgpt' as const,
+          token: 'chatgpt-token'
+        }))
+      },
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const form = new FormData();
+      form.set('audio', new File(['not audio'], 'note.txt', { type: 'text/plain' }));
+      const response = await fetch(`${server.url}/voice/transcriptions`, {
+        method: 'POST',
+        headers: authHeaders(token, deviceId),
+        body: form
+      });
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({
+        error: 'Only audio recordings can be transcribed.'
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('rejects oversized voice transcription uploads before calling the provider', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const voiceFetch = vi.fn();
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      mirror: {
+        isConnected: () => true,
+        sendMessage: vi.fn(),
+        resolveTranscriptionAuthContext: vi.fn(async () => ({
+          authMode: 'chatgpt' as const,
+          token: 'chatgpt-token'
+        }))
+      },
+      voiceTranscriptionFetch: voiceFetch as unknown as typeof fetch,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const form = new FormData();
+      form.set(
+        'audio',
+        new File([new Uint8Array(24_000_001)], 'too-large.webm', { type: 'audio/webm' })
+      );
+      const response = await fetch(`${server.url}/voice/transcriptions`, {
+        method: 'POST',
+        headers: authHeaders(token, deviceId),
+        body: form
+      });
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({
+        error: 'Recorded audio is too large to transcribe.'
+      });
+      expect(voiceFetch).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('pairs a device, protects thread data, and blocks revoked tokens', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -137,6 +511,160 @@ describe('Agent Pulse helper API', () => {
         headers: authHeaders(pairedBody.token, pairedBody.deviceId)
       });
       expect(afterRevoke.status).toBe(403);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('deduplicates repeated project names and prefers normal workspace paths', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings(),
+      enabledProviders: ['codex' as const]
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [],
+        listProjects: async () => [
+          {
+            projectId: 'rapid-temp',
+            name: 'Rapid',
+            path: '/private/var/folders/tmp/vibe-kanban-worktrees/1abd/Rapid',
+            providers: ['codex']
+          },
+          {
+            projectId: 'rapid-real',
+            name: 'Rapid',
+            path: '/Users/me/projects/Rapid',
+            providers: ['claude-code']
+          },
+          {
+            projectId: 'amwins',
+            name: 'Amwins',
+            path: '/Users/me/projects/Amwins',
+            providers: ['codex']
+          }
+        ]
+      },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/projects/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        projects: [
+          {
+            projectId: 'amwins',
+            name: 'Amwins',
+            path: '/Users/me/projects/Amwins',
+            providers: ['codex']
+          },
+          {
+            projectId: 'rapid-real',
+            name: 'Rapid',
+            path: '/Users/me/projects/Rapid',
+            providers: ['codex', 'claude-code']
+          }
+        ]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('filters transient provider project paths from the project list', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings(),
+      enabledProviders: ['codex' as const]
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: {
+        listThreads: async () => [],
+        listProjects: async () => [
+          {
+            projectId: 'real-project',
+            name: 'OpenAssist',
+            path: '/Users/me/projects/OpenAssist',
+            providers: ['codex']
+          },
+          {
+            projectId: 'scratch-codex',
+            name: 'openai',
+            path: '/Users/me/Documents/Codex/2026-04-18-claude-pilot-openai',
+            providers: ['claude-code']
+          },
+          {
+            projectId: 'private-temp',
+            name: 'video',
+            path: '/private/tmp/reportsapp-facebook-video',
+            providers: ['claude-code']
+          },
+          {
+            projectId: 'tmp-probe',
+            name: 'ks-acp-probe-56mkt9cm',
+            path: '/tmp/ks-acp-probe-56mkt9cm',
+            providers: ['codex']
+          },
+          {
+            projectId: 'gemini-playground',
+            name: 'planetary',
+            path: '/Users/me/.gemini/antigravity/playground/stellar-planetary',
+            providers: ['claude-code']
+          },
+          {
+            projectId: 'windows-program-files',
+            name: 'Technologies',
+            path: '/Volumes/[C] Windows 11/Program Files/Duck Creek Technologies',
+            providers: ['claude-code']
+          }
+        ]
+      },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/projects/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        projects: [
+          {
+            projectId: 'real-project',
+            name: 'OpenAssist',
+            path: '/Users/me/projects/OpenAssist',
+            providers: ['codex']
+          }
+        ]
+      });
     } finally {
       await server.stop();
     }
@@ -349,7 +877,7 @@ describe('Agent Pulse helper API', () => {
     const claudeProject: Project = {
       projectId: 'claude-project',
       name: 'Claude project',
-      path: '/tmp/claude-project',
+      path: '/Users/me/projects/claude-project',
       providers: ['claude-code']
     };
     const settings = {
@@ -960,7 +1488,7 @@ describe('Agent Pulse helper API', () => {
           expect.objectContaining({
             type: 'auth_failure',
             sourceIp: '203.0.113.80',
-            reason: 'missing'
+            reason: 'unknown-device'
           }),
           expect.objectContaining({
             type: 'revoke',
@@ -1598,6 +2126,154 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('can return a watch-safe transcript view that hides commentary and tool noise', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async (): Promise<ThreadTranscript> => ({
+        threadId: 'thread-1',
+        activeTurnId: 'turn-2',
+        sendState: {
+          canSend: true,
+          reason: 'thread_changed',
+          label: 'Codex is working'
+        },
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            kind: 'message',
+            text: 'First question',
+            turnId: 'turn-1',
+            createdAt: '2026-04-25T16:14:00Z'
+          },
+          {
+            id: 'assistant-commentary-1',
+            role: 'assistant',
+            kind: 'message',
+            phase: 'commentary',
+            text: 'Tracing the code path.',
+            turnId: 'turn-1',
+            createdAt: '2026-04-25T16:14:05Z'
+          },
+          {
+            id: 'tool-1',
+            role: 'activity',
+            kind: 'tool',
+            text: 'Bash pwd',
+            turnId: 'turn-1',
+            createdAt: '2026-04-25T16:14:08Z'
+          },
+          {
+            id: 'assistant-final-1',
+            role: 'assistant',
+            kind: 'message',
+            phase: 'final_answer',
+            text: 'Here is the finished answer.',
+            turnId: 'turn-1',
+            createdAt: '2026-04-25T16:14:15Z'
+          },
+          {
+            id: 'user-2',
+            role: 'user',
+            kind: 'message',
+            text: 'Follow up on that.',
+            turnId: 'turn-2',
+            createdAt: '2026-04-25T16:15:00Z'
+          },
+          {
+            id: 'assistant-commentary-2',
+            role: 'assistant',
+            kind: 'message',
+            phase: 'commentary',
+            text: 'Checking one more thing.',
+            turnId: 'turn-2',
+            createdAt: '2026-04-25T16:15:05Z'
+          },
+          {
+            id: 'tool-2',
+            role: 'activity',
+            kind: 'tool',
+            text: 'Bash ls',
+            turnId: 'turn-2',
+            createdAt: '2026-04-25T16:15:07Z'
+          }
+        ]
+      })),
+      sendMessage: vi.fn()
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/threads/thread-1/transcript?view=watch`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        threadId: 'thread-1',
+        provider: 'codex',
+        activeTurnId: 'turn-2',
+        sendState: {
+          canSend: true,
+          reason: 'thread_changed',
+          label: 'Codex is working'
+        },
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            kind: 'message',
+            text: 'First question',
+            turnId: 'turn-1',
+            createdAt: '2026-04-25T16:14:00Z'
+          },
+          {
+            id: 'assistant-final-1',
+            role: 'assistant',
+            kind: 'message',
+            phase: 'final_answer',
+            text: 'Here is the finished answer.',
+            turnId: 'turn-1',
+            createdAt: '2026-04-25T16:14:15Z'
+          },
+          {
+            id: 'user-2',
+            role: 'user',
+            kind: 'message',
+            text: 'Follow up on that.',
+            turnId: 'turn-2',
+            createdAt: '2026-04-25T16:15:00Z'
+          }
+        ]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('returns a clear error when the pairing PIN is wrong', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -2178,10 +2854,21 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(),
       isThreadStreaming: (threadId: string) => threadId === 'thread-approval'
     };
+    const pendingApproval = {
+      id: 'permission-request-1',
+      method: 'item/permissions/requestApproval',
+      params: {
+        turnId: 'turn-7',
+        reason: 'Allow Codex to use Microsoft Teams?'
+      },
+      turnId: 'turn-7'
+    };
     const mirror = {
       isConnected: () => true,
       sendMessage: vi.fn(),
       isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval',
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === 'thread-approval' ? [pendingApproval] : [],
       isThreadOwned: () => true,
       waitForOwnership: async () => true
     };
@@ -2326,6 +3013,182 @@ describe('Agent Pulse helper API', () => {
         threadId: 'thread-approval',
         requests: [pendingApproval]
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('returns pending approval payloads from the app-server live state', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-app-approval',
+      title: 'Check files',
+      workspace: 'CodexPulse',
+      status: 'waiting_approval',
+      lastActivityAt: '2026-04-28T13:10:00Z',
+      lastTurnSummary: ''
+    };
+    const pendingApproval = {
+      id: 'server-request-42',
+      method: 'item/tool/requestUserInput',
+      params: {
+        turnId: 'turn-9',
+        questions: [
+          {
+            id: 'choice',
+            header: 'Pick mode',
+            question: 'Should Codex continue with the safe option?',
+            options: [{ label: 'Yes', description: 'Continue safely.' }]
+          }
+        ]
+      },
+      turnId: 'turn-9'
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === 'thread-app-approval' ? [pendingApproval] : []
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      getPendingApprovalRequests: () => [],
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(
+        `${server.url}/threads/thread-app-approval/pending-approvals`,
+        { headers: authHeaders(token, deviceId) }
+      );
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        threadId: 'thread-app-approval',
+        requests: [pendingApproval]
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('records approval decisions through the app-server when the request came from app-server', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const pendingApproval = {
+      id: '42',
+      method: 'item/tool/requestUserInput',
+      params: {
+        threadId: 'thread-approval',
+        turnId: 'turn-7',
+        questions: [{ id: 'answer', question: 'Continue?' }]
+      },
+      turnId: 'turn-7'
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === 'thread-approval' ? [pendingApproval] : [],
+      respondToApproval: vi.fn(async () => undefined)
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      respondToApproval: vi.fn(async () => undefined),
+      getPendingApprovalRequests: () => [],
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(
+        `${server.url}/threads/thread-approval/approvals/42`,
+        {
+          method: 'POST',
+          headers: {
+            ...authHeaders(token, deviceId),
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            method: 'item/tool/requestUserInput',
+            decision: { answers: { answer: { answers: ['Yes'] } } }
+          })
+        }
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ ok: true });
+      expect(appServer.respondToApproval).toHaveBeenCalledWith(
+        'thread-approval',
+        '42',
+        'item/tool/requestUserInput',
+        { answers: { answer: { answers: ['Yes'] } } }
+      );
+      expect(mirror.respondToApproval).not.toHaveBeenCalled();
+      expect(opener.openThread).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -2801,7 +3664,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('re-opens Codex and retries when the mirror reports the thread is not active', async () => {
+  it('falls back to app-server after a normal desktop focus send fails', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -2813,26 +3676,21 @@ describe('Agent Pulse helper API', () => {
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(async () => transcript),
-      sendMessage: vi.fn(async () => {
-        throw new Error('app-server send must not be used when the mirror can retry.');
-      })
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'app-server-turn-1',
+        transcript
+      }))
     };
     const mirror = {
       isConnected: () => true,
-      sendMessage: vi
-        .fn()
-        .mockRejectedValueOnce(
-          new SendBlockedError(
-            'thread_unavailable',
-            'Codex could not deliver the request — the thread is not currently focused on the Mac.'
-          )
-        )
-        .mockResolvedValueOnce({
-          ok: true as const,
-          mode: 'start' as const,
-          turnId: 'mirror-turn-1',
-          transcript
-        }),
+      sendMessage: vi.fn(async () => {
+        throw new SendBlockedError(
+          'thread_unavailable',
+          'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+        );
+      }),
       isThreadOwned: () => false,
       waitForOwnership: vi.fn(async () => true)
     };
@@ -2877,23 +3735,19 @@ describe('Agent Pulse helper API', () => {
       });
 
       expect(sendResponse.status).toBe(200);
-      expect(opener.openThread).toHaveBeenCalledTimes(2);
-      expect(opener.openThread).toHaveBeenNthCalledWith(1, 'thread-1', {
-        refreshMode: 'mini-window'
-      });
-      expect(opener.openThread).toHaveBeenNthCalledWith(2, 'thread-1', {
-        refreshMode: 'mini-window'
-      });
-      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4000);
-      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2000);
+      expect(opener.openThread).toHaveBeenCalledWith('thread-1', {});
+      expect(opener.openThread).toHaveBeenCalledTimes(1);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4_000);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2_000);
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
       expect(mirror.sendMessage).toHaveBeenCalledTimes(2);
-      expect(appServer.sendMessage).not.toHaveBeenCalled();
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
     } finally {
       await server.stop();
     }
   });
 
-  it('falls back to app-server send when Codex desktop never owns the thread', async () => {
+  it('uses app-server send when Codex desktop never owns the thread', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -2973,13 +3827,102 @@ describe('Agent Pulse helper API', () => {
           provider: 'codex'
         }
       });
+      expect(opener.openThread).toHaveBeenCalledWith('thread-1', {});
+      expect(opener.openThread).toHaveBeenCalledTimes(1);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4_000);
+      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2_000);
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', {
+        collaborationMode: 'plan'
+      });
       expect(mirror.sendMessage).toHaveBeenCalledTimes(2);
       expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', {
         collaborationMode: 'plan'
       });
-      expect(opener.openThread).toHaveBeenCalledTimes(2);
-      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4000);
-      expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2000);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('opens and sends through the IPC mirror before trying app-server', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(async () => {
+        throw new SendBlockedError(
+          'thread_unavailable',
+          'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+        );
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(async () => ({
+        ok: true as const,
+        mode: 'start' as const,
+        turnId: 'mirror-turn-1',
+        transcript
+      })),
+      isThreadOwned: () => false,
+      waitForOwnership: vi.fn(async () => true)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const sendResponse = await fetch(`${server.url}/threads/thread-1/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: 'Hello from phone.' })
+      });
+
+      expect(sendResponse.status).toBe(200);
+      await expect(sendResponse.json()).resolves.toMatchObject({
+        ok: true,
+        mode: 'start',
+        turnId: 'mirror-turn-1'
+      });
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
+      expect(opener.openThread).toHaveBeenCalledWith('thread-1', {});
+      expect(mirror.waitForOwnership).toHaveBeenCalledWith('thread-1', 4_000);
+      expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
     } finally {
       await server.stop();
     }
@@ -3529,7 +4472,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('returns 503 when the IPC mirror is not connected (single source of truth)', async () => {
+  it('uses app-server fallback when the IPC mirror is not connected', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -3592,9 +4535,14 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ text: 'Hi.' })
       });
 
-      expect(sendResponse.status).toBe(503);
+      expect(sendResponse.status).toBe(200);
+      await expect(sendResponse.json()).resolves.toMatchObject({
+        ok: true,
+        mode: 'start',
+        turnId: 'fallback-turn-1'
+      });
       expect(mirror.sendMessage).not.toHaveBeenCalled();
-      expect(appServer.sendMessage).not.toHaveBeenCalled();
+      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hi.', undefined);
     } finally {
       await server.stop();
     }

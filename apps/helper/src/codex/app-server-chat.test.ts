@@ -193,6 +193,83 @@ describe('Codex App Server same-thread chat', () => {
     expect(chat.isThreadStreaming('thread-1')).toBe(false);
   });
 
+  it('shows context compaction as a real live transcript activity', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+
+    transport.emitNotification({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-compact',
+        turnId: 'turn-compact',
+        item: {
+          id: 'compact-item-1',
+          type: 'contextCompaction',
+          status: 'running'
+        }
+      }
+    });
+
+    const visible = chat.applyLiveState(emptyTranscript('thread-compact'), 'thread-compact');
+
+    expect(chat.isThreadCompacting('thread-compact')).toBe(true);
+    expect(visible.sendState).toMatchObject({
+      canSend: false,
+      reason: 'compacting_context',
+      label: 'Automatically compacting context'
+    });
+    expect(visible.messages).toEqual([
+      expect.objectContaining({
+        id: 'compact-item-1',
+        role: 'activity',
+        kind: 'status',
+        phase: 'context_compaction',
+        text: 'Automatically compacting context',
+        turnId: 'turn-compact'
+      })
+    ]);
+  });
+
+  it('maps saved context compaction items from thread/read into the transcript', async () => {
+    const transport = fakeTransport([
+      threadResponse('thread-compact', 'idle', [
+        {
+          ...turn('turn-compact', 'completed'),
+          items: [
+            {
+              type: 'userMessage',
+              id: 'user-1',
+              content: [{ type: 'input_text', text: 'Please continue.', text_elements: [] }]
+            },
+            {
+              type: 'contextCompaction',
+              id: 'compact-item-1',
+              status: 'completed'
+            }
+          ]
+        }
+      ])
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    const transcript = await chat.readTranscript('thread-compact');
+
+    expect(transcript.messages).toEqual([
+      expect.objectContaining({
+        id: 'user-1',
+        text: 'Please continue.'
+      }),
+      expect.objectContaining({
+        id: 'compact-item-1',
+        role: 'activity',
+        kind: 'status',
+        phase: 'context_compaction',
+        text: 'Automatically compacting context',
+        turnId: 'turn-compact'
+      })
+    ]);
+  });
+
   it('stores app-server approval requests and answers the same request id', async () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);
@@ -231,6 +308,35 @@ describe('Codex App Server same-thread chat', () => {
         result: { decision: 'accept' }
       }
     ]);
+    expect(chat.getPendingApprovalRequests('thread-approval')).toEqual([]);
+  });
+
+  it('clears stale app-server approval requests when thread status is no longer waiting', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+
+    transport.emitServerRequest({
+      id: 42,
+      method: 'item/tool/requestUserInput',
+      params: {
+        threadId: 'thread-approval',
+        turnId: 'turn-7',
+        questions: [{ id: 'choice', question: 'Continue?' }]
+      }
+    });
+
+    expect(chat.isThreadWaitingForApproval('thread-approval')).toBe(true);
+    expect(chat.getPendingApprovalRequests('thread-approval')).toHaveLength(1);
+
+    transport.emitNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: 'thread-approval',
+        status: { type: 'idle', activeFlags: [] }
+      }
+    });
+
+    expect(chat.isThreadWaitingForApproval('thread-approval')).toBe(false);
     expect(chat.getPendingApprovalRequests('thread-approval')).toEqual([]);
   });
 
@@ -779,6 +885,32 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
+  it('passes collaboration mode to app-server turn/steer for active plan threads', async () => {
+    const transport = fakeTransport([
+      threadResponse('thread-1', 'active', [turn('turn-live', 'inProgress')]),
+      threadResponse('thread-1', 'active', [turn('turn-live', 'inProgress')])
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    await chat.sendMessage('thread-1', 'Implement plan.', {
+      collaborationMode: 'default'
+    });
+
+    expect(transport.calls.find((call) => call.method === 'turn/steer')?.params).toMatchObject({
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-live',
+      input: [{ type: 'text', text: 'Implement plan.', text_elements: [] }],
+      collaborationMode: {
+        mode: 'default',
+        settings: {
+          model: 'gpt-5.5',
+          reasoning_effort: null,
+          developer_instructions: null
+        }
+      }
+    });
+  });
+
   it('blocks mobile sends when Codex is waiting for approval on the Mac', async () => {
     const transport = fakeTransport([
       threadResponse('thread-1', 'active', [turn('turn-live', 'inProgress')], ['waitingOnApproval'])
@@ -1108,6 +1240,51 @@ describe('Codex App Server same-thread chat', () => {
     expect(liveEvents).toContainEqual({
       type: 'thread/remove',
       payload: { threadId: 'thread-1' }
+    });
+  });
+
+  it('resolves ChatGPT transcription auth using the Codex authToken field first', async () => {
+    const calls: RequestCall[] = [];
+    const transport: CodexAppServerTransport = {
+      isConnected: () => true,
+      request: async <T = unknown>(method: string, params: unknown): Promise<T> => {
+        calls.push({ method, params });
+        return {
+          authMethod: 'chatgpt',
+          accessToken: 'not-the-chatgpt-token',
+          authToken: 'chatgpt-token'
+        } as T;
+      }
+    };
+    const chat = new CodexAppServerChat(transport);
+
+    await expect(chat.resolveTranscriptionAuthContext()).resolves.toEqual({
+      authMode: 'chatgpt',
+      token: 'chatgpt-token'
+    });
+    expect(calls).toEqual([
+      {
+        method: 'getAuthStatus',
+        params: { includeToken: true, refreshToken: true }
+      }
+    ]);
+  });
+
+  it('uses OpenAI-compatible transcription auth when Codex marks the token as OpenAI auth', async () => {
+    const transport: CodexAppServerTransport = {
+      isConnected: () => true,
+      request: async <T = unknown>(): Promise<T> =>
+        ({
+          authMethod: 'chatgpt',
+          requiresOpenaiAuth: true,
+          authToken: 'codex-openai-token'
+        }) as T
+    };
+    const chat = new CodexAppServerChat(transport);
+
+    await expect(chat.resolveTranscriptionAuthContext()).resolves.toEqual({
+      authMode: 'openai',
+      token: 'codex-openai-token'
     });
   });
 });

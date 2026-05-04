@@ -29,6 +29,7 @@ import {
   HandoffSummaryDraftRequestSchema,
   HandoffSummaryDraftResponseSchema,
   LiveEventSchema,
+  PairLookupResponseSchema,
   PairRequestSchema,
   PairingDeviceListResponseSchema,
   PairResponseSchema,
@@ -43,6 +44,8 @@ import {
   ThreadCreateRequestSchema,
   ThreadCreateResponseSchema,
   ThreadDeleteResponseSchema,
+  ThreadFileChangeActionRequestSchema,
+  ThreadFileChangeActionResponseSchema,
   ThreadMessageRequestSchema,
   ThreadMessageResponseSchema,
   TranscriptCommentDraftRequestSchema,
@@ -52,8 +55,11 @@ import {
   ThreadModelUpdateResponseSchema,
   ThreadOpenRequestSchema,
   ThreadSchema,
+  WatchPushRegisterRequestSchema,
+  WatchPushRegisterResponseSchema,
   ThreadStopResponseSchema,
   ThreadTranscriptSchema,
+  VoiceTranscriptionResponseSchema,
   OlderThreadMessagesResponseSchema,
   SeenThreadActivityImportRequestSchema,
   SeenThreadActivityMarkRequestSchema,
@@ -62,6 +68,7 @@ import {
   type CollaborationModeKind,
   type AgentProvider,
   type ChatAttachment,
+  type ChatMessage,
   type CatalogModel,
   type HelperHealth,
   type ApprovalInboxItem,
@@ -75,6 +82,7 @@ import {
   type RemoteAccessMode,
   type RemoteAccessProtocol,
   type Thread,
+  type ThreadFileChangeSummary,
   type ThreadListGroup,
   type ThreadMessageResponse,
   type ThreadTranscript
@@ -93,11 +101,18 @@ import {
   isSharedChatPath
 } from '../chats/shared-chat-paths';
 import { SendBlockedError } from '../codex/app-server-chat';
+import type { CodexTranscriptionAuthContext } from '../codex/codex-mirror';
 import type { CatalogReader } from '../codex/catalog';
 import { registerCodexProjectlessChat } from '../codex/codex-global-state';
 import type { createThreadOpener } from '../codex/thread-opener';
 import { debugLog } from '../debug';
 import type { SeenThreadStore } from './seen-thread-store';
+import {
+  normalizeProjectsForWorkspaceDisplay,
+  normalizeThreadForWorkspaceDisplay,
+  normalizeThreadsForWorkspaceDisplay,
+  WorkspaceDisplayRootResolver
+} from './workspace-display';
 import { normalizeEnabledProviders, type HelperSettings, type HelperSettingsStore } from './settings';
 import { createTabletDevProxy, type TabletDevProxy } from './tablet-dev-proxy';
 
@@ -120,6 +135,10 @@ const MAX_EXPANDED_THREADS_PER_PROJECT = 120;
 const MAX_OUTGOING_ATTACHMENTS = 6;
 const MAX_OUTGOING_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES = 16 * 1024 * 1024;
+const MAX_VOICE_TRANSCRIPTION_BYTES = 24_000_000;
+const CHATGPT_TRANSCRIPTIONS_URL = 'https://chatgpt.com/backend-api/transcribe';
+const OPENAI_TRANSCRIPTIONS_URL = 'https://api.openai.com/v1/audio/transcriptions';
+const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
 
 type MessageSendOptions = {
   model?: string;
@@ -177,6 +196,13 @@ export type AppServerChatBridge = {
     method: string,
     response: unknown
   ): Promise<void>;
+  applyFileChangeAction?(
+    threadId: string,
+    changeId: string,
+    action: 'undo' | 'reapply'
+  ): Promise<ThreadFileChangeSummary>;
+  resolveTranscriptionAuthContext?(refreshToken?: boolean): Promise<CodexTranscriptionAuthContext>;
+  getFileChangeSummaries?(threadId: string): ThreadFileChangeSummary[];
   getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
   isThreadStreaming?(threadId: string): boolean;
   isThreadCompacting?(threadId: string): boolean;
@@ -211,8 +237,16 @@ export type CodexMirrorBridge = {
     method: string,
     response: unknown
   ): Promise<void>;
+  applyFileChangeAction?(
+    threadId: string,
+    changeId: string,
+    action: 'undo' | 'reapply'
+  ): Promise<ThreadFileChangeSummary>;
+  resolveTranscriptionAuthContext?(refreshToken?: boolean): Promise<CodexTranscriptionAuthContext>;
+  getFileChangeSummaries?(threadId: string): ThreadFileChangeSummary[];
   getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
   isThreadWaitingForApproval?(threadId: string): boolean;
+  isThreadCompacting?(threadId: string): boolean;
   // Drops stale approval entries the mirror is still tracking for one thread.
   // Used by the poll loop to self-heal when Codex's authoritative remote
   // status reports a thread as `idle` but our in-memory state still says
@@ -221,6 +255,9 @@ export type CodexMirrorBridge = {
   clearPendingApprovalsForThread?(threadId: string): boolean;
   onPendingApprovalsChange?(
     listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
+  ): () => void;
+  onFileChangesChange?(
+    listener: (event: { threadId: string; summaries: ThreadFileChangeSummary[] }) => void
   ): () => void;
   isThreadOwned?(threadId: string): boolean;
   waitForOwnership?(threadId: string, timeoutMs: number): Promise<boolean>;
@@ -282,6 +319,7 @@ export type AgentPulseServerOptions = {
   tabletDevUrl?: string;
   onLanModeChange?: (enabled: boolean) => Promise<void>;
   remoteAccess?: RemoteAccessController;
+  voiceTranscriptionFetch?: typeof fetch;
 };
 
 export type RemoteAccessController = {
@@ -304,7 +342,7 @@ export async function startAgentPulseServer(
 ): Promise<RunningAgentPulseServer> {
   const hub = new LiveEventHub();
   const tabletDevProxy = options.tabletDevUrl ? createTabletDevProxy(options.tabletDevUrl) : undefined;
-  const { app, transformTranscript, dispose } = createApp(options, hub, tabletDevProxy);
+  const { app, transformTranscript, workspaceDisplayRoots, dispose } = createApp(options, hub, tabletDevProxy);
 
   const hostname = options.settings.lanEnabled ? '0.0.0.0' : '127.0.0.1';
   const server = await new Promise<Server>((resolve, reject) => {
@@ -334,6 +372,8 @@ export async function startAgentPulseServer(
     hub,
     options.appServer,
     options.mirror,
+    workspaceDisplayRoots,
+    options.chatRoot,
     transformTranscript
   );
   const detachCatalog = options.catalog?.onChange((kind) => {
@@ -359,6 +399,7 @@ export async function startAgentPulseServer(
 type CreatedApp = {
   app: Hono;
   transformTranscript: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript;
+  workspaceDisplayRoots: WorkspaceDisplayRootResolver;
   dispose: () => void;
 };
 
@@ -370,6 +411,11 @@ function createApp(
   const app = new Hono();
   const startedAt = Date.now();
   const localAttachments = new Map<string, LocalAttachment>();
+  // Tracks the last status we observed per thread so the watch-push hook only
+  // fires on transitions (e.g. running → idle) and not on every redundant
+  // status broadcast. Reset entries are fine — duplicate pushes on first sight
+  // are not catastrophic, only noisy.
+  const lastStatusByThread = new Map<string, Thread['status']>();
   // Pending model/effort overrides applied on the next turn/start for that thread.
   // Used by /threads/:id/model when no Codex window owns the thread. The override
   // is consumed when the user sends the next
@@ -434,6 +480,79 @@ function createApp(
   };
   const requestIp = (context: Context): string =>
     clientIp(context.req.raw, getConnInfo(context).remote.address, currentSettings);
+
+  // Watch APNs delivery hook. Today this only logs the intended push so the
+  // watch-side wiring (token registration, notification handling, deep-link
+  // routing) can be exercised end-to-end without an APNs key. To enable real
+  // delivery, replace the body with an APNs HTTP/2 client driven by the
+  // helper's settings (team id, key id, .p8 path, bundle id, environment).
+  const notifyWatchDevices = (input: {
+    threadId: string;
+    kind: 'finished' | 'errored' | 'attention';
+    title: string;
+    body: string;
+  }): void => {
+    void options.registry
+      .listDevicesWithWatchPush()
+      .then((devices) => {
+        if (devices.length === 0) return;
+        for (const device of devices) {
+          // eslint-disable-next-line no-console
+          console.info('[watch-push]', {
+            deviceId: device.deviceId,
+            kind: input.kind,
+            threadId: input.threadId,
+            title: input.title,
+            body: input.body
+          });
+        }
+      })
+      .catch(() => undefined);
+  };
+
+  const maybeNotifyWatchOfStatusChange = (threadId: string, nextStatus: Thread['status']): void => {
+    const previous = lastStatusByThread.get(threadId);
+    lastStatusByThread.set(threadId, nextStatus);
+    if (previous === nextStatus) return;
+
+    if (nextStatus === 'idle' && (previous === 'running' || previous === 'compacting')) {
+      notifyWatchDevices({
+        threadId,
+        kind: 'finished',
+        title: 'Agent finished',
+        body: 'Open Agent Pulse to review the result.'
+      });
+      return;
+    }
+    if (nextStatus === 'error') {
+      notifyWatchDevices({
+        threadId,
+        kind: 'errored',
+        title: 'Agent errored',
+        body: 'Tap to open the thread.'
+      });
+      return;
+    }
+    if (nextStatus === 'waiting_approval') {
+      notifyWatchDevices({
+        threadId,
+        kind: 'attention',
+        title: 'Agent needs you',
+        body: 'A pending approval is waiting.'
+      });
+    }
+  };
+
+  // Intercept every status broadcast once so the watch-push hook fires
+  // automatically without sprinkling calls at every emit site. The original
+  // method is kept so non-status events pass through unchanged.
+  const originalBroadcast = hub.broadcast.bind(hub);
+  hub.broadcast = (event: LiveEvent): void => {
+    if (event.type === 'thread/status/changed') {
+      maybeNotifyWatchOfStatusChange(event.payload.threadId, event.payload.status);
+    }
+    originalBroadcast(event);
+  };
   const authenticate = async (context: Context) => {
     const auth = await requireAuth(context.req.raw, options.registry);
     if (!auth.ok && isPublicRemoteRequest(context.req.raw, currentSettings)) {
@@ -719,6 +838,7 @@ function createApp(
     await Promise.all(threads.map((thread) => registerSharedCodexChatThread(thread)));
     return threads;
   };
+  const workspaceDisplayRoots = new WorkspaceDisplayRootResolver();
   const listAllThreads = async (
     groupLimits: Map<string, number> = new Map()
   ): Promise<ThreadListResult> => {
@@ -740,8 +860,13 @@ function createApp(
     const decoratedCopilotThreads = decorateSharedChatThreads(copilotThreads, options.chatRoot);
     rememberThreadCwds(decoratedClaudeThreads);
     rememberThreadCwds(decoratedCopilotThreads);
-    return limitThreadsPerProject(
+    const displayThreads = await normalizeThreadsForWorkspaceDisplay(
       [...codexThreads, ...decoratedClaudeThreads, ...decoratedCopilotThreads],
+      workspaceDisplayRoots,
+      options.chatRoot
+    );
+    return limitThreadsPerProject(
+      displayThreads,
       MAX_THREADS_PER_PROJECT,
       groupLimits
     );
@@ -752,9 +877,16 @@ function createApp(
       isProviderEnabled('claude-code') ? options.claudeCode?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([]),
       isProviderEnabled('copilot') ? options.copilot?.listProjects?.() ?? Promise.resolve([]) : Promise.resolve([])
     ]);
-    return filterSharedChatProjects(
-      mergeProjectsByPath([...codexProjects, ...claudeProjects, ...copilotProjects]),
+    const displayProjects = await normalizeProjectsForWorkspaceDisplay(
+      [...codexProjects, ...claudeProjects, ...copilotProjects],
+      workspaceDisplayRoots,
       options.chatRoot
+    );
+    return filterTransientProjects(
+      filterSharedChatProjects(
+        mergeProjectsByPath(displayProjects),
+        options.chatRoot
+      )
     );
   };
   const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
@@ -850,15 +982,20 @@ function createApp(
     const thread = isSharedChat
       ? decorateSharedChatThread({ ...rawThread, workspacePath: rawThread.workspacePath ?? cwd }, options.chatRoot)
       : rawThread;
+    const displayThread = await normalizeThreadForWorkspaceDisplay(
+      thread,
+      workspaceDisplayRoots,
+      options.chatRoot
+    );
     if (provider === 'codex') {
-      draftThreads.set(thread.threadId, thread);
+      draftThreads.set(displayThread.threadId, displayThread);
       if (isSharedChat) {
-        await registerSharedCodexChatThread(thread);
+        await registerSharedCodexChatThread(displayThread);
       }
     }
-    threadCwdByThreadId.set(thread.threadId, cwd);
-    hub.broadcast({ type: 'thread/upsert', payload: thread });
-    return thread;
+    threadCwdByThreadId.set(displayThread.threadId, cwd);
+    hub.broadcast({ type: 'thread/upsert', payload: displayThread });
+    return displayThread;
   };
 
   const sendHandoffPrompt = async (
@@ -889,7 +1026,10 @@ function createApp(
     if (isCopilotThreadId(threadId)) {
       return options.copilot?.getPendingApprovalRequests?.(threadId) ?? [];
     }
-    return options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
+    return mergePendingApprovalRequests(
+      options.appServer?.getPendingApprovalRequests?.(threadId) ?? [],
+      options.mirror?.getPendingApprovalRequests?.(threadId) ?? []
+    );
   };
 
   app.use('*', async (context, next) => {
@@ -994,6 +1134,37 @@ function createApp(
     } catch {
       return context.notFound();
     }
+  });
+
+  // Read-only PIN → base-URL lookup so a watch user only types 6 digits and
+  // never has to type a URL. Reuses the pairing manager's existing per-IP and
+  // global rate limiters; the endpoint never returns admin data and never
+  // consumes the PIN. The actual pairing still happens via /device/pair.
+  app.get('/pair/lookup/:pin', (context) => {
+    const pin = context.req.param('pin');
+    const ip = requestIp(context);
+
+    if (typeof pin !== 'string' || pin.length < 4 || pin.length > 12) {
+      return context.json({ error: 'Invalid PIN.' }, 400);
+    }
+
+    const exists = options.pairing.verifyPinExists(pin, ip);
+    if (!exists) {
+      return context.json({ error: 'PIN not found or expired.' }, 404);
+    }
+
+    const remote = options.remoteAccess?.getStatus() ?? currentSettings.remoteAccess;
+    const publicUrl = remote?.enabled && remote.publicUrl ? remote.publicUrl : undefined;
+    const requestUrl = new URL(context.req.url);
+    const fallbackBase = `${requestUrl.protocol}//${requestUrl.host}`;
+    const baseUrl = publicUrl ?? fallbackBase;
+
+    return context.json(
+      PairLookupResponseSchema.parse({
+        baseUrl,
+        helperName: 'Agent Pulse'
+      })
+    );
   });
 
   app.post('/device/pair', async (context) => {
@@ -1368,7 +1539,11 @@ function createApp(
     if (!options.seenThreadStore) {
       return context.json({ error: 'Seen-activity store unavailable.' }, 503);
     }
-    const parsed = SeenThreadActivityImportRequestSchema.parse(await context.req.json());
+    const body = await readJsonBody(context);
+    if (!body.ok) {
+      return context.json({ error: body.error }, 400);
+    }
+    const parsed = SeenThreadActivityImportRequestSchema.parse(body.value);
     await options.seenThreadStore.importIfMissing(parsed.entries);
     return context.json(
       SeenThreadActivityResponseSchema.parse({ entries: options.seenThreadStore.getAll() })
@@ -1384,7 +1559,11 @@ function createApp(
       return context.json({ error: 'Seen-activity store unavailable.' }, 503);
     }
     const threadId = context.req.param('threadId');
-    const parsed = SeenThreadActivityMarkRequestSchema.parse(await context.req.json());
+    const body = await readJsonBody(context);
+    if (!body.ok) {
+      return context.json({ error: body.error }, 400);
+    }
+    const parsed = SeenThreadActivityMarkRequestSchema.parse(body.value);
     const effectiveSeenAt = await options.seenThreadStore.markSeen(threadId, parsed.seenAt);
     if (effectiveSeenAt !== null) {
       hub.broadcast({
@@ -1460,26 +1639,31 @@ function createApp(
       const thread = isSharedChat
         ? decorateSharedChatThread({ ...rawThread, workspacePath: rawThread.workspacePath ?? cwd }, options.chatRoot)
         : rawThread;
+      const displayThread = await normalizeThreadForWorkspaceDisplay(
+        thread,
+        workspaceDisplayRoots,
+        options.chatRoot
+      );
       if (parsed.provider === 'codex') {
-        draftThreads.set(thread.threadId, thread);
+        draftThreads.set(displayThread.threadId, displayThread);
         if (isSharedChat) {
-          await registerSharedCodexChatThread(thread);
-          const openResult = await openThreadWithMiniRefresh(thread.threadId);
+          await registerSharedCodexChatThread(displayThread);
+          const openResult = await openThreadWithMiniRefresh(displayThread.threadId);
           if (openResult.ok) {
-            await waitForDesktopOwnership(thread.threadId);
+            await waitForDesktopOwnership(displayThread.threadId);
           } else {
             console.warn('[agent-pulse] Could not open shared chat in Codex desktop', {
-              threadId: thread.threadId,
+              threadId: displayThread.threadId,
               error: openResult.error
             });
           }
         }
       }
-      threadCwdByThreadId.set(thread.threadId, cwd);
-      hub.broadcast({ type: 'thread/upsert', payload: thread });
+      threadCwdByThreadId.set(displayThread.threadId, cwd);
+      hub.broadcast({ type: 'thread/upsert', payload: displayThread });
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
 
-      return context.json(ThreadCreateResponseSchema.parse({ thread }));
+      return context.json(ThreadCreateResponseSchema.parse({ thread: displayThread }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error('[agent-pulse] startThread failed', { provider: parsed.provider, cwd, error: detail });
@@ -1629,6 +1813,68 @@ function createApp(
     return context.json(HandoffDeleteResponseSchema.parse({ ok: true }));
   });
 
+  app.post('/threads/:threadId/file-changes/:changeId', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    const threadId = context.req.param('threadId');
+    const changeId = context.req.param('changeId');
+    const parsed = ThreadFileChangeActionRequestSchema.parse(await context.req.json());
+    if (!options.mirror?.applyFileChangeAction) {
+      return context.json(
+        { error: 'Codex file-change actions require a running Codex Desktop bridge.' },
+        503
+      );
+    }
+    try {
+      const summary = await options.mirror.applyFileChangeAction(threadId, changeId, parsed.action);
+      hub.broadcast({
+        type: 'thread/file-changes/changed',
+        payload: {
+          threadId,
+          summaries: options.mirror.getFileChangeSummaries?.(threadId) ?? [summary]
+        }
+      });
+      return context.json(ThreadFileChangeActionResponseSchema.parse({ ok: true, summary }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return context.json({ error: detail }, 503);
+    }
+  });
+
+  app.post('/voice/transcriptions', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    if (!voiceTranscriptionAvailable(options)) {
+      return context.json(
+        { error: 'Codex voice transcription is unavailable. Open Codex on your Mac first.' },
+        503
+      );
+    }
+
+    try {
+      const authProviders = voiceTranscriptionAuthProviders(options);
+      if (authProviders.length === 0) {
+        return context.json(
+          { error: 'Codex voice transcription is unavailable. Open Codex on your Mac first.' },
+          503
+        );
+      }
+      const upload = await parseVoiceTranscriptionUpload(context);
+      const text = await transcribeVoiceUpload(upload, authProviders, options.voiceTranscriptionFetch ?? fetch);
+      return context.json(VoiceTranscriptionResponseSchema.parse({ text }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return context.json(
+        { error: detail },
+        error instanceof VoiceTranscriptionError && error.status === 503 ? 503 : 400
+      );
+    }
+  });
+
   app.get('/threads/:threadId/transcript', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -1637,6 +1883,7 @@ function createApp(
 
     const threadId = context.req.param('threadId');
     const messageLimit = parseTranscriptMessageLimit(context.req.query('limit'));
+    const transcriptView = parseTranscriptView(context.req.query('view'));
     if (!isProviderEnabled(providerForThreadId(threadId))) {
       return disabledProviderResponse(context, providerForThreadId(threadId));
     }
@@ -1646,9 +1893,12 @@ function createApp(
       }
       try {
         const transcript = await options.claudeCode.readTranscript(threadId);
-        const visibleTranscript = transformTranscript(
-          limitTranscriptMessages(transcript, messageLimit),
-          threadId
+        const visibleTranscript = presentTranscriptForView(
+          transformTranscript(
+            limitTranscriptMessages(transcript, messageLimit),
+            threadId
+          ),
+          transcriptView
         );
         return context.json(
           ThreadTranscriptSchema.parse(visibleTranscript)
@@ -1664,9 +1914,12 @@ function createApp(
       }
       try {
         const transcript = await options.copilot.readTranscript(threadId);
-        const visibleTranscript = transformTranscript(
-          limitTranscriptMessages(transcript, messageLimit),
-          threadId
+        const visibleTranscript = presentTranscriptForView(
+          transformTranscript(
+            limitTranscriptMessages(transcript, messageLimit),
+            threadId
+          ),
+          transcriptView
         );
         return context.json(
           ThreadTranscriptSchema.parse(visibleTranscript)
@@ -1721,9 +1974,12 @@ function createApp(
         // schema so we don't have to thread a flag through every transcript shape.
         context.header('X-Transcript-Stale', '1');
       }
-      const visibleTranscript = transformTranscript(
-        limitTranscriptMessages(transcript, messageLimit),
-        threadId
+      const visibleTranscript = presentTranscriptForView(
+        transformTranscript(
+          limitTranscriptMessages(transcript, messageLimit),
+          threadId
+        ),
+        transcriptView
       );
       return context.json(
         ThreadTranscriptSchema.parse({
@@ -1979,7 +2235,9 @@ function createApp(
 
       await options.appServer?.ensureConnected?.().catch(() => undefined);
       const mirrorReady = options.mirror?.isConnected() === true;
-      if (!mirrorReady) {
+      const appServerReady =
+        options.appServer?.isConnected() === true && typeof options.appServer.sendMessage === 'function';
+      if (!mirrorReady && !appServerReady) {
         return context.json(
           { error: 'Codex desktop is not connected. Open Codex on this Mac to send.' },
           503
@@ -2005,12 +2263,9 @@ function createApp(
         }
       }
 
-      // Prefer the IPC mirror to the running Codex desktop window. The desktop
-      // forwards turn/start to its own app-server, so the message appears live
-      // in the desktop UI. If the desktop cannot take ownership of the thread
-      // (common when the mini-window opener is blocked by macOS Accessibility or
-      // focus timing), fall back to the spawned app-server so the tablet send
-      // does not fail with "thread is not currently active on Mac".
+      // Prefer the desktop IPC path for existing Codex threads so remote sends
+      // show up in the real Codex window. If that bridge cannot deliver, fall
+      // back to the app-server path so tablet/remote sends still work.
       const override = pendingModelOverrides.get(threadId);
       const mirrorSendOptions =
         override || parsed.collaborationMode || outgoingAttachments.provider.length > 0
@@ -2024,29 +2279,36 @@ function createApp(
             }
           : undefined;
       let result: ThreadMessageResponse;
-      try {
-        result = ThreadMessageResponseSchema.parse(
-          await runWithFollowerOwnership(
-            () => options.mirror!.sendMessage(threadId, textToSend, mirrorSendOptions),
-            options.opener,
-            threadId,
-            options.mirror
-          )
-        );
-      } catch (error) {
-        if (
-          !(error instanceof SendBlockedError) ||
-          error.reason !== 'thread_unavailable' ||
-          !options.appServer?.isConnected()
-        ) {
-          throw error;
-        }
-        console.warn('[send] IPC mirror could not focus thread; falling back to app-server', {
+      const sendWithMirror = (
+        allowOpen: boolean,
+        openThreadOptions?: Parameters<ThreadOpener['openThread']>[1]
+      ) =>
+        runWithFollowerOwnership(
+          () => options.mirror!.sendMessage(threadId, textToSend, mirrorSendOptions),
+          options.opener,
           threadId,
-          reason: error.reason
-        });
+          options.mirror,
+          { allowOpen, openThreadOptions }
+        );
+
+      if (mirrorReady) {
+        try {
+          result = ThreadMessageResponseSchema.parse(await sendWithMirror(true, {}));
+        } catch (error) {
+          if (!appServerReady || !options.appServer?.sendMessage) {
+            throw error;
+          }
+          console.warn('[send] IPC mirror could not deliver thread send; falling back to app-server', {
+            threadId,
+            reason: error instanceof SendBlockedError ? error.reason : String(error)
+          });
+          result = ThreadMessageResponseSchema.parse(
+            await options.appServer.sendMessage(threadId, textToSend, mirrorSendOptions)
+          );
+        }
+      } else {
         result = ThreadMessageResponseSchema.parse(
-          await options.appServer.sendMessage(threadId, textToSend, mirrorSendOptions)
+          await options.appServer!.sendMessage(threadId, textToSend, mirrorSendOptions)
         );
       }
 
@@ -2338,6 +2600,36 @@ function createApp(
     return context.json({ ok: true });
   });
 
+  // Watch APNs registration: stores the watch's APNs device token against the
+  // already-paired DeviceRecord. Actual push delivery is performed by
+  // `notifyWatchDevices` below; today that is a stub that logs the intent so
+  // the watch wiring is testable without an APNs key. To enable real delivery,
+  // replace the stub body with an APNs HTTP/2 client (e.g. `apn2`) using
+  // settings sourced from `options`.
+  app.post('/devices/watch-push', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const rawBody = await context.req.json().catch(() => undefined);
+    if (!rawBody) {
+      return context.json({ error: 'Request body required.' }, 400);
+    }
+    const parsed = WatchPushRegisterRequestSchema.parse(rawBody);
+    await options.registry.setWatchPushToken(auth.device.deviceId, parsed.pushToken);
+    return context.json(WatchPushRegisterResponseSchema.parse({ ok: true }));
+  });
+
+  app.delete('/devices/watch-push', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    await options.registry.setWatchPushToken(auth.device.deviceId, undefined);
+    return context.json(WatchPushRegisterResponseSchema.parse({ ok: true }));
+  });
+
   app.get('/catalog/plugins', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -2477,11 +2769,7 @@ function createApp(
     if (!isProviderEnabled(providerForThreadId(threadId))) {
       return disabledProviderResponse(context, providerForThreadId(threadId));
     }
-    const requests = isClaudeThreadId(threadId)
-      ? options.claudeCode?.getPendingApprovalRequests?.(threadId) ?? []
-      : isCopilotThreadId(threadId)
-        ? options.copilot?.getPendingApprovalRequests?.(threadId) ?? []
-        : options.mirror?.getPendingApprovalRequests?.(threadId) ?? [];
+    const requests = pendingRequestsForThread(threadId);
     return context.json({ threadId, requests });
   });
 
@@ -2532,6 +2820,25 @@ function createApp(
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         return context.json({ error: `Could not record Copilot approval: ${detail}` }, 503);
+      }
+    }
+    const appServer = options.appServer;
+    const appServerPending = appServer?.getPendingApprovalRequests?.(threadId) ?? [];
+    if (
+      appServerPending.some((request) => request.id === requestId && request.method === parsed.method)
+    ) {
+      if (!appServer?.respondToApproval || !appServer.isConnected()) {
+        return context.json(
+          { error: 'Codex app-server is not available to respond to this approval.' },
+          503
+        );
+      }
+      try {
+        await appServer.respondToApproval(threadId, requestId, parsed.method, parsed.decision);
+        return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return context.json({ error: `Could not record approval: ${detail}` }, 503);
       }
     }
     if (!options.mirror?.respondToApproval || !options.mirror.isConnected()) {
@@ -2717,14 +3024,24 @@ function createApp(
     // the HTTP fallback path always has a recent copy to serve when a live read times out.
     const appServerTranscript =
       options.appServer?.applyLiveState?.(transcript, threadId) ?? transcript;
-    const realtimeTranscript = applyMirrorApprovalState(
+    const compactionTranscript = applyMirrorCompactionState(
       appServerTranscript,
       threadId,
       options.mirror
     );
-    transcriptCache.set(threadId, realtimeTranscript);
+    const realtimeTranscript = applyMirrorApprovalState(
+      compactionTranscript,
+      threadId,
+      options.mirror
+    );
+    const transcriptWithFileChanges = applyMirrorFileChanges(
+      realtimeTranscript,
+      threadId,
+      options.mirror
+    );
+    transcriptCache.set(threadId, transcriptWithFileChanges);
     const exposed = exposeLocalAttachments(
-      applyMobileSendState(realtimeTranscript, currentSettings),
+      applyMobileSendState(transcriptWithFileChanges, currentSettings),
       threadId,
       localAttachments
     );
@@ -2827,6 +3144,12 @@ function createApp(
       payload: { threadId: event.threadId, status }
     });
   });
+  const detachMirrorFileChanges = options.mirror?.onFileChangesChange?.((event) => {
+    hub.broadcast({ type: 'thread/file-changes/changed', payload: event });
+    const cached = transcriptCache.get(event.threadId) ?? emptyDraftTranscript(event.threadId);
+    const visible = transformTranscript(cached, event.threadId);
+    hub.broadcast({ type: 'thread/transcript/changed', payload: visible });
+  });
   void options.appServer?.ensureConnected?.()
     .catch(() => undefined)
     .finally(() => {
@@ -2836,6 +3159,7 @@ function createApp(
   return {
     app,
     transformTranscript,
+    workspaceDisplayRoots,
     dispose: () => {
       if (autoDesktopRefreshTimer) {
         clearTimeout(autoDesktopRefreshTimer);
@@ -2850,6 +3174,7 @@ function createApp(
       detachAppServerTurnCompleted?.();
       detachAppServerConnection?.();
       detachMirrorPendingApprovals?.();
+      detachMirrorFileChanges?.();
     }
   };
 }
@@ -2874,11 +3199,72 @@ function mergeProjectsByPath(projects: Project[]): Project[] {
       providers: [...new Set([...(existing.providers ?? ['codex']), ...(project.providers ?? ['codex'])])]
     }));
   }
-  return [...byPath.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const byName = new Map<string, Project>();
+  for (const project of byPath.values()) {
+    const key = project.name.trim().toLowerCase();
+    const existing = byName.get(key);
+    if (!existing) {
+      byName.set(key, project);
+      continue;
+    }
+
+    const preferred = projectPathPreference(project.path) > projectPathPreference(existing.path)
+      ? project
+      : existing;
+    byName.set(key, ProjectSchema.parse({
+      ...preferred,
+      providers: [...new Set([...(existing.providers ?? ['codex']), ...(project.providers ?? ['codex'])])]
+    }));
+  }
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function filterTransientProjects(projects: Project[]): Project[] {
+  return projects.filter((project) => !isTransientProjectPath(project.path));
+}
+
+function isTransientProjectPath(projectPath: string): boolean {
+  const normalized = path.normalize(projectPath);
+  if (normalized === '/' || normalized === '/tmp' || normalized.startsWith('/tmp/')) {
+    return true;
+  }
+  if (
+    (normalized.startsWith(`${homedir()}/`) || normalized.startsWith('/Volumes/')) &&
+    !existsSync(normalized)
+  ) {
+    return true;
+  }
+  return (
+    normalized === path.join(homedir(), 'Documents', 'Codex') ||
+    normalized.includes('/Documents/Codex/') ||
+    normalized.startsWith('/private/') ||
+    normalized.includes('/.codex/worktrees/') ||
+    normalized.includes('/.claude/worktrees/') ||
+    normalized.includes('/.gemini/antigravity/playground/') ||
+    /^\/Volumes\/[^/]+\/Program Files(?:\/|$)/.test(normalized)
+  );
 }
 
 function normalizeRequestedCwd(value: string): string {
   return path.normalize(value.trim().replace(/^~(?=$|\/)/, homedir()));
+}
+
+function projectPathPreference(projectPath: string): number {
+  const normalized = path.normalize(projectPath);
+  let score = 0;
+  if (normalized.startsWith('/private/var/folders/')) {
+    score -= 4;
+  }
+  if (normalized.includes('/.codex/worktrees/')) {
+    score -= 3;
+  }
+  if (normalized.includes('/Documents/Codex/')) {
+    score -= 2;
+  }
+  if (normalized.startsWith(homedir())) {
+    score += 1;
+  }
+  return score;
 }
 
 // Codex's IPC follower discovery requires `getThreadRole === 'owner'`. If the
@@ -2897,18 +3283,27 @@ async function runWithFollowerOwnership<T>(
   opener: ThreadOpener,
   threadId: string,
   mirror: CodexMirrorBridge | undefined,
-  options: { ownershipTimeoutMs?: number; retryDelayMs?: number } = {}
+  options: {
+    ownershipTimeoutMs?: number;
+    retryDelayMs?: number;
+    allowOpen?: boolean;
+    openThreadOptions?: Parameters<ThreadOpener['openThread']>[1];
+  } = {}
 ): Promise<T> {
   const ownershipTimeoutMs = options.ownershipTimeoutMs ?? 4_000;
   const retryDelayMs = options.retryDelayMs ?? 800;
+  const allowOpen = options.allowOpen ?? true;
+  const openThreadOptions = options.openThreadOptions ?? { refreshMode: 'mini-window' };
+  let openedForOwnership = false;
 
   const owned = mirror?.isThreadOwned?.(threadId);
-  debugLog('[ownership] enter', { threadId, owned });
+  debugLog('[ownership] enter', { threadId, owned, allowOpen });
 
-  if (mirror?.isThreadOwned && !owned) {
+  if (allowOpen && mirror?.isThreadOwned && !owned) {
     debugLog('[ownership] not owned — opening thread on Mac', { threadId });
     try {
-      await opener.openThread(threadId, { refreshMode: 'mini-window' });
+      await opener.openThread(threadId, openThreadOptions);
+      openedForOwnership = true;
     } catch (openError) {
       console.warn('[ownership] opener failed', { threadId, error: String(openError) });
     }
@@ -2940,12 +3335,19 @@ async function runWithFollowerOwnership<T>(
       throw error;
     }
     debugLog('[ownership] apply failed with thread_unavailable — opening, waiting, and retrying', {
-      threadId
+      threadId,
+      allowOpen
     });
-    try {
-      await opener.openThread(threadId, { refreshMode: 'mini-window' });
-    } catch (openError) {
-      console.warn('[ownership] retry opener failed', { threadId, error: String(openError) });
+    if (!allowOpen) {
+      throw error;
+    }
+    if (!openedForOwnership) {
+      try {
+        await opener.openThread(threadId, openThreadOptions);
+        openedForOwnership = true;
+      } catch (openError) {
+        console.warn('[ownership] retry opener failed', { threadId, error: String(openError) });
+      }
     }
     if (mirror?.waitForOwnership) {
       const before = Date.now();
@@ -3000,10 +3402,234 @@ function healthPayload(options: AgentPulseServerOptions, startedAt: number): Hel
     codexAppServer: options.appServer?.isConnected() ? 'connected' : 'disconnected',
     version: options.version,
     uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
+    voiceTranscription: voiceTranscriptionHealthPayload(options),
     ...(options.remoteAccess?.getStatus()
       ? { remoteAccess: remoteHealthPayload(options.remoteAccess.getStatus()) }
       : {})
   });
+}
+
+type VoiceTranscriptionUpload = {
+  data: Buffer;
+  fileName: string;
+  mimeType: string;
+};
+
+type VoiceTranscriptionAuthProvider = {
+  resolveTranscriptionAuthContext(refreshToken?: boolean): Promise<CodexTranscriptionAuthContext>;
+};
+
+class VoiceTranscriptionError extends Error {
+  constructor(message: string, readonly status = 400) {
+    super(message);
+    this.name = 'VoiceTranscriptionError';
+  }
+}
+
+async function parseVoiceTranscriptionUpload(context: Context): Promise<VoiceTranscriptionUpload> {
+  const body = await context.req.parseBody();
+  const candidate = firstUploadedFile(body.audio ?? body.file);
+  if (!candidate) {
+    throw new VoiceTranscriptionError('Attach an audio recording to transcribe.');
+  }
+  const mimeType = candidate.type || 'application/octet-stream';
+  if (!mimeType.toLowerCase().startsWith('audio/')) {
+    throw new VoiceTranscriptionError('Only audio recordings can be transcribed.');
+  }
+  if (candidate.size <= 0) {
+    throw new VoiceTranscriptionError('Recorded audio was empty.');
+  }
+  if (candidate.size > MAX_VOICE_TRANSCRIPTION_BYTES) {
+    throw new VoiceTranscriptionError('Recorded audio is too large to transcribe.');
+  }
+  return {
+    data: Buffer.from(await candidate.arrayBuffer()),
+    fileName: candidate.name ?? defaultVoiceFileName(mimeType),
+    mimeType
+  };
+}
+
+type UploadedFileLike = {
+  arrayBuffer(): Promise<ArrayBuffer>;
+  size: number;
+  type?: string;
+  name?: string;
+};
+
+function firstUploadedFile(value: unknown): UploadedFileLike | undefined {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  if (!candidate || typeof candidate !== 'object') {
+    return undefined;
+  }
+  const file = candidate as Partial<UploadedFileLike>;
+  return typeof file.arrayBuffer === 'function' && typeof file.size === 'number' ? file as UploadedFileLike : undefined;
+}
+
+async function transcribeVoiceUpload(
+  upload: VoiceTranscriptionUpload,
+  authProviders: VoiceTranscriptionAuthProvider[],
+  fetchImpl: typeof fetch
+): Promise<string> {
+  let lastAuthError: VoiceTranscriptionError | undefined;
+  for (const authProvider of authProviders) {
+    try {
+      return await transcribeVoiceUploadWithProvider(upload, authProvider, fetchImpl);
+    } catch (error) {
+      if (error instanceof VoiceTranscriptionError && error.status === 503) {
+        lastAuthError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw (
+    lastAuthError ??
+    new VoiceTranscriptionError(
+      'Could not use Codex transcription auth. Codex may need a fresh sign-in.',
+      503
+    )
+  );
+}
+
+async function transcribeVoiceUploadWithProvider(
+  upload: VoiceTranscriptionUpload,
+  authProvider: VoiceTranscriptionAuthProvider,
+  fetchImpl: typeof fetch
+): Promise<string> {
+  let auth = await authProvider.resolveTranscriptionAuthContext(true);
+  let response = await sendTranscriptionRequest(upload, auth, fetchImpl);
+  if (response.status === 401 && auth.authMode === 'chatgpt') {
+    auth = await authProvider.resolveTranscriptionAuthContext(true);
+    response = await sendTranscriptionRequest(upload, auth, fetchImpl);
+  }
+  if ((response.status === 401 || response.status === 403) && auth.authMode === 'chatgpt') {
+    // Some current Codex ChatGPT tokens are rejected by chatgpt.com/transcribe but
+    // accepted by the OpenAI-compatible transcription endpoint. This matches the
+    // working OpenAssist path and avoids falling back to the focus-sensitive mirror.
+    response = await sendTranscriptionRequest(upload, auth, fetchImpl, {
+      forceOpenAICompatible: true
+    });
+  }
+  if (!response.ok) {
+    const detail = await extractVoiceTranscriptionError(response);
+    const message =
+      response.status === 401 || response.status === 403
+        ? `Codex returned a transcription token that ChatGPT rejected${
+            detail ? `: ${detail}` : '.'
+          }`
+        : detail ?? `Voice transcription failed with HTTP ${response.status}.`;
+    throw new VoiceTranscriptionError(message, response.status === 401 || response.status === 403 ? 503 : 400);
+  }
+
+  const text = await decodeVoiceTranscriptionText(response);
+  if (!text.trim()) {
+    throw new VoiceTranscriptionError('The audio upload finished, but no transcript text came back.');
+  }
+  return text.trim();
+}
+
+async function sendTranscriptionRequest(
+  upload: VoiceTranscriptionUpload,
+  auth: CodexTranscriptionAuthContext,
+  fetchImpl: typeof fetch,
+  options: { forceOpenAICompatible?: boolean } = {}
+): Promise<Response> {
+  const form = new FormData();
+  const useOpenAICompatible = auth.authMode === 'openai' || options.forceOpenAICompatible === true;
+  form.set(
+    'file',
+    new Blob([new Uint8Array(upload.data)], { type: upload.mimeType }),
+    normalizedVoiceFileName(upload.fileName, upload.mimeType)
+  );
+  if (useOpenAICompatible) {
+    form.set('model', DEFAULT_TRANSCRIPTION_MODEL);
+    form.set('prompt', 'Transcribe this audio verbatim. Preserve wording and punctuation when clear.');
+  }
+  return fetchImpl(useOpenAICompatible ? OPENAI_TRANSCRIPTIONS_URL : CHATGPT_TRANSCRIPTIONS_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${auth.token}` },
+    body: form
+  });
+}
+
+async function decodeVoiceTranscriptionText(response: Response): Promise<string> {
+  const payload = (await response.json().catch(() => undefined)) as
+    | { text?: unknown; transcript?: unknown }
+    | undefined;
+  return typeof payload?.text === 'string'
+    ? payload.text
+    : typeof payload?.transcript === 'string'
+      ? payload.transcript
+      : '';
+}
+
+async function extractVoiceTranscriptionError(response: Response): Promise<string | undefined> {
+  const payload = (await response.json().catch(() => undefined)) as
+    | { error?: unknown; message?: unknown; detail?: unknown }
+    | undefined;
+  for (const value of [payload?.message, payload?.error, payload?.detail]) {
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+    if (value && typeof value === 'object') {
+      const message = (value as { message?: unknown }).message;
+      if (typeof message === 'string' && message.trim()) {
+        return message.trim();
+      }
+    }
+  }
+  return undefined;
+}
+
+function defaultVoiceFileName(mimeType: string): string {
+  if (mimeType.includes('mp4')) return 'voice.m4a';
+  if (mimeType.includes('mpeg')) return 'voice.mp3';
+  if (mimeType.includes('wav')) return 'voice.wav';
+  if (mimeType.includes('ogg')) return 'voice.ogg';
+  return 'voice.webm';
+}
+
+function normalizedVoiceFileName(fileName: string, mimeType: string): string {
+  const trimmed = fileName.trim();
+  return trimmed && trimmed.includes('.') ? trimmed : defaultVoiceFileName(mimeType);
+}
+
+function voiceTranscriptionHealthPayload(options: AgentPulseServerOptions) {
+  const available = voiceTranscriptionAvailable(options);
+  return {
+    available,
+    maxBytes: MAX_VOICE_TRANSCRIPTION_BYTES,
+    ...(available
+      ? {}
+      : {
+          reason: options.mirror?.isConnected()
+            ? 'Codex transcription auth is not available.'
+            : 'Codex Desktop is not connected.'
+        })
+  };
+}
+
+function voiceTranscriptionAvailable(options: AgentPulseServerOptions): boolean {
+  return voiceTranscriptionAuthProviders(options).length > 0;
+}
+
+function voiceTranscriptionAuthProviders(
+  options: AgentPulseServerOptions
+): VoiceTranscriptionAuthProvider[] {
+  const providers: VoiceTranscriptionAuthProvider[] = [];
+  const appServerAuth = options.appServer?.resolveTranscriptionAuthContext;
+  if (options.appServer?.isConnected() && appServerAuth) {
+    providers.push({
+      resolveTranscriptionAuthContext: (refreshToken) => appServerAuth.call(options.appServer, refreshToken)
+    });
+  }
+  const mirrorAuth = options.mirror?.resolveTranscriptionAuthContext;
+  if (options.mirror?.isConnected() && mirrorAuth) {
+    providers.push({
+      resolveTranscriptionAuthContext: (refreshToken) => mirrorAuth.call(options.mirror, refreshToken)
+    });
+  }
+  return providers;
 }
 
 function remoteHealthPayload(remoteAccess: RemoteAccessSettings) {
@@ -3117,6 +3743,145 @@ function limitTranscriptMessages(
     ...transcript,
     messages: messages.slice(sliceStart)
   });
+}
+
+type TranscriptView = 'default' | 'watch';
+
+function parseTranscriptView(raw: string | undefined): TranscriptView {
+  return raw === 'watch' ? 'watch' : 'default';
+}
+
+function presentTranscriptForView(
+  transcript: ThreadTranscript,
+  view: TranscriptView
+): ThreadTranscript {
+  if (view !== 'watch') {
+    return transcript;
+  }
+
+  const messages = filterTranscriptMessagesForWatch(transcript);
+  if (messages.length === transcript.messages.length) {
+    return transcript;
+  }
+
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    messages
+  });
+}
+
+function filterTranscriptMessagesForWatch(transcript: ThreadTranscript): ChatMessage[] {
+  const visible: ChatMessage[] = [];
+  let turnBuffer: ChatMessage[] = [];
+  let leadingBuffer: ChatMessage[] = [];
+  let currentUserMessage: ChatMessage | null = null;
+  let hasVisibleUserTurn = false;
+
+  const flushTurn = (isCurrentTurn: boolean) => {
+    if (currentUserMessage && shouldShowWatchTranscriptMessage(currentUserMessage)) {
+      visible.push(currentUserMessage);
+    }
+
+    const finalAssistant = selectWatchFinalAssistantMessage(turnBuffer, {
+      isLive: isCurrentTurn && transcriptIsLiveForWatch(transcript)
+    });
+    if (finalAssistant) {
+      visible.push(finalAssistant);
+    }
+
+    turnBuffer = [];
+    currentUserMessage = null;
+  };
+
+  for (const message of transcript.messages) {
+    if (isWatchUserMessage(message)) {
+      if (hasVisibleUserTurn) {
+        flushTurn(false);
+      }
+      currentUserMessage = message;
+      hasVisibleUserTurn = true;
+      if (leadingBuffer.length > 0) {
+        turnBuffer.push(...leadingBuffer);
+        leadingBuffer = [];
+      }
+      continue;
+    }
+
+    if (!hasVisibleUserTurn) {
+      leadingBuffer.push(message);
+    } else {
+      turnBuffer.push(message);
+    }
+  }
+
+  if (hasVisibleUserTurn) {
+    flushTurn(true);
+  } else {
+    turnBuffer = leadingBuffer;
+    leadingBuffer = [];
+    flushTurn(true);
+  }
+
+  return visible;
+}
+
+function isWatchUserMessage(message: ChatMessage): boolean {
+  return message.role === 'user' && message.kind === 'message';
+}
+
+function shouldShowWatchTranscriptMessage(message: ChatMessage): boolean {
+  return message.kind === 'message' && message.text.trim().length > 0;
+}
+
+function selectWatchFinalAssistantMessage(
+  messages: ChatMessage[],
+  options: { isLive: boolean }
+): ChatMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (
+      message.role === 'assistant' &&
+      message.kind === 'message' &&
+      message.phase === 'final_answer' &&
+      shouldShowWatchTranscriptMessage(message)
+    ) {
+      return message;
+    }
+  }
+
+  if (options.isLive) {
+    return undefined;
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (
+      message.role === 'assistant' &&
+      message.kind === 'message' &&
+      message.phase !== 'commentary' &&
+      shouldShowWatchTranscriptMessage(message)
+    ) {
+      return message;
+    }
+  }
+
+  return undefined;
+}
+
+function transcriptIsLiveForWatch(transcript: ThreadTranscript): boolean {
+  if (transcript.sendState.reason === 'waiting_on_approval') {
+    return true;
+  }
+  if (transcript.sendState.reason === 'compacting_context') {
+    return true;
+  }
+  if (transcript.activeTurnId) {
+    return true;
+  }
+  return (
+    transcript.sendState.reason === 'thread_changed' &&
+    transcript.sendState.label.endsWith(' is working')
+  );
 }
 
 function exposeLocalAttachments(
@@ -3443,6 +4208,27 @@ function tokenUrlForWorkspaceImage(
   return `/attachments/${token}`;
 }
 
+// Cloudflare/cloudflared sometimes forwards aborted requests with an empty
+// body — this happens when the tablet page is reloading or the worker is
+// torn down mid-fetch. context.req.json() throws SyntaxError on empty input,
+// so wrap it and return a structured 400 instead of letting the request crash.
+async function readJsonBody(
+  context: Context
+): Promise<{ ok: true; value: unknown } | { ok: false; error: string }> {
+  try {
+    const value = await context.req.json();
+    return { ok: true, value };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof SyntaxError
+          ? 'Request body is not valid JSON.'
+          : `Failed to read request body: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
 async function requireAuth(request: Request, registry: DeviceRegistry) {
   const authHeader = request.headers.get('authorization') ?? '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
@@ -3583,6 +4369,8 @@ function startThreadPolling(
   hub: LiveEventHub,
   appServer: AppServerChatBridge | undefined,
   mirror: CodexMirrorBridge | undefined,
+  workspaceDisplayRoots: WorkspaceDisplayRootResolver,
+  chatRoot: string | undefined,
   transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ) {
   let previous = new Map<string, string>();
@@ -3609,8 +4397,12 @@ function startThreadPolling(
         loadedThreadIds instanceof Map
           ? new Set(loadedThreadIds.keys())
           : loadedThreadIds;
-      const threads = threadsFromProviderResult(await threadProvider.listThreads()).map((thread) =>
-        applyAppServerLiveThreadStatus(thread, appServer, mirror, liveStatuses)
+      const threads = await normalizeThreadsForWorkspaceDisplay(
+        threadsFromProviderResult(await threadProvider.listThreads()).map((thread) =>
+          applyAppServerLiveThreadStatus(thread, appServer, mirror, liveStatuses)
+        ),
+        workspaceDisplayRoots,
+        chatRoot
       );
       const toReconcile = threads.filter((thread) =>
         shouldReconcileThread(thread, fullSweep, loadedIdsSet)
@@ -3752,13 +4544,24 @@ function applyAppServerLiveThreadStatus(
 
   // Live notification-derived state from in-memory flags (notifications are
   // pushed in real time and beat the snapshot returned by thread/loaded/list).
-  const inMemoryStatus = mirror?.isThreadWaitingForApproval?.(thread.threadId)
-    ? 'waiting_approval'
-    : appServer?.isThreadCompacting?.(thread.threadId)
-      ? 'compacting'
-      : appServer?.isThreadStreaming?.(thread.threadId)
-        ? 'running'
-        : undefined;
+  const mirrorApprovalRequests = mirror?.getPendingApprovalRequests?.(thread.threadId) ?? [];
+  const appServerApprovalRequests = appServer?.getPendingApprovalRequests?.(thread.threadId) ?? [];
+  let inMemoryStatus: Thread['status'] | undefined;
+  if (
+    mirrorApprovalRequests.length > 0 &&
+    mirror?.isThreadWaitingForApproval?.(thread.threadId)
+  ) {
+    inMemoryStatus = 'waiting_approval';
+  } else if (
+    appServerApprovalRequests.length > 0 &&
+    appServer?.isThreadWaitingForApproval?.(thread.threadId)
+  ) {
+    inMemoryStatus = 'waiting_approval';
+  } else if (appServer?.isThreadCompacting?.(thread.threadId)) {
+    inMemoryStatus = 'compacting';
+  } else if (appServer?.isThreadStreaming?.(thread.threadId)) {
+    inMemoryStatus = 'running';
+  }
   if (inMemoryStatus) {
     return ThreadSchema.parse({ ...thread, status: inMemoryStatus });
   }
@@ -3806,6 +4609,20 @@ function buildApprovalInbox(
     return riskRank[a.riskLevel] - riskRank[b.riskLevel] || b.ageMs - a.ageMs;
   });
   return { items: sorted, total: sorted.length };
+}
+
+function mergePendingApprovalRequests(
+  primary: PendingApprovalRequest[],
+  secondary: PendingApprovalRequest[]
+): PendingApprovalRequest[] {
+  const byKey = new Map<string, PendingApprovalRequest>();
+  for (const request of [...primary, ...secondary]) {
+    const key = `${request.method}:${request.id}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, request);
+    }
+  }
+  return [...byKey.values()];
 }
 
 function buildTouchCommands(hasActiveThread: boolean) {
@@ -4367,6 +5184,11 @@ function applyMirrorApprovalState(
   if (!mirror?.isConnected() || !mirror.isThreadWaitingForApproval?.(threadId)) {
     return transcript;
   }
+  const mirrorRequests = mirror.getPendingApprovalRequests?.(threadId) ?? [];
+  if (mirrorRequests.length === 0) {
+    mirror.clearPendingApprovalsForThread?.(threadId);
+    return transcript;
+  }
   return ThreadTranscriptSchema.parse({
     ...transcript,
     activeTurnId: transcript.activeTurnId ?? `mirror-approval:${threadId}`,
@@ -4375,6 +5197,59 @@ function applyMirrorApprovalState(
       reason: 'waiting_on_approval',
       label: 'Codex is waiting for approval'
     }
+  });
+}
+
+function applyMirrorCompactionState(
+  transcript: ThreadTranscript,
+  threadId: string,
+  mirror: CodexMirrorBridge | undefined
+): ThreadTranscript {
+  if (!mirror?.isConnected() || !mirror.isThreadCompacting?.(threadId)) {
+    return transcript;
+  }
+  const activeTurnId = transcript.activeTurnId ?? `mirror-compaction:${threadId}`;
+  const hasCompactionMessage = transcript.messages.some(
+    (message) => message.phase === 'context_compaction'
+  );
+  const messages = hasCompactionMessage
+    ? transcript.messages
+    : [
+        ...transcript.messages,
+        ChatMessageSchema.parse({
+          id: `context-compaction:${activeTurnId}`,
+          role: 'activity',
+          kind: 'status',
+          phase: 'context_compaction',
+          text: 'Automatically compacting context',
+          turnId: activeTurnId,
+          createdAt: new Date().toISOString()
+        })
+      ];
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    activeTurnId,
+    sendState: {
+      canSend: false,
+      reason: 'compacting_context',
+      label: 'Automatically compacting context'
+    },
+    messages
+  });
+}
+
+function applyMirrorFileChanges(
+  transcript: ThreadTranscript,
+  threadId: string,
+  mirror: CodexMirrorBridge | undefined
+): ThreadTranscript {
+  const summaries = mirror?.getFileChangeSummaries?.(threadId) ?? [];
+  if (summaries.length === 0) {
+    return transcript;
+  }
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    fileChanges: summaries
   });
 }
 

@@ -102,6 +102,103 @@ describe('ClaudeCodeProvider', () => {
     expect(transcript.messages.at(-1)?.text).toBe('[completed] Check grouping');
   });
 
+  it('uses real Claude session cwd values for projects with hyphenated folder names', async () => {
+    const claudeHome = await tempClaudeHome();
+    const projectDir = path.join(
+      claudeHome,
+      'projects',
+      '-Volumes--C--Windows-11-Program-Files-Duck-Creek-Technologies'
+    );
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      path.join(projectDir, 'session-duck.jsonl'),
+      [
+        JSON.stringify({
+          type: 'user',
+          sessionId: 'session-duck',
+          uuid: 'message-user',
+          timestamp: '2026-04-25T16:14:00Z',
+          cwd: '/Volumes/[C] Windows 11/Program Files/Duck Creek Technologies',
+          message: { role: 'user', content: [{ type: 'text', text: 'Check Duck Creek' }] }
+        })
+      ].join('\n')
+    );
+
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    await expect(provider.listProjects()).resolves.toEqual([
+      {
+        projectId: 'd5ac67a6df9cea09',
+        name: 'Duck Creek Technologies',
+        path: '/Volumes/[C] Windows 11/Program Files/Duck Creek Technologies',
+        providers: ['claude-code']
+      }
+    ]);
+  });
+
+  it('does not list empty Claude history directories as projects', async () => {
+    const claudeHome = await tempClaudeHome();
+    await mkdir(path.join(claudeHome, 'projects', '-Users-me-Documents-Codex-2026-04-18-claude-pilot'), {
+      recursive: true
+    });
+
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    await expect(provider.listProjects()).resolves.toEqual([]);
+  });
+
+  it('keeps Claude thread activity pinned to the latest visible transcript event', async () => {
+    const claudeHome = await tempClaudeHome();
+    const projectDir = path.join(claudeHome, 'projects', '-Users-me-projects-CodexPulse');
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      path.join(projectDir, 'session-review.jsonl'),
+      [
+        JSON.stringify({
+          type: 'user',
+          sessionId: 'session-review',
+          uuid: 'message-user',
+          timestamp: '2026-04-25T16:14:00Z',
+          cwd: '/Users/me/projects/CodexPulse',
+          message: { role: 'user', content: [{ type: 'text', text: 'Check the review badge' }] }
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId: 'session-review',
+          uuid: 'message-assistant',
+          timestamp: '2026-04-25T16:15:00Z',
+          cwd: '/Users/me/projects/CodexPulse',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Looks good now.' }]
+          }
+        }),
+        JSON.stringify({
+          type: 'last-prompt',
+          sessionId: 'session-review',
+          timestamp: '2026-04-25T16:16:30Z',
+          lastPrompt: 'Check the review badge'
+        })
+      ].join('\n')
+    );
+
+    const provider = new ClaudeCodeProvider({
+      claudeHome,
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const [thread] = await provider.listThreads();
+
+    expect(thread?.lastActivityAt).toBe('2026-04-25T16:15:00.000Z');
+    expect(thread?.lastTurnSummary).toBe('Looks good now.');
+  });
+
   it('deletes Claude JSONL session files from local history', async () => {
     const claudeHome = await tempClaudeHome();
     const projectDir = path.join(claudeHome, 'projects', '-Users-me-projects-CodexPulse');
@@ -283,6 +380,8 @@ describe('ClaudeCodeProvider', () => {
         '-p',
         '--input-format',
         'stream-json',
+        '--permission-mode',
+        'auto',
         '--model',
         'sonnet',
         '--effort',

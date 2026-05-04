@@ -56,13 +56,27 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
   }, [threads, threadModels]);
 
   const topProjects = useMemo(() => {
-    const counts: Record<string, number> = {};
+    const counts = new Map<string, { name: string; count: number }>();
     for (const t of threads) {
-      counts[t.workspace] = (counts[t.workspace] ?? 0) + 1;
+      const key = workspaceInsightKey(t.workspacePath, t.workspace);
+      const existing = counts.get(key);
+      counts.set(key, {
+        name: existing?.name ?? t.workspace,
+        count: (existing?.count ?? 0) + 1
+      });
     }
     const ordered = projects.length > 0
-      ? projects.map((p) => ({ name: p.name, count: counts[p.name] ?? 0 }))
-      : Object.entries(counts).map(([name, count]) => ({ name, count }));
+      ? combineWorkspaceInsightRows(
+          projects.map((p) => {
+            const key = workspaceInsightKey(p.path, p.name);
+            return {
+              key,
+              name: p.name,
+              count: counts.get(key)?.count ?? 0
+            };
+          })
+        )
+      : [...counts.entries()].map(([key, value]) => ({ key, ...value }));
     return ordered.sort((a, b) => b.count - a.count).slice(0, 5);
   }, [projects, threads]);
 
@@ -124,7 +138,7 @@ export function DashboardInsights({ threads, projects = [], health, threadModels
           <h3 className="codex-insight-card-title">Workspaces</h3>
           <ul className="codex-insight-list">
             {topProjects.map((p) => (
-              <li key={p.name} className="codex-insight-list-row">
+              <li key={p.key} className="codex-insight-list-row">
                 <span className="codex-insight-list-row-title">{p.name}</span>
                 <span className="codex-insight-list-row-meta">{p.count}</span>
               </li>
@@ -179,4 +193,33 @@ function helperTone(health: HelperHealth): string {
 
 function capitalize(s: string): string {
   return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
+}
+
+function workspaceInsightKey(pathValue: string | undefined, name: string): string {
+  return normalizeWorkspaceText(pathValue ?? name) || normalizeWorkspaceText(name);
+}
+
+function normalizeWorkspaceText(value: string): string {
+  return value.trim().replace(/\/+$/g, '').toLowerCase();
+}
+
+function combineWorkspaceInsightRows(
+  rows: Array<{ key: string; name: string; count: number }>
+): Array<{ key: string; name: string; count: number }> {
+  const byKey = new Map<string, { key: string; name: string; count: number }>();
+  const usedNames = new Map<string, string>();
+
+  for (const row of rows) {
+    const nameKey = normalizeWorkspaceText(row.name);
+    const key = usedNames.get(nameKey) ?? row.key;
+    usedNames.set(nameKey, key);
+    const existing = byKey.get(key);
+    byKey.set(key, {
+      key,
+      name: existing?.name ?? row.name,
+      count: (existing?.count ?? 0) + row.count
+    });
+  }
+
+  return [...byKey.values()];
 }

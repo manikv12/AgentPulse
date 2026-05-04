@@ -20,12 +20,14 @@ import {
   type SeenThreadActivityMap,
   ThreadCreateResponseSchema,
   ThreadDeleteResponseSchema,
+  ThreadFileChangeActionResponseSchema,
   ThreadMessageResponseSchema,
   ThreadModelUpdateResponseSchema,
   ThreadStopResponseSchema,
   TouchCommandSheetResponseSchema,
   TranscriptCommentDraftResponseSchema,
   ThreadTranscriptSchema,
+  VoiceTranscriptionResponseSchema,
   OlderThreadMessagesResponseSchema,
   ThreadListResponseSchema,
   type CollaborationModeKind,
@@ -46,6 +48,8 @@ import {
   type ProjectFilesResponse,
   type RemoteAccessSettings,
   type Thread,
+  type ThreadFileChangeActionRequest,
+  type ThreadFileChangeSummary,
   type ThreadListGroup,
   type ThreadMessageResponse,
   type ThreadDeleteResponse,
@@ -53,6 +57,7 @@ import {
   type TouchCommand,
   type TranscriptCommentDraft,
   type ThreadTranscript,
+  type VoiceTranscriptionResponse,
   type OlderThreadMessagesResponse
 } from '@agent-pulse/shared';
 import { z } from 'zod';
@@ -226,7 +231,7 @@ export function adminFetch(url: string, token: string | undefined, init: Request
   if (token) {
     headers.set('authorization', `Bearer ${token}`);
   }
-  if (init.body) {
+  if (init.body && !isFormDataBody(init.body)) {
     headers.set('content-type', 'application/json');
   }
   return fetch(url, { ...init, headers });
@@ -700,6 +705,29 @@ export async function sendThreadMessage(
   return ThreadMessageResponseSchema.parse(await response.json());
 }
 
+export async function transcribeVoiceAudio(
+  session: AgentPulseSession,
+  audio: Blob
+): Promise<VoiceTranscriptionResponse> {
+  const form = new FormData();
+  const extension = audio.type.includes('mp4')
+    ? 'm4a'
+    : audio.type.includes('ogg')
+      ? 'ogg'
+      : audio.type.includes('wav')
+        ? 'wav'
+        : 'webm';
+  form.set('audio', audio, `voice.${extension}`);
+  const response = await authedFetch('/voice/transcriptions', session, {
+    method: 'POST',
+    body: form
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not transcribe audio.'));
+  }
+  return VoiceTranscriptionResponseSchema.parse(await response.json());
+}
+
 export async function stopThreadWork(
   session: AgentPulseSession,
   threadId: string
@@ -834,6 +862,26 @@ export async function respondToApproval(
   ApprovalDecisionResponseSchema.parse(await response.json());
 }
 
+export async function applyThreadFileChangeAction(
+  session: AgentPulseSession,
+  threadId: string,
+  changeId: string,
+  action: ThreadFileChangeActionRequest['action']
+): Promise<ThreadFileChangeSummary | undefined> {
+  const response = await authedFetch(
+    `/threads/${encodeURIComponent(threadId)}/file-changes/${encodeURIComponent(changeId)}`,
+    session,
+    {
+      method: 'POST',
+      body: JSON.stringify({ action })
+    }
+  );
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not apply Codex file change.'));
+  }
+  return ThreadFileChangeActionResponseSchema.parse(await response.json()).summary;
+}
+
 export async function updateThreadModel(
   session: AgentPulseSession,
   threadId: string,
@@ -877,7 +925,7 @@ async function authedFetch(
   headers.set('authorization', `Bearer ${session.token}`);
   headers.set('x-agent-pulse-device-id', session.deviceId);
   headers.set('x-agent-pulse-fingerprint', session.fingerprint);
-  if (init.body) {
+  if (init.body && !isFormDataBody(init.body)) {
     headers.set('content-type', 'application/json');
   }
 
@@ -885,4 +933,8 @@ async function authedFetch(
     ...init,
     headers
   });
+}
+
+function isFormDataBody(body: BodyInit): boolean {
+  return typeof FormData !== 'undefined' && body instanceof FormData;
 }

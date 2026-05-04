@@ -985,6 +985,9 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
   let lastTurnSummary = '';
   let model: string | undefined;
   let reasoningEffort: string | undefined;
+  const noteVisibleActivity = (createdAt: string) => {
+    lastActivityAt = createdAt;
+  };
 
   const toolNames = new Map<string, string>();
   const toolArguments = new Map<string, string>();
@@ -994,7 +997,6 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
     const type = stringField(payload, 'type');
     const data = asRecord(payload.data);
     const timestamp = timestampToIso(stringField(payload, 'timestamp'), dirStat.mtime);
-    lastActivityAt = timestamp;
     if (type === 'session.start') {
       model = normalizeCopilotModel(stringField(data, 'selectedModel')) ?? model;
       const context = asRecord(data?.context);
@@ -1012,6 +1014,7 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
         text,
         createdAt: timestamp
       }));
+      noteVisibleActivity(timestamp);
       continue;
     }
     if (type === 'assistant.message') {
@@ -1024,6 +1027,7 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
           text: reasoningText,
           createdAt: timestamp
         }));
+        noteVisibleActivity(timestamp);
       }
       const toolRequests = Array.isArray(data?.toolRequests) ? data.toolRequests : [];
       for (const [toolIndex, tool] of toolRequests.entries()) {
@@ -1040,6 +1044,7 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
           text: args && args !== '{}' ? `${name}\n${args}` : name,
           createdAt: timestamp
         }));
+        noteVisibleActivity(timestamp);
       }
       const text = stringField(data, 'content') ?? '';
       if (text) {
@@ -1063,6 +1068,7 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
           text,
           createdAt: timestamp
         }));
+        noteVisibleActivity(timestamp);
       }
       continue;
     }
@@ -1079,6 +1085,7 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
         text: args && args !== '{}' ? `${name}\n${args}` : name,
         createdAt: timestamp
       }));
+      noteVisibleActivity(timestamp);
       continue;
     }
     if (type === 'tool.execution_complete') {
@@ -1093,6 +1100,7 @@ async function parseCopilotSessionDir(dirPath: string, nativeSessionId: string):
         text: resultText ? `${name} completed\n${resultText}` : `${name} completed`,
         createdAt: timestamp
       }));
+      noteVisibleActivity(timestamp);
       continue;
     }
     if (type === 'assistant.turn_start') {

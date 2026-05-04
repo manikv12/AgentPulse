@@ -97,10 +97,10 @@ export class CodexThreadReader {
 
   async listProjects(): Promise<Project[]> {
     const { sidebarState, entries } = await this.readVisibleThreadEntries();
-    const candidates = [
-      ...orderedCodexSidebarProjectRoots(sidebarState),
-      ...entries.map(({ workspaceRoot }) => workspaceRoot)
-    ];
+    const sidebarRoots = orderedCodexSidebarProjectRoots(sidebarState);
+    const candidates = sidebarRoots.length > 0
+      ? sidebarRoots
+      : entries.map(({ workspaceRoot }) => workspaceRoot);
     const seen = new Set<string>();
     const projects: Project[] = [];
 

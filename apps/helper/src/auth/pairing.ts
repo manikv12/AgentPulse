@@ -12,6 +12,8 @@ export type DeviceRecord = {
   createdAt: string;
   lastSeenAt?: string;
   revokedAt?: string;
+  watchPushToken?: string;
+  watchPushTokenUpdatedAt?: string;
 };
 
 export type PublicDeviceRecord = Omit<DeviceRecord, 'token'> & {
@@ -42,9 +44,18 @@ export class MemoryDeviceStore implements DeviceStore {
 
 export type ValidationResult =
   | { ok: true; device: DeviceRecord }
-  | { ok: false; reason: 'missing' | 'invalid' | 'revoked' };
+  | { ok: false; reason: 'missing' | 'unknown-device' | 'invalid' | 'revoked' };
+
+// Don't rewrite a device's keychain entry on every authenticated request just
+// to bump lastSeenAt by a few seconds. The previous behaviour churned the
+// keychain hundreds of times per session, multiplying the chance of a
+// delete-then-readd write losing data. One write per minute per device is
+// plenty for "device is alive" telemetry.
+const LAST_SEEN_THROTTLE_MS = 60 * 1000;
 
 export class DeviceRegistry {
+  private readonly lastSeenWrittenAt = new Map<string, number>();
+
   constructor(
     private readonly store: DeviceStore,
     private readonly now: () => Date = () => new Date()
@@ -115,6 +126,32 @@ export class DeviceRegistry {
     return devices.filter((device) => !device.revokedAt);
   }
 
+  async setWatchPushToken(deviceId: string, watchPushToken: string | undefined): Promise<DeviceRecord | undefined> {
+    const devices = await this.store.list();
+    const device = devices.find((candidate) => candidate.deviceId === deviceId);
+
+    if (!device || device.revokedAt) {
+      return undefined;
+    }
+
+    const next: DeviceRecord = { ...device };
+    if (watchPushToken && watchPushToken.trim().length > 0) {
+      next.watchPushToken = watchPushToken.trim();
+      next.watchPushTokenUpdatedAt = this.now().toISOString();
+    } else {
+      delete next.watchPushToken;
+      delete next.watchPushTokenUpdatedAt;
+    }
+
+    await this.store.save(next);
+    return next;
+  }
+
+  async listDevicesWithWatchPush(): Promise<DeviceRecord[]> {
+    const devices = await this.store.list();
+    return devices.filter((device) => !device.revokedAt && device.watchPushToken);
+  }
+
   async revokeDevice(deviceId: string): Promise<void> {
     const devices = await this.store.list();
     const device = devices.find((candidate) => candidate.deviceId === deviceId);
@@ -142,7 +179,7 @@ export class DeviceRegistry {
     const device = devices.find((candidate) => candidate.deviceId === deviceId);
 
     if (!device) {
-      return { ok: false, reason: 'missing' };
+      return { ok: false, reason: 'unknown-device' };
     }
 
     if (device.revokedAt) {
@@ -153,7 +190,12 @@ export class DeviceRegistry {
       return { ok: false, reason: 'invalid' };
     }
 
-    await this.store.save({ ...device, lastSeenAt: this.now().toISOString() });
+    const nowMs = this.now().getTime();
+    const lastWrittenMs = this.lastSeenWrittenAt.get(device.deviceId) ?? 0;
+    if (nowMs - lastWrittenMs >= LAST_SEEN_THROTTLE_MS) {
+      this.lastSeenWrittenAt.set(device.deviceId, nowMs);
+      await this.store.save({ ...device, lastSeenAt: new Date(nowMs).toISOString() });
+    }
     return { ok: true, device };
   }
 }
@@ -190,6 +232,8 @@ export class PairingManager {
   private readonly pinTtlMs: number;
   private readonly limiter: RateLimiter;
   private readonly globalLimiter: RateLimiter;
+  private readonly lookupLimiter: RateLimiter;
+  private readonly lookupGlobalLimiter: RateLimiter;
 
   constructor(
     private readonly registry: DeviceRegistry,
@@ -207,6 +251,16 @@ export class PairingManager {
       maxAttempts: 9,
       windowMs: 5 * 60 * 1000,
       blockMs: 60 * 60 * 1000
+    });
+    this.lookupLimiter = new RateLimiter({
+      maxAttempts: 30,
+      windowMs: 60 * 1000,
+      blockMs: 5 * 60 * 1000
+    });
+    this.lookupGlobalLimiter = new RateLimiter({
+      maxAttempts: 60,
+      windowMs: 60 * 1000,
+      blockMs: 5 * 60 * 1000
     });
   }
 
@@ -236,6 +290,24 @@ export class PairingManager {
       expiresAt: record.expiresAt.toISOString(),
       ...(record.deviceId ? { deviceId: record.deviceId } : {})
     }));
+  }
+
+  // Read-only PIN check used by the watch-pairing lookup endpoint. Returns
+  // false for unknown / expired PINs. Uses dedicated lookup limiters that are
+  // separate (and looser) than the pair-exchange limiters because lookup is
+  // read-only — getting it wrong reveals nothing, and a watch user retyping
+  // the same expired PIN should not lock them out of pairing entirely.
+  verifyPinExists(pin: string, ip: string): boolean {
+    if (this.lookupLimiter.isBlocked(ip) || this.lookupGlobalLimiter.isBlocked(GLOBAL_PAIRING_LIMIT_KEY)) {
+      return false;
+    }
+    this.purgeExpiredPins();
+    const match = [...this.activePins.values()].some((record) => record.pin === pin);
+    if (!match) {
+      this.lookupLimiter.recordFailure(ip);
+      this.lookupGlobalLimiter.recordFailure(GLOBAL_PAIRING_LIMIT_KEY);
+    }
+    return match;
   }
 
   async exchangePin(input: {

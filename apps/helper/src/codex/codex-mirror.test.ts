@@ -610,6 +610,50 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('routes file-read approvals through the file approval follower method', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({ ok: true });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await mirror.respondToApproval(
+      'thread-approval',
+      'read-1',
+      'item/fileRead/requestApproval',
+      'accept'
+    );
+
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-file-approval-decision', {
+      conversationId: 'thread-approval',
+      requestId: 'read-1',
+      decision: 'accept'
+    });
+    mirror.dispose();
+  });
+
+  it('routes desktop requestUserInput answers through the user-input follower method', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({ ok: true });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await mirror.respondToApproval(
+      'thread-approval',
+      'question-1',
+      'item/tool/requestUserInput',
+      { answers: { choice: { answers: ['Yes'] } } }
+    );
+
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-submit-user-input', {
+      conversationId: 'thread-approval',
+      requestId: 'question-1',
+      response: { answers: { choice: { answers: ['Yes'] } } }
+    });
+    mirror.dispose();
+  });
+
   it('exposes pending MCP elicitation approvals from Computer Use', () => {
     const { ipc, setReady, emitBroadcast } = createMockIpc();
     setReady(true);
@@ -928,6 +972,98 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('resolves ChatGPT transcription auth from Codex account status', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockRejectedValueOnce(new Error('old method unavailable'));
+    sendRequest.mockResolvedValueOnce({
+      data: {
+        accessToken: 'not-the-chatgpt-token',
+        authToken: 'chatgpt-token',
+        authMode: 'chatgpt'
+      }
+    });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await expect(mirror.resolveTranscriptionAuthContext(true)).resolves.toEqual({
+      authMode: 'chatgpt',
+      token: 'chatgpt-token'
+    });
+    expect(sendRequest).toHaveBeenNthCalledWith(1, 'getAuthStatus', {
+      includeToken: true,
+      refreshToken: true
+    });
+    expect(sendRequest).toHaveBeenNthCalledWith(2, 'account/getAuthStatus', {
+      includeToken: true,
+      refreshToken: true
+    });
+    mirror.dispose();
+  });
+
+  it('detects OpenAI API transcription auth from returned API keys', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({
+      result: {
+        apiKey: 'sk-test-voice-token'
+      }
+    });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await expect(mirror.resolveTranscriptionAuthContext()).resolves.toEqual({
+      authMode: 'openai',
+      token: 'sk-test-voice-token'
+    });
+    mirror.dispose();
+  });
+
+  it('uses OpenAI-compatible transcription auth when Codex marks the token as OpenAI auth', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({
+      result: {
+        authMethod: 'chatgpt',
+        requiresOpenaiAuth: true,
+        authToken: 'codex-openai-token'
+      }
+    });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await expect(mirror.resolveTranscriptionAuthContext()).resolves.toEqual({
+      authMode: 'openai',
+      token: 'codex-openai-token'
+    });
+    mirror.dispose();
+  });
+
+  it('rejects transcription auth responses without a reusable token', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValue({
+      result: {
+        authMode: 'chatgpt'
+      }
+    });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await expect(mirror.resolveTranscriptionAuthContext()).rejects.toThrow(
+      'Codex did not return a reusable transcription token.'
+    );
+    expect(sendRequest).toHaveBeenCalledWith('getAuthStatus', {
+      includeToken: true,
+      refreshToken: true
+    });
+    expect(sendRequest).toHaveBeenCalledWith('account/getAuthStatus', {
+      includeToken: true,
+      refreshToken: true
+    });
+    mirror.dispose();
+  });
+
   it('sends thread-follower-set-model-and-reasoning with {conversationId, model, reasoningEffort}', async () => {
     // Regression test: Codex desktop's IPC handler destructures `{conversationId, model, reasoningEffort}`.
     // If we ever rename the wire keys (e.g. `model -> modelSlug`), the desktop falls back to "Custom".
@@ -1025,6 +1161,151 @@ describe('codex mirror', () => {
     const mirror = createCodexMirror({ ipc, reader });
 
     await expect(mirror.waitForOwnership('thread-never', 50)).resolves.toBe(false);
+    mirror.dispose();
+  });
+
+  it('tracks Codex file changes from stream broadcasts', () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const onFileChangesChange = vi.fn();
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader, onFileChangesChange });
+    const diff = [
+      'diff --git a/apps/tablet/src/App.tsx b/apps/tablet/src/App.tsx',
+      '--- a/apps/tablet/src/App.tsx',
+      '+++ b/apps/tablet/src/App.tsx',
+      '@@ -1,2 +1,3 @@',
+      '-old line',
+      '+new line',
+      '+another line'
+    ].join('\n');
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'desktop-host',
+      conversationId: 'thread-file-change',
+      change: {
+        type: 'patch',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        cwd: '/repo',
+        unifiedDiff: diff
+      }
+    });
+
+    expect(mirror.getFileChangeSummaries('thread-file-change')).toEqual([
+      expect.objectContaining({
+        id: 'turn-1:item-1',
+        threadId: 'thread-file-change',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        cwd: '/repo',
+        fileCount: 1,
+        linesAdded: 2,
+        linesDeleted: 1,
+        action: 'undo',
+        canUseCodexApplyPatch: true,
+        files: [
+          {
+            path: 'apps/tablet/src/App.tsx',
+            linesAdded: 2,
+            linesDeleted: 1
+          }
+        ]
+      })
+    ]);
+    expect(onFileChangesChange).toHaveBeenCalledWith({
+      threadId: 'thread-file-change',
+      summaries: mirror.getFileChangeSummaries('thread-file-change')
+    });
+    mirror.dispose();
+  });
+
+  it('keeps the parent fileChange item id when the diff is nested', () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+    const diff = [
+      'diff --git a/apps/tablet/src/Nested.tsx b/apps/tablet/src/Nested.tsx',
+      '--- a/apps/tablet/src/Nested.tsx',
+      '+++ b/apps/tablet/src/Nested.tsx',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new'
+    ].join('\n');
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'desktop-host',
+      conversationId: 'thread-file-change',
+      change: {
+        type: 'snapshot',
+        turns: [
+          {
+            id: 'turn-real',
+            status: 'completed',
+            items: [
+              {
+                id: 'file-change-real',
+                type: 'fileChange',
+                status: 'completed',
+                patch: {
+                  id: 'nested-patch-id',
+                  unifiedDiff: diff
+                }
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    expect(mirror.getFileChangeSummaries('thread-file-change')).toEqual([
+      expect.objectContaining({
+        id: 'turn-real:file-change-real',
+        turnId: 'turn-real',
+        itemId: 'file-change-real'
+      })
+    ]);
+    mirror.dispose();
+  });
+
+  it('uses Codex apply-patch for undo and flips the next action to reapply', async () => {
+    const { ipc, setReady, emitBroadcast, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValue({ ok: true });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+    const diff = [
+      'diff --git a/package.json b/package.json',
+      '--- a/package.json',
+      '+++ b/package.json',
+      '@@ -1 +1 @@',
+      '-  "name": "old"',
+      '+  "name": "new"'
+    ].join('\n');
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'desktop-host',
+      conversationId: 'thread-file-change',
+      change: {
+        type: 'patch',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        cwd: '/repo',
+        unifiedDiff: diff
+      }
+    });
+
+    const summary = await mirror.applyFileChangeAction('thread-file-change', 'turn-1:item-1', 'undo');
+
+    expect(sendRequest).toHaveBeenCalledWith('apply-patch', {
+      diff,
+      cwd: '/repo',
+      hostConfig: { id: 'desktop-host' },
+      revert: true
+    });
+    expect(summary.action).toBe('reapply');
+    expect(mirror.getFileChangeSummaries('thread-file-change')[0]?.action).toBe('reapply');
     mirror.dispose();
   });
 });
