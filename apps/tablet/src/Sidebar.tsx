@@ -630,7 +630,7 @@ export function Sidebar({
           {searchActive ? (
             <>
               <span className="codex-sidebar-search-count" aria-live="polite">
-                {visibleThreadCount}
+                {`${visibleThreadCount} ${visibleThreadCount === 1 ? 'thread' : 'threads'} found`}
               </span>
               <button
                 className="codex-sidebar-search-clear"

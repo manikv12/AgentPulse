@@ -101,10 +101,10 @@ import {
   isSharedChatPath
 } from '../chats/shared-chat-paths';
 import { SendBlockedError } from '../codex/app-server-chat';
-import type { CodexTranscriptionAuthContext } from '../codex/codex-mirror';
 import type { CatalogReader } from '../codex/catalog';
 import { registerCodexProjectlessChat } from '../codex/codex-global-state';
 import type { createThreadOpener } from '../codex/thread-opener';
+import type { CodexTranscriptionAuthContext } from '../codex/transcription-auth';
 import { debugLog } from '../debug';
 import type { SeenThreadStore } from './seen-thread-store';
 import {

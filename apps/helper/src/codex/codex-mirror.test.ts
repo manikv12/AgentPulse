@@ -1263,9 +1263,91 @@ describe('codex mirror', () => {
       expect.objectContaining({
         id: 'turn-real:file-change-real',
         turnId: 'turn-real',
-        itemId: 'file-change-real'
+        itemId: 'file-change-real',
+        canUseCodexApplyPatch: false,
+        unavailableReason: 'Codex did not expose the workspace path for this file change.'
       })
     ]);
+    mirror.dispose();
+  });
+
+  it('clears cached file changes when an authoritative snapshot has no diffs', () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const onFileChangesChange = vi.fn();
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader, onFileChangesChange });
+    const diff = [
+      'diff --git a/apps/tablet/src/App.tsx b/apps/tablet/src/App.tsx',
+      '--- a/apps/tablet/src/App.tsx',
+      '+++ b/apps/tablet/src/App.tsx',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new'
+    ].join('\n');
+
+    emitBroadcast('thread-stream-state-changed', {
+      conversationId: 'thread-file-change',
+      change: {
+        type: 'snapshot',
+        cwd: '/repo',
+        unifiedDiff: diff
+      }
+    });
+    expect(mirror.getFileChangeSummaries('thread-file-change')).toHaveLength(1);
+
+    emitBroadcast('thread-stream-state-changed', {
+      conversationId: 'thread-file-change',
+      change: {
+        type: 'snapshot',
+        turns: []
+      }
+    });
+
+    expect(mirror.getFileChangeSummaries('thread-file-change')).toEqual([]);
+    expect(onFileChangesChange).toHaveBeenLastCalledWith({
+      threadId: 'thread-file-change',
+      summaries: []
+    });
+    mirror.dispose();
+  });
+
+  it('does not apply file-change patches when Codex did not include a workspace path', async () => {
+    const { ipc, setReady, emitBroadcast, sendRequest } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+    const diff = [
+      'diff --git a/package.json b/package.json',
+      '--- a/package.json',
+      '+++ b/package.json',
+      '@@ -1 +1 @@',
+      '-  "name": "old"',
+      '+  "name": "new"'
+    ].join('\n');
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'desktop-host',
+      conversationId: 'thread-file-change',
+      change: {
+        type: 'patch',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        unifiedDiff: diff
+      }
+    });
+
+    expect(mirror.getFileChangeSummaries('thread-file-change')).toEqual([
+      expect.objectContaining({
+        id: 'turn-1:item-1',
+        canUseCodexApplyPatch: false,
+        unavailableReason: 'Codex did not expose the workspace path for this file change.'
+      })
+    ]);
+    await expect(
+      mirror.applyFileChangeAction('thread-file-change', 'turn-1:item-1', 'undo')
+    ).rejects.toThrow('Codex did not expose the workspace path for this file change.');
+    expect(sendRequest).not.toHaveBeenCalledWith('apply-patch', expect.anything());
     mirror.dispose();
   });
 

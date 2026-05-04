@@ -12,6 +12,11 @@ import { debugLog } from '../debug';
 import { SendBlockedError } from './app-server-chat';
 import type { CodexAppServerChat } from './app-server-chat';
 import type { IpcClient } from './ipc-client';
+import {
+  CodexTranscriptionAuthError,
+  parseCodexTranscriptionAuthContext,
+  type CodexTranscriptionAuthContext
+} from './transcription-auth';
 
 export type CodexMirrorBroadcast = {
   method: string;
@@ -117,11 +122,6 @@ export type ApprovalMethod =
 
 export type ApprovalResponse = 'accept' | 'acceptForSession' | 'decline' | unknown;
 
-export type CodexTranscriptionAuthContext = {
-  authMode: 'chatgpt' | 'openai';
-  token: string;
-};
-
 const DEFAULT_HOST_ID = 'local';
 const DEFAULT_UNOWNED_STREAMING_STALE_MS = 20_000;
 const ACTIVE_STATUSES = new Set(['active', 'inProgress', 'in_progress', 'pending']);
@@ -163,7 +163,7 @@ type JsonRecord = Record<string, unknown>;
 type CodexFileChangeRecord = {
   summary: ThreadFileChangeSummary;
   unifiedDiff: string;
-  cwd: string;
+  cwd?: string;
   hostId: string;
 };
 
@@ -305,6 +305,11 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     const summaries = collectFileChangeRecords(conversationId, change, hostId);
     if (changeType === 'snapshot') {
       if (summaries.length === 0) {
+        const previous = fileChangeSummariesByThread.get(conversationId);
+        if (previous && previous.size > 0) {
+          fileChangeSummariesByThread.delete(conversationId);
+          notifyFileChangesChanged(conversationId);
+        }
         return;
       }
       fileChangeSummariesByThread.set(
@@ -759,6 +764,12 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         record.summary.unavailableReason ?? 'Codex did not expose an applyable diff for this change.'
       );
     }
+    if (!record.cwd) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Codex did not expose the workspace path for this file change.'
+      );
+    }
     try {
       await sendFollowerRequest('apply-patch', {
         diff: record.unifiedDiff,
@@ -1005,19 +1016,26 @@ function collectFileChangeRecords(
           nextContext.turnId ?? 'turn',
           nextContext.itemId ?? stableDiffId(unifiedDiff)
         ].join(':');
+        const cwd = nextContext.cwd?.trim() || undefined;
         records.push({
           unifiedDiff,
-          cwd: nextContext.cwd ?? process.cwd(),
+          cwd,
           hostId,
           summary: ThreadFileChangeSummarySchema.parse({
             id,
             threadId,
             turnId: nextContext.turnId,
             itemId: nextContext.itemId,
-            cwd: nextContext.cwd,
+            cwd,
             ...parsed,
             action: 'undo',
-            canUseCodexApplyPatch: true
+            canUseCodexApplyPatch: Boolean(cwd),
+            ...(cwd
+              ? {}
+              : {
+                  unavailableReason:
+                    'Codex did not expose the workspace path for this file change.'
+                })
           })
         });
       }
@@ -1598,112 +1616,14 @@ function conversationStatePatchPath(path: unknown[]): unknown[] {
 }
 
 function parseTranscriptionAuthContext(raw: unknown): CodexTranscriptionAuthContext {
-  const dictionaries = transcriptionAuthCandidateDictionaries(raw);
-  if (dictionaries.length === 0) {
-    throw new SendBlockedError(
-      'thread_unavailable',
-      'Codex returned an empty transcription auth response.'
-    );
-  }
-
-  const errorMessage = dictionaries
-    .map((dictionary) =>
-      firstNonEmptyString(
-        stringField(dictionary, 'error'),
-        stringField(dictionary, 'message'),
-        stringField(objectField(dictionary, 'detail'), 'message'),
-        stringField(objectField(dictionary, 'details'), 'message')
-      )
-    )
-    .find(Boolean);
-  if (errorMessage) {
-    throw new SendBlockedError('thread_unavailable', errorMessage);
-  }
-
-  const authMode = resolvedTranscriptionAuthMode(dictionaries);
-  const token = transcriptionTokenForMode(dictionaries, authMode);
-  if (!token) {
-    throw new SendBlockedError(
-      'thread_unavailable',
-      'Codex did not return a reusable transcription token.'
-    );
-  }
-
-  return {
-    authMode,
-    token
-  };
-}
-
-function transcriptionAuthCandidateDictionaries(raw: unknown): JsonRecord[] {
-  const root = asObject(raw);
-  if (!root) {
-    return [];
-  }
-
-  const dictionaries: JsonRecord[] = [root];
-  const nestedKeys = ['result', 'status', 'auth', 'data', 'credentials', 'tokens', 'account'];
-  for (let index = 0; index < dictionaries.length; index += 1) {
-    const dictionary = dictionaries[index]!;
-    for (const key of nestedKeys) {
-      const nested = asObject(dictionary[key]);
-      if (nested && !dictionaries.includes(nested)) {
-        dictionaries.push(nested);
-      }
+  try {
+    return parseCodexTranscriptionAuthContext(raw);
+  } catch (error) {
+    if (error instanceof CodexTranscriptionAuthError) {
+      throw new SendBlockedError('thread_unavailable', error.message);
     }
+    throw error;
   }
-  return dictionaries;
-}
-
-function resolvedTranscriptionAuthMode(
-  dictionaries: JsonRecord[]
-): CodexTranscriptionAuthContext['authMode'] {
-  if (dictionaries.some((dictionary) => dictionary.requiresOpenaiAuth === true)) {
-    return 'openai';
-  }
-  for (const dictionary of dictionaries) {
-    const explicit = firstNonEmptyString(
-      stringField(dictionary, 'authMode'),
-      stringField(dictionary, 'authMethod'),
-      stringField(dictionary, 'method'),
-      stringField(dictionary, 'type'),
-      stringField(dictionary, 'provider')
-    );
-    const normalized = explicit?.toLowerCase() ?? '';
-    if (normalized.includes('chatgpt') || normalized.includes('chat_gpt') || normalized.includes('session')) {
-      return 'chatgpt';
-    }
-    if (normalized.includes('openai') || normalized.includes('api')) {
-      return 'openai';
-    }
-  }
-  const token = transcriptionTokenForMode(dictionaries, undefined);
-  return token.trim().startsWith('sk-') ? 'openai' : 'chatgpt';
-}
-
-function transcriptionTokenForMode(
-  dictionaries: JsonRecord[],
-  authMode: CodexTranscriptionAuthContext['authMode'] | undefined
-): string {
-  const fields =
-    authMode === 'chatgpt'
-      ? ['authToken', 'token', 'accessToken', 'access_token']
-      : authMode === 'openai'
-        ? ['apiKey', 'api_key', 'token', 'accessToken', 'access_token', 'authToken']
-        : ['authToken', 'token', 'accessToken', 'access_token', 'apiKey', 'api_key'];
-  for (const dictionary of dictionaries) {
-    for (const field of fields) {
-      const value = stringField(dictionary, field);
-      if (value) {
-        return value;
-      }
-    }
-  }
-  return '';
-}
-
-function firstNonEmptyString(...values: Array<string | null | undefined>): string | undefined {
-  return values.map((value) => value?.trim()).find((value): value is string => Boolean(value));
 }
 
 function numericPathPart(value: unknown): number | null {

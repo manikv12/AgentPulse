@@ -4019,7 +4019,7 @@ describe('Agent Pulse tablet UI', () => {
 
     fireEvent.click(within(sidebar).getByRole('button', { name: 'Clear search' }));
     expect(search).toHaveValue('');
-    expect(within(sidebar).getByText('Search by chat or project')).toBeInTheDocument();
+    expect(within(sidebar).queryByRole('button', { name: 'Clear search' })).not.toBeInTheDocument();
   });
 
   it('shows waiting approval instead of working when the thread status is approval-blocked', async () => {
