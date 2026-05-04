@@ -14,5 +14,29 @@ out/
 .vscode/
 .idea/
 
+# Xcode / watchOS app artifacts
+*.xcuserstate
+*.xcuserdatad/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM/
+*.dSYM.zip
+
+# Apple signing / provisioning — must never be committed
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+*.certSigningRequest
+ExportOptions.plist
+AuthKey_*.p8
+
+
+Watch app/
+
 /.playwright-mcp/
 /.cloudflared/

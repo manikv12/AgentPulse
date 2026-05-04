@@ -3,6 +3,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  FolderOpen,
   Monitor,
   Moon,
   PanelLeftClose,
@@ -615,46 +616,44 @@ export function Sidebar({
         </button>
       </div>
 
-      <button
-        className="codex-sidebar-new"
-        type="button"
-        onClick={() => onNewThread?.()}
-        disabled={onNewThread === undefined}
-      >
-        <Plus size={16} />
-        <span>New chat</span>
-      </button>
-
-      <p className="codex-sidebar-section-label">Workspace</p>
-
-      <div className={`codex-sidebar-search-shell ${searchActive ? 'is-active' : ''}`}>
-        <label className="codex-sidebar-search">
-          <Search size={11} aria-hidden="true" />
+      <div className="codex-sidebar-toolbar">
+        <label className={`codex-sidebar-search ${searchActive ? 'is-active' : ''}`}>
+          <Search size={13} aria-hidden="true" />
           <span className="sr-only">Search chats</span>
           <input
             type="search"
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.currentTarget.value)}
-            placeholder="Search chats or projects"
+            placeholder="Search…"
             aria-label="Search chats or projects"
           />
           {searchActive ? (
-            <button
-              className="codex-sidebar-search-clear"
-              type="button"
-              onClick={() => setSearchQuery('')}
-              aria-label="Clear search"
-              title="Clear search"
-            >
-              <X size={13} />
-            </button>
+            <>
+              <span className="codex-sidebar-search-count" aria-live="polite">
+                {`${visibleThreadCount} ${visibleThreadCount === 1 ? 'thread' : 'threads'} found`}
+              </span>
+              <button
+                className="codex-sidebar-search-clear"
+                type="button"
+                onClick={() => setSearchQuery('')}
+                aria-label="Clear search"
+                title="Clear search"
+              >
+                <X size={12} />
+              </button>
+            </>
           ) : null}
         </label>
-        <div className="codex-sidebar-search-meta" aria-live="polite">
-          {searchActive
-            ? `${visibleThreadCount} thread${visibleThreadCount === 1 ? '' : 's'} found`
-            : 'Search by chat or project'}
-        </div>
+        <button
+          className="codex-sidebar-new"
+          type="button"
+          onClick={() => onNewThread?.()}
+          disabled={onNewThread === undefined}
+          aria-label="New chat"
+          title="New chat"
+        >
+          <Plus size={15} />
+        </button>
       </div>
 
       <div className="codex-sidebar-thread-scroll" aria-label="Thread list">
@@ -695,10 +694,11 @@ export function Sidebar({
                         onClick={() => toggleGroup(group.workspacePath)}
                         style={{ background: 'transparent', border: 0, cursor: 'pointer', textAlign: 'left', color: 'inherit', fontFamily: 'inherit' }}
                       >
-                        <span style={{ color: 'var(--text-subtle)', display: 'grid', placeItems: 'center' }}>
-                          {isGroupCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                        <span className="codex-sidebar-group-chevron" aria-hidden="true">
+                          {isGroupCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
                         </span>
-                        {group.workspace}
+                        <FolderOpen size={13} className="codex-sidebar-group-icon" aria-hidden="true" />
+                        <span className="codex-sidebar-group-label">{group.workspace}</span>
                       </button>
                       {group.project ? (
                         <button

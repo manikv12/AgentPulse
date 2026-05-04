@@ -349,6 +349,61 @@ describe('Codex thread reader', () => {
     ]);
   });
 
+  it('does not turn every attention thread cwd into a saved project when Codex has sidebar roots', async () => {
+    const reader = new CodexThreadReader({
+      now: () => new Date('2026-04-25T16:20:00Z')
+    }) as any;
+    const sidebar = parseCodexSidebarState(
+      JSON.stringify({
+        'electron-saved-workspace-roots': ['/Users/me/projects/OpenAssist']
+      })
+    );
+
+    reader.readSidebarState = async () => sidebar;
+    reader.readSqliteRows = async () => [
+      {
+        id: 'thread-openassist',
+        title: 'Real saved workspace',
+        cwd: '/Users/me/projects/OpenAssist',
+        source: 'vscode',
+        updated_at_ms: Date.parse('2026-04-25T16:19:00Z'),
+        archived: 0,
+        rollout_path: ''
+      },
+      {
+        id: 'thread-temp-review',
+        title: 'Needs review in temp folder',
+        cwd: '/private/var/folders/tmp/vibe-kanban-worktrees/1abd/Rapid',
+        source: 'vscode',
+        updated_at_ms: Date.parse('2026-04-25T16:19:30Z'),
+        archived: 0,
+        rollout_path: ''
+      }
+    ];
+    reader.readSignalsForRow = async (row: { id: string }) =>
+      row.id === 'thread-temp-review' ? ['waiting_approval'] : [];
+
+    await expect(reader.listThreads()).resolves.toMatchObject([
+      {
+        threadId: 'thread-openassist',
+        workspace: 'OpenAssist'
+      },
+      {
+        threadId: 'thread-temp-review',
+        workspace: 'Rapid',
+        status: 'waiting_approval'
+      }
+    ]);
+    await expect(reader.listProjects()).resolves.toEqual([
+      {
+        projectId: projectIdForPath('/Users/me/projects/OpenAssist'),
+        name: 'OpenAssist',
+        path: '/Users/me/projects/OpenAssist',
+        providers: ['codex']
+      }
+    ]);
+  });
+
   it('keeps old idle chats when their workspace is still in the Codex sidebar', () => {
     const sidebar = parseCodexSidebarState(
       JSON.stringify({

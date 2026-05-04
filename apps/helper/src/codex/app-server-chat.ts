@@ -18,6 +18,11 @@ import {
   ThreadTranscriptSchema
 } from '@agent-pulse/shared';
 import { workspaceNameFromCwd } from './thread-reader';
+import {
+  CodexTranscriptionAuthError,
+  parseCodexTranscriptionAuthContext,
+  type CodexTranscriptionAuthContext
+} from './transcription-auth';
 
 export type CodexAppServerTransport = {
   request<T = unknown>(method: string, params: unknown): Promise<T>;
@@ -222,6 +227,11 @@ type AppServerThreadItem =
       status: string;
     }
   | {
+      type: 'contextCompaction';
+      id: string;
+      status?: string;
+    }
+  | {
       type: 'mcpToolCall';
       id: string;
       server: string;
@@ -255,9 +265,51 @@ export type AppServerTurnCompletedEvent = {
 };
 
 const APP_SERVER_LIVE_TURN_PREFIX = 'app-server-live:';
+const CONTEXT_COMPACTION_LABEL = 'Automatically compacting context';
+const CONTEXT_COMPACTION_PHASE = 'context_compaction';
 
 function appServerLiveTurnId(threadId: string): string {
   return `${APP_SERVER_LIVE_TURN_PREFIX}${threadId}`;
+}
+
+function contextCompactionMessageId(threadId: string, turnId?: string | null): string {
+  return `context-compaction:${turnId ?? threadId}`;
+}
+
+function contextCompactionMessage(input: {
+  id: string;
+  turnId?: string;
+  createdAt?: string;
+  status?: string;
+}): ChatMessage {
+  return ChatMessageSchema.parse({
+    id: input.id,
+    role: 'activity',
+    kind: 'status',
+    phase: CONTEXT_COMPACTION_PHASE,
+    text: CONTEXT_COMPACTION_LABEL,
+    ...(input.turnId ? { turnId: input.turnId } : {}),
+    createdAt: input.createdAt ?? new Date().toISOString()
+  });
+}
+
+function setContextCompactionMessage(
+  state: AppServerLiveThreadState,
+  input: { id: string; turnId?: string | null; status?: string }
+): void {
+  for (const [id, message] of state.liveMessages.entries()) {
+    if (message.phase === CONTEXT_COMPACTION_PHASE && id !== input.id) {
+      state.liveMessages.delete(id);
+    }
+  }
+  state.liveMessages.set(
+    input.id,
+    contextCompactionMessage({
+      id: input.id,
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      status: input.status
+    })
+  );
 }
 
 type AppServerContentPart = {
@@ -309,6 +361,37 @@ export class CodexAppServerChat {
 
   async ensureConnected(): Promise<void> {
     await this.transport.ensureConnected?.();
+  }
+
+  async resolveTranscriptionAuthContext(
+    refreshToken = true
+  ): Promise<CodexTranscriptionAuthContext> {
+    if (!this.transport.isConnected()) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Codex app-server is not connected. Open Codex on your Mac to use voice transcription.'
+      );
+    }
+
+    const params = { includeToken: true, refreshToken };
+    let lastError: unknown;
+    for (const method of ['getAuthStatus', 'account/getAuthStatus']) {
+      try {
+        return parseTranscriptionAuthContext(
+          await this.transport.request(method, params)
+        );
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (lastError instanceof Error) {
+      throw lastError;
+    }
+    throw new SendBlockedError(
+      'thread_unavailable',
+      'Codex did not provide transcription authentication.'
+    );
   }
 
   onConnectionChange(listener: (connected: boolean) => void): () => void {
@@ -444,7 +527,7 @@ export class CodexAppServerChat {
     ensureCanSend(transcript.sendState);
 
     if (thread.status.type === 'active' && transcript.activeTurnId) {
-      return this.steerActiveTurn(threadId, trimmed, transcript.activeTurnId, options.attachments);
+      return this.steerActiveTurn(threadId, trimmed, transcript.activeTurnId, options, thread);
     }
 
     // turn/start accepts `model` and `effort` directly. We pass the user's queued overrides
@@ -503,8 +586,15 @@ export class CodexAppServerChat {
     // the server's item/started notification round-trips. handleNotification
     // will reconcile when the real notification lands.
     const state = this.stateForThread(threadId);
+    const turnId = state.activeTurnId ?? appServerLiveTurnId(threadId);
+    state.activeTurnId = turnId;
     state.isCompacting = true;
     state.isStreaming = true;
+    setContextCompactionMessage(state, {
+      id: contextCompactionMessageId(threadId, turnId),
+      turnId,
+      status: 'running'
+    });
     this.emitThreadStateChanged(threadId);
   }
 
@@ -771,7 +861,8 @@ export class CodexAppServerChat {
     threadId: string,
     text: string,
     activeTurnId: string | null,
-    attachments: ChatAttachment[] | undefined
+    options: TurnStartOptions,
+    thread: AppServerThread
   ): Promise<ThreadMessageResponse> {
     if (!activeTurnId) {
       throw new SendBlockedError(
@@ -781,14 +872,14 @@ export class CodexAppServerChat {
     }
 
     try {
-      return await this.callTurnSteer(threadId, text, activeTurnId, attachments);
+      return await this.callTurnSteer(threadId, text, activeTurnId, options, thread);
     } catch {
       const refreshed = await this.loadExistingThread(threadId);
       const refreshedTranscript = mapThreadToTranscript(refreshed);
       ensureCanSend(refreshedTranscript.sendState);
 
       if (refreshedTranscript.activeTurnId && refreshedTranscript.activeTurnId !== activeTurnId) {
-        return this.callTurnSteer(threadId, text, refreshedTranscript.activeTurnId, attachments);
+        return this.callTurnSteer(threadId, text, refreshedTranscript.activeTurnId, options, refreshed);
       }
 
       throw new SendBlockedError('thread_changed', 'Thread changed. Try again.');
@@ -799,12 +890,15 @@ export class CodexAppServerChat {
     threadId: string,
     text: string,
     expectedTurnId: string,
-    attachments: ChatAttachment[] | undefined
+    options: TurnStartOptions,
+    thread: AppServerThread
   ): Promise<ThreadMessageResponse> {
+    const overrides = turnStartOverrides(options, thread);
     const response = await this.transport.request<{ turnId: string }>('turn/steer', {
       threadId,
-      input: userTextInput(text, attachments),
-      expectedTurnId
+      input: userTextInput(text, options.attachments),
+      expectedTurnId,
+      ...overrides
     });
     const updatedTranscript = await this.readTranscriptAfterAcceptedSend(threadId).catch(() =>
       startedDraftTranscript(threadId, text, response.turnId)
@@ -960,6 +1054,14 @@ export class CodexAppServerChat {
       const type = stringField(status, 'type');
       const activeFlags = arrayField(status, 'activeFlags')
         .filter((flag): flag is string => typeof flag === 'string');
+      const waitingForRequest =
+        activeFlags.includes('waitingOnApproval') || activeFlags.includes('waitingOnUserInput');
+      if (!waitingForRequest && state.pendingRequests.size > 0) {
+        for (const requestId of state.pendingRequests.keys()) {
+          this.pendingServerRequests.delete(requestId);
+        }
+        state.pendingRequests.clear();
+      }
       // thread/status/changed is the only notification that should toggle isStreaming
       // off — short-lived events like item/completed and serverRequest/resolved happen
       // many times inside one turn, and using them to clear isStreaming makes the
@@ -1105,11 +1207,17 @@ export class CodexAppServerChat {
 
     if (stringField(item, 'type') === 'contextCompaction') {
       state.isCompacting = method === 'item/started';
+      setContextCompactionMessage(state, {
+        id: stringField(item, 'id') ?? contextCompactionMessageId(threadId, state.activeTurnId),
+        turnId: state.activeTurnId,
+        status: method === 'item/started' ? 'running' : 'completed'
+      });
       this.emitThreadStateChanged(threadId);
       return;
     }
 
-    const message = messageFromAppServerItem(item, new Date().toISOString());
+    const turnId = stringField(params, 'turnId') ?? state.activeTurnId ?? appServerLiveTurnId(threadId);
+    const message = messageFromAppServerItem(item, new Date().toISOString(), turnId);
     if (message) {
       state.liveMessages.set(message.id, message);
     }
@@ -1146,6 +1254,7 @@ export class CodexAppServerChat {
         role,
         kind,
         text: `${existing?.text ?? ''}${delta}`,
+        turnId: stringField(params, 'turnId') ?? existing?.turnId ?? state.activeTurnId ?? appServerLiveTurnId(threadId),
         createdAt: existing?.createdAt ?? new Date().toISOString()
       })
     );
@@ -1173,6 +1282,7 @@ export class CodexAppServerChat {
         role: 'activity',
         kind: 'plan',
         text,
+        turnId,
         createdAt: new Date().toISOString()
       })
     );
@@ -1349,6 +1459,7 @@ function userMessageForStartedTurn(turnId: string, text: string): ChatMessage {
     role: 'user',
     kind: 'message',
     text,
+    turnId,
     createdAt: new Date().toISOString()
   });
 }
@@ -1729,6 +1840,7 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
             )
             .map((content) => content.text)
             .join('\n'),
+          turnId: turn.id,
           createdAt
         }, attachments);
       }
@@ -1740,6 +1852,7 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
           kind: 'message',
           text: item.text,
           ...(item.phase ? { phase: item.phase } : {}),
+          turnId: turn.id,
           createdAt
         };
       }
@@ -1750,6 +1863,7 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
           role: 'activity',
           kind: 'plan',
           text: item.text,
+          turnId: turn.id,
           createdAt
         };
       }
@@ -1760,6 +1874,7 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
           role: 'activity',
           kind: 'reasoning',
           text: [...item.summary, ...item.content].join('\n'),
+          turnId: turn.id,
           createdAt
         };
       }
@@ -1770,6 +1885,7 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
           role: 'activity',
           kind: 'command',
           text: item.command,
+          turnId: turn.id,
           createdAt
         };
       }
@@ -1780,8 +1896,18 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
           role: 'activity',
           kind: 'file',
           text: `File change ${item.status}`,
+          turnId: turn.id,
           createdAt
         };
+      }
+
+      if (item.type === 'contextCompaction') {
+        return contextCompactionMessage({
+          id: item.id,
+          turnId: turn.id,
+          createdAt,
+          status: item.status
+        });
       }
 
       if (item.type === 'mcpToolCall') {
@@ -1795,6 +1921,7 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
           role: 'activity',
           kind: 'tool',
           text: `${item.server}.${item.tool} ${item.status}`,
+          turnId: turn.id,
           createdAt
         }, attachments);
       }
@@ -1809,7 +1936,8 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
 
 function messageFromAppServerItem(
   item: Record<string, unknown>,
-  createdAt: string
+  createdAt: string,
+  turnId?: string
 ): ChatMessage | undefined {
   const id = stringField(item, 'id');
   const type = stringField(item, 'type');
@@ -1824,6 +1952,7 @@ function messageFromAppServerItem(
       kind: 'message',
       text: stringField(item, 'text') ?? '',
       ...(stringField(item, 'phase') ? { phase: stringField(item, 'phase') } : {}),
+      ...(turnId ? { turnId } : {}),
       createdAt
     });
   }
@@ -1834,6 +1963,7 @@ function messageFromAppServerItem(
       role: 'activity',
       kind: 'plan',
       text: stringField(item, 'text') ?? '',
+      ...(turnId ? { turnId } : {}),
       createdAt
     });
   }
@@ -1847,6 +1977,7 @@ function messageFromAppServerItem(
         ...arrayField(item, 'summary').filter((entry): entry is string => typeof entry === 'string'),
         ...arrayField(item, 'content').filter((entry): entry is string => typeof entry === 'string')
       ].join('\n'),
+      ...(turnId ? { turnId } : {}),
       createdAt
     });
   }
@@ -1857,6 +1988,7 @@ function messageFromAppServerItem(
       role: 'activity',
       kind: 'command',
       text: stringField(item, 'command') ?? stringField(item, 'aggregatedOutput') ?? 'Command running',
+      ...(turnId ? { turnId } : {}),
       createdAt
     });
   }
@@ -1867,7 +1999,17 @@ function messageFromAppServerItem(
       role: 'activity',
       kind: 'file',
       text: `File change ${stringField(item, 'status') ?? 'running'}`,
+      ...(turnId ? { turnId } : {}),
       createdAt
+    });
+  }
+
+  if (type === 'contextCompaction') {
+    return contextCompactionMessage({
+      id,
+      ...(turnId ? { turnId } : {}),
+      createdAt,
+      status: stringField(item, 'status')
     });
   }
 
@@ -1880,6 +2022,7 @@ function messageFromAppServerItem(
       role: 'activity',
       kind: 'tool',
       text: `${server}.${tool} ${status}`,
+      ...(turnId ? { turnId } : {}),
       createdAt
     });
   }
@@ -1898,7 +2041,7 @@ function approvalResponseForServerRequest(
   if (method === 'item/commandExecution/requestApproval') {
     return { decision: response };
   }
-  if (method === 'item/fileChange/requestApproval') {
+  if (method === 'item/fileChange/requestApproval' || method === 'item/fileRead/requestApproval') {
     return { decision: response };
   }
   if (method === 'item/permissions/requestApproval') {
@@ -1921,7 +2064,7 @@ function approvalResponseForServerRequest(
       _meta: null
     };
   }
-  if (method === 'item/tool/requestUserInput') {
+  if (method === 'item/tool/requestUserInput' || method === 'tool/requestUserInput') {
     return response && typeof response === 'object' && !Array.isArray(response)
       ? response
       : { answers: {} };
@@ -2084,6 +2227,17 @@ function recordField(record: Record<string, unknown>, field: string): Record<str
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function parseTranscriptionAuthContext(raw: unknown): CodexTranscriptionAuthContext {
+  try {
+    return parseCodexTranscriptionAuthContext(raw);
+  } catch (error) {
+    if (error instanceof CodexTranscriptionAuthError) {
+      throw new SendBlockedError('thread_unavailable', error.message);
+    }
+    throw error;
+  }
 }
 
 function recordFromUnknown(value: unknown): Record<string, unknown> {

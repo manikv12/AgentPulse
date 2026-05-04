@@ -12,6 +12,7 @@ import {
   openThreadInCodex,
   pairDevice,
   sendThreadMessage,
+  transcribeVoiceAudio,
   stopThreadWork,
   startThread,
   AgentPulseApiError
@@ -263,7 +264,7 @@ describe('tablet API helpers', () => {
   });
 
   it('includes image attachments when sending a tablet message', async () => {
-    const fetchMock = vi.fn(async (url: string) => {
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
       if (url === '/threads/thread-1/messages') {
         return {
           ok: true,
@@ -325,6 +326,36 @@ describe('tablet API helpers', () => {
         body: JSON.stringify({ text: 'See this.', attachments: [attachment] })
       })
     );
+  });
+
+  it('posts voice transcription audio as multipart form data', async () => {
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (url === '/voice/transcriptions') {
+        return {
+          ok: true,
+          json: async () => ({ text: 'Voice draft text.' })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+
+    await expect(
+      transcribeVoiceAudio(session, new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/webm' }))
+    ).resolves.toEqual({ text: 'Voice draft text.' });
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect(init.body).toBeInstanceOf(FormData);
+    expect(new Headers(init.headers).get('content-type')).toBeNull();
+    expect(new Headers(init.headers).get('authorization')).toBe('Bearer token-1234567890');
   });
 
   it('stops Codex work through the authenticated helper route', async () => {

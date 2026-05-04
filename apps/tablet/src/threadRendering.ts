@@ -1,4 +1,4 @@
-import type { ChatMessage } from '@agent-pulse/shared';
+import type { ChatMessage, ThreadFileChangeSummary } from '@agent-pulse/shared';
 
 export type WorkSummaryKind =
   | 'browser'
@@ -48,16 +48,23 @@ export type ActivityGroup = {
 
 export type RenderableEntry =
   | { type: 'message'; message: ChatMessage }
-  | { type: 'activityGroup'; group: ActivityGroup };
+  | { type: 'activityGroup'; group: ActivityGroup }
+  | { type: 'fileChanges'; id: string; turnId?: string; summaries: ThreadFileChangeSummary[] };
 
 export function buildRenderableEntries(
   messages: ChatMessage[],
-  options: { isLive?: boolean; preserveInputOrder?: boolean } = {}
+  options: {
+    isLive?: boolean;
+    preserveInputOrder?: boolean;
+    fileChanges?: ThreadFileChangeSummary[];
+  } = {}
 ): RenderableEntry[] {
   const result: RenderableEntry[] = [];
   let turnBuffer: ChatMessage[] = [];
   let leadingBuffer: ChatMessage[] = [];
+  let currentUserMessage: ChatMessage | null = null;
   let hasVisibleUserTurn = false;
+  const assignedFileChangeIds = new Set<string>();
   // `preserveInputOrder` is set when the caller has already arranged the
   // messages in the exact rendering order it wants (e.g. an optimistic pending
   // user bubble interleaved with helper-side messages whose clocks may not be
@@ -71,28 +78,48 @@ export function buildRenderableEntries(
     : sortMessagesByCreatedAt(messages);
 
   const flushTurn = () => {
-    if (turnBuffer.length === 0) {
+    const turnMessages = currentUserMessage ? [currentUserMessage, ...turnBuffer] : turnBuffer;
+    const turnFileChanges = fileChangesForTurn(
+      options.fileChanges ?? [],
+      turnMessages,
+      assignedFileChangeIds,
+      currentUserMessage?.turnId
+    );
+    if (turnBuffer.length === 0 && turnFileChanges.length === 0) {
+      currentUserMessage = null;
       return;
     }
 
-    const finalIndex = findFinalResponseIndex(turnBuffer, options);
-    const finalMessage = finalIndex >= 0 ? turnBuffer[finalIndex]! : null;
-    const activityMessages = finalMessage
-      ? turnBuffer.filter((_, index) => index !== finalIndex)
-      : turnBuffer.slice();
+    if (turnBuffer.length > 0) {
+      const finalIndex = findFinalResponseIndex(turnBuffer, options);
+      const finalMessage = finalIndex >= 0 ? turnBuffer[finalIndex]! : null;
+      const activityMessages = finalMessage
+        ? turnBuffer.filter((_, index) => index !== finalIndex)
+        : turnBuffer.slice();
 
-    if (activityMessages.length > 0) {
+      if (activityMessages.length > 0) {
+        result.push({
+          type: 'activityGroup',
+          group: buildActivityGroup(activityMessages, finalMessage)
+        });
+      }
+
+      if (finalMessage) {
+        result.push({ type: 'message', message: finalMessage });
+      }
+    }
+
+    if (turnFileChanges.length > 0) {
       result.push({
-        type: 'activityGroup',
-        group: buildActivityGroup(activityMessages, finalMessage)
+        type: 'fileChanges',
+        id: `file-changes:${turnFileChanges.map((summary) => summary.id).join('|')}`,
+        turnId: firstDefinedTurnId(turnMessages, turnFileChanges),
+        summaries: turnFileChanges
       });
     }
 
-    if (finalMessage) {
-      result.push({ type: 'message', message: finalMessage });
-    }
-
     turnBuffer = [];
+    currentUserMessage = null;
   };
 
   for (const message of orderedMessages) {
@@ -101,6 +128,7 @@ export function buildRenderableEntries(
         flushTurn();
       }
       result.push({ type: 'message', message });
+      currentUserMessage = message;
       hasVisibleUserTurn = true;
       if (leadingBuffer.length > 0) {
         turnBuffer.push(...leadingBuffer);
@@ -124,6 +152,52 @@ export function buildRenderableEntries(
     flushTurn();
   }
   return result;
+}
+
+function fileChangesForTurn(
+  fileChanges: ThreadFileChangeSummary[],
+  turnMessages: ChatMessage[],
+  assignedFileChangeIds: Set<string>,
+  currentUserTurnId?: string
+): ThreadFileChangeSummary[] {
+  if (fileChanges.length === 0 || turnMessages.length === 0) {
+    return [];
+  }
+  const messageById = new Map(turnMessages.map((message) => [message.id, message]));
+  const turnIds = new Set(
+    turnMessages
+      .map((message) => message.turnId)
+      .filter((turnId): turnId is string => Boolean(turnId))
+  );
+  const matched = fileChanges.filter((summary) => {
+    if (assignedFileChangeIds.has(summary.id)) {
+      return false;
+    }
+    if (summary.itemId) {
+      const itemMessage = messageById.get(summary.itemId);
+      if (itemMessage) {
+        return !currentUserTurnId || !itemMessage.turnId || itemMessage.turnId === currentUserTurnId;
+      }
+    }
+    if (summary.turnId && currentUserTurnId) {
+      return summary.turnId === currentUserTurnId;
+    }
+    return Boolean(summary.turnId && turnIds.has(summary.turnId));
+  });
+  for (const summary of matched) {
+    assignedFileChangeIds.add(summary.id);
+  }
+  return matched;
+}
+
+function firstDefinedTurnId(
+  messages: ChatMessage[],
+  summaries: ThreadFileChangeSummary[]
+): string | undefined {
+  return (
+    summaries.find((summary) => summary.turnId)?.turnId ??
+    messages.find((message) => message.turnId)?.turnId
+  );
 }
 
 export function findFinalResponseIndex(
@@ -224,6 +298,12 @@ export function formatWorkLabel(
     return joined.charAt(0).toUpperCase() + joined.slice(1);
   }
 
+  if (messages.some((message) => message.phase === 'context_compaction')) {
+    return 'Compacting context';
+  }
+  if (messages.some((message) => message.phase === 'pending_send')) {
+    return 'Thinking';
+  }
   if (counts.reasoning > 0) {
     return 'Thought through the task';
   }
@@ -363,11 +443,13 @@ function activityTitleForKind(kind: WorkSummaryKind, message: ChatMessage): stri
     case 'plan':
       return 'Updated plan';
     case 'reasoning':
-      return message.phase === 'commentary' ? 'Thinking' : 'Reasoning';
+      return message.phase === 'commentary' || message.phase === 'pending_send'
+        ? 'Thinking'
+        : 'Reasoning';
     case 'search':
       return 'Searched';
     case 'status':
-      return 'Status';
+      return message.phase === 'context_compaction' ? 'Compacting context' : 'Status';
     case 'subagent':
       return 'Used subagent';
     case 'tool':

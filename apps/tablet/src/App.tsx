@@ -21,6 +21,7 @@ import {
   type Project,
   type RemoteAccessSettings,
   type Thread,
+  type ThreadFileChangeSummary,
   type ThreadListGroup,
   type TouchCommand,
   type TranscriptCommentDraft,
@@ -52,6 +53,7 @@ import {
   adminFetch,
   adminLogin,
   adminLogout,
+  applyThreadFileChangeAction,
   clearAdminToken,
   clearSession,
   checkRemoteAccess,
@@ -92,6 +94,7 @@ import {
   sendHandoff,
   startThread,
   stopThreadWork,
+  transcribeVoiceAudio,
   updateRemoteAccess,
   updateEnabledProviders,
   updateThreadModel,
@@ -191,6 +194,15 @@ function parseSeenLocalStorage(raw: string | null): Record<string, number> {
   } catch {
     return {};
   }
+}
+
+function newerSeenThreadEntries(
+  localEntries: Record<string, number>,
+  helperEntries: Record<string, number>
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(localEntries).filter(([threadId, seenAt]) => (helperEntries[threadId] ?? 0) < seenAt)
+  );
 }
 
 function transcriptShowsLiveActive(transcript: ThreadTranscript): boolean {
@@ -409,7 +421,7 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
   if (!method || !id) {
     return null;
   }
-  if (method === 'item/tool/requestUserInput') {
+  if (method === 'item/tool/requestUserInput' || method === 'tool/requestUserInput') {
     const params = (req.params ?? {}) as { questions?: unknown; turnId?: unknown };
     const questions = Array.isArray(params.questions) ? params.questions : [];
     // Codex's RequestUserInputQuestion has fields { id, header, question,
@@ -447,6 +459,7 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
   if (
     method === 'item/commandExecution/requestApproval' ||
     method === 'item/fileChange/requestApproval' ||
+    method === 'item/fileRead/requestApproval' ||
     method === 'item/permissions/requestApproval'
   ) {
     const rawParams = recordFromUnknown(req.params) ?? {};
@@ -464,14 +477,16 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
       kind:
         method === 'item/commandExecution/requestApproval'
           ? 'commandApproval'
-          : method === 'item/fileChange/requestApproval'
+          : method === 'item/fileChange/requestApproval' || method === 'item/fileRead/requestApproval'
             ? 'fileApproval'
             : 'permissionsApproval',
       title:
         method === 'item/commandExecution/requestApproval'
           ? 'Approve command?'
-          : method === 'item/fileChange/requestApproval'
-            ? 'Approve file changes?'
+          : method === 'item/fileRead/requestApproval'
+            ? 'Approve file read?'
+            : method === 'item/fileChange/requestApproval'
+              ? 'Approve file changes?'
             : typeof params.reason === 'string' && params.reason.trim().length > 0
               ? params.reason.trim()
               : 'Approve permissions?',
@@ -1237,6 +1252,62 @@ function latestTranscriptMessage(
   );
 }
 
+type ActiveSendGuard = {
+  text: string;
+  attachmentIds: Set<string>;
+  attachmentUrls: Set<string>;
+  baselineMessageIds: Set<string>;
+  startedAt: number;
+};
+
+function transcriptConfirmsActiveSend(
+  transcript: ThreadTranscript,
+  guard: ActiveSendGuard
+): boolean {
+  const trimmed = guard.text.trim();
+  return transcript.messages.some((message) => {
+    if (message.role !== 'user' || guard.baselineMessageIds.has(message.id)) {
+      return false;
+    }
+    if (trimmed && message.text.trim() === trimmed) {
+      return true;
+    }
+    return (message.attachments ?? []).some(
+      (attachment) =>
+        guard.attachmentIds.has(attachment.id) || guard.attachmentUrls.has(attachment.url)
+    );
+  });
+}
+
+function transcriptHasFreshPostSendMessage(
+  transcript: ThreadTranscript,
+  guard: ActiveSendGuard
+): boolean {
+  return transcript.messages.some((message) => {
+    if (guard.baselineMessageIds.has(message.id)) {
+      return false;
+    }
+    const createdAt = Date.parse(message.createdAt);
+    return !Number.isFinite(createdAt) || createdAt >= guard.startedAt - 10_000;
+  });
+}
+
+function shouldAcceptTranscriptForActiveSend(
+  transcript: ThreadTranscript,
+  guard: ActiveSendGuard | undefined
+): boolean {
+  if (!guard) {
+    return true;
+  }
+  if (Date.now() - guard.startedAt > 60_000) {
+    return true;
+  }
+  return (
+    transcriptConfirmsActiveSend(transcript, guard) ||
+    transcriptHasFreshPostSendMessage(transcript, guard)
+  );
+}
+
 function removeTranscriptCache(
   current: Record<string, ThreadTranscript>,
   threadId: string
@@ -1327,6 +1398,7 @@ export function App() {
   const [transcripts, setTranscripts] = useState<Record<string, ThreadTranscript>>(() =>
     readCachedTranscripts(loadSession())
   );
+  const activeSendGuardsRef = useRef<Map<string, ActiveSendGuard>>(new Map());
   const [threadModels, setThreadModels] = useState<Record<string, string>>({});
   const [threadReasoningEfforts, setThreadReasoningEfforts] = useState<Record<string, string>>({});
   // Tracks user-initiated picks per thread (model + effort + timestamp). Codex's persisted thread
@@ -1604,7 +1676,7 @@ export function App() {
     let cancelled = false;
     void fetchPendingApprovals(session, activeThreadId)
       .then((requests) => {
-        if (cancelled || requests.length === 0) return;
+        if (cancelled) return;
         const summaries = summarizePendingApprovalsFromHelper(requests);
         setThreadPendingRequests((current) => ({
           ...current,
@@ -1696,18 +1768,25 @@ export function App() {
       .catch(() => setTouchCommands([]));
   }, [activeThreadId, session]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options: { forceRetry?: boolean } = {}) => {
     const requestSession = session;
-    if (requestSession && sessionRecoverySuspended) {
+    const forceRetry = options.forceRetry === true;
+    if (forceRetry) {
+      setSessionRecoverySuspended(false);
+      setMessage('');
+    }
+    if (requestSession && sessionRecoverySuspended && !forceRetry) {
       setThreadsLoaded(false);
       setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
       return;
     }
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 5_000);
+    let helperReachable = false;
 
     try {
       const nextHealth = await fetchHealth(controller.signal);
+      helperReachable = true;
       setHealth(nextHealth);
       window.clearTimeout(timeout);
 
@@ -1791,26 +1870,19 @@ export function App() {
           }
         });
 
-      // Pull the helper's authoritative seen-thread map. If the local tablet
-      // had a localStorage map from before the helper started tracking this,
-      // import it once so users don't lose their existing review state on the
-      // first connect after the upgrade. A migration-done flag prevents the
-      // import from firing on every page load — Dashboard continues writing
-      // to the same localStorage key, so the key will always have entries
-      // once any thread has been marked seen.
+      // Pull the helper's authoritative seen-thread map, then push back any
+      // newer local entries. This keeps review state durable after helper
+      // restarts or store resets while still letting the helper be the shared
+      // source of truth for every paired device.
       void (async () => {
         try {
-          const MIGRATION_FLAG_KEY = 'agent-pulse:seen-migration-v1';
-          const migrationDone = window.localStorage.getItem(MIGRATION_FLAG_KEY) === '1';
           const localRaw = window.localStorage.getItem('agent-pulse:seen-thread-activity');
           const localMap = parseSeenLocalStorage(localRaw);
-          let entries: Record<string, number>;
-          if (!migrationDone && Object.keys(localMap).length > 0) {
-            entries = await importSeenThreadActivity(requestSession, localMap);
-            window.localStorage.setItem(MIGRATION_FLAG_KEY, '1');
-          } else {
-            entries = await fetchSeenThreadActivity(requestSession);
-          }
+          const helperEntries = await fetchSeenThreadActivity(requestSession);
+          const localNewerEntries = newerSeenThreadEntries(localMap, helperEntries);
+          const entries = Object.keys(localNewerEntries).length > 0
+            ? await importSeenThreadActivity(requestSession, localNewerEntries)
+            : helperEntries;
           if (sameSession(loadSession(), requestSession)) {
             setSeenThreadActivity(entries);
           }
@@ -1890,10 +1962,12 @@ export function App() {
             return;
           } catch (recoverError) {
             if (!(recoverError instanceof Response) || (recoverError.status !== 401 && recoverError.status !== 403)) {
-              setSessionRecoverySuspended(true);
-              setThreadsLoaded(false);
+              setSessionRecoverySuspended(false);
               setLoadingThreadGroupKey(undefined);
-              setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
+              setMessage('Reconnecting to helper...');
+              setScreen((current) =>
+                ADMIN_FLEX_SCREENS.has(current) || current === 'dashboard' ? current : 'dashboard'
+              );
               return;
             }
 
@@ -1919,6 +1993,13 @@ export function App() {
       }
       setThreadsLoaded(false);
       setLoadingThreadGroupKey(undefined);
+      if (requestSession && helperReachable) {
+        setMessage('Reconnecting to helper...');
+        setScreen((current) =>
+          ADMIN_FLEX_SCREENS.has(current) || current === 'dashboard' ? current : 'dashboard'
+        );
+        return;
+      }
       setScreen((current) => (BACKGROUND_STABLE_SCREENS.has(current) ? current : 'offline'));
     }
   }, [session, sessionRecoverySuspended, syncWorkingStateFromThreads, threadGroupLimits]);
@@ -1940,12 +2021,49 @@ export function App() {
     let closingFromCleanup = false;
     let reconnectAttempt = 0;
     let reconnectTimer: number | undefined;
+    let recoveryInFlight = false;
     let socket: WebSocket | undefined;
+
+    const scheduleReconnect = () => {
+      const delay = Math.min(1000 * 2 ** reconnectAttempt, 15_000);
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(connect, delay);
+    };
+
+    const recoverLiveSession = async (): Promise<boolean> => {
+      if (recoveryInFlight) {
+        return false;
+      }
+      recoveryInFlight = true;
+      try {
+        const recovered = await recoverDeviceSession(session);
+        if (closingFromCleanup || sessionRecoverySuspended || !sameSession(loadSession(), session)) {
+          return true;
+        }
+        const nextSession = {
+          ...session,
+          token: recovered.token,
+          deviceId: recovered.deviceId,
+          deviceName: recovered.deviceName
+        };
+        saveSession(nextSession);
+        setSession(nextSession);
+        setSessionRecoverySuspended(false);
+        reconnectAttempt = 0;
+        setMessage('');
+        return true;
+      } catch {
+        return false;
+      } finally {
+        recoveryInFlight = false;
+      }
+    };
 
     const connect = () => {
       socket = new WebSocket(liveEventsUrl(session));
       socket.onopen = () => {
         reconnectAttempt = 0;
+        setMessage('');
       };
       socket.onmessage = (event) => {
         const parsed = LiveEventSchema.safeParse(JSON.parse(event.data));
@@ -1987,7 +2105,13 @@ export function App() {
         }
 
         if (liveEvent.type === 'thread/transcript/changed') {
-          setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
+          const guard = activeSendGuardsRef.current.get(liveEvent.payload.threadId);
+          if (shouldAcceptTranscriptForActiveSend(liveEvent.payload, guard)) {
+            setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
+            if (guard && transcriptConfirmsActiveSend(liveEvent.payload, guard)) {
+              activeSendGuardsRef.current.delete(liveEvent.payload.threadId);
+            }
+          }
           if (!liveEvent.payload.usage) {
             requestTranscriptRefresh(liveEvent.payload.threadId);
           }
@@ -2085,6 +2209,23 @@ export function App() {
           }));
         }
 
+        if (liveEvent.type === 'thread/file-changes/changed') {
+          const { threadId, summaries } = liveEvent.payload;
+          setTranscripts((current) => {
+            const previous = current[threadId];
+            if (!previous) {
+              return current;
+            }
+            return {
+              ...current,
+              [threadId]: ThreadTranscriptSchema.parse({
+                ...previous,
+                fileChanges: summaries
+              })
+            };
+          });
+        }
+
         if (liveEvent.type === 'thread/seen-activity/changed') {
           // Another paired device reviewed this thread (or this device echoed
           // back). Keep our local map in sync so the Review chip drops in
@@ -2140,9 +2281,14 @@ export function App() {
           return;
         }
         setMessage('Reconnecting to helper...');
-        const delay = Math.min(1000 * 2 ** reconnectAttempt, 15_000);
-        reconnectAttempt += 1;
-        reconnectTimer = window.setTimeout(connect, delay);
+        void recoverLiveSession().then((recovered) => {
+          if (closingFromCleanup || sessionRecoverySuspended || !loadSession()) {
+            return;
+          }
+          if (!recovered) {
+            scheduleReconnect();
+          }
+        });
       };
     };
 
@@ -2344,7 +2490,13 @@ export function App() {
       }
 
       const transcript = await fetchThreadTranscript(session, threadId, options);
-      setTranscripts((current) => upsertTranscriptCache(current, transcript));
+      const guard = activeSendGuardsRef.current.get(threadId);
+      if (shouldAcceptTranscriptForActiveSend(transcript, guard)) {
+        setTranscripts((current) => upsertTranscriptCache(current, transcript));
+        if (guard && transcriptConfirmsActiveSend(transcript, guard)) {
+          activeSendGuardsRef.current.delete(threadId);
+        }
+      }
       applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
       return transcript;
     },
@@ -2357,6 +2509,41 @@ export function App() {
         return Promise.reject(new Error('Not connected.'));
       }
       return fetchOlderThreadMessages(session, threadId, beforeMessageId, limit);
+    },
+    [session]
+  );
+
+  const handleApplyFileChangeAction = useCallback(
+    async (
+      threadId: string,
+      changeId: string,
+      action: ThreadFileChangeSummary['action']
+    ): Promise<void> => {
+      if (!session) {
+        throw new Error('Not connected.');
+      }
+      const summary = await applyThreadFileChangeAction(session, threadId, changeId, action);
+      if (summary) {
+        setTranscripts((current) => {
+          const previous = current[threadId];
+          if (!previous) {
+            return current;
+          }
+          const nextFileChanges = (previous.fileChanges ?? []).map((fileChange) =>
+            fileChange.id === summary.id ? summary : fileChange
+          );
+          if (!nextFileChanges.some((fileChange) => fileChange.id === summary.id)) {
+            nextFileChanges.push(summary);
+          }
+          return {
+            ...current,
+            [threadId]: ThreadTranscriptSchema.parse({
+              ...previous,
+              fileChanges: nextFileChanges
+            })
+          };
+        });
+      }
     },
     [session]
   );
@@ -2404,25 +2591,44 @@ export function App() {
       const baselineMessageIds = new Set(
         previousTranscript?.messages.map((message) => message.id) ?? []
       );
-      const result = await sendThreadMessage(session, threadId, text, options);
-      const responseHasNewUserMessage = result.transcript.messages.some(
-        (message) =>
-          message.role === 'user' &&
-          !baselineMessageIds.has(message.id) &&
-          ((trimmedSendText && message.text.trim() === trimmedSendText) ||
-            (message.attachments ?? []).some(
-              (attachment) =>
-                sentAttachmentIds.has(attachment.id) || sentAttachmentUrls.has(attachment.url)
-            ))
-      );
-      if (responseHasNewUserMessage) {
+      const guard: ActiveSendGuard = {
+        text,
+        attachmentIds: sentAttachmentIds,
+        attachmentUrls: sentAttachmentUrls,
+        baselineMessageIds,
+        startedAt: Date.now()
+      };
+      activeSendGuardsRef.current.set(threadId, guard);
+      let result: Awaited<ReturnType<typeof sendThreadMessage>>;
+      try {
+        result = await sendThreadMessage(session, threadId, text, options);
+      } catch (error) {
+        activeSendGuardsRef.current.delete(threadId);
+        throw error;
+      }
+      const responseHasNewUserMessage = transcriptConfirmsActiveSend(result.transcript, guard);
+      if (shouldAcceptTranscriptForActiveSend(result.transcript, guard)) {
         setTranscripts((current) => upsertTranscriptCache(current, result.transcript));
+      }
+      if (responseHasNewUserMessage) {
+        activeSendGuardsRef.current.delete(threadId);
       }
       applyTranscriptActivityState(result.transcript);
       applyTranscriptModel(threadId, result.transcript.model, result.transcript.reasoningEffort);
       return result;
     },
     [session, transcripts, applyTranscriptActivityState, applyTranscriptModel]
+  );
+
+  const handleTranscribeVoiceAudio = useCallback(
+    async (audio: Blob): Promise<string> => {
+      if (!session) {
+        throw new Error('Not connected.');
+      }
+      const response = await transcribeVoiceAudio(session, audio);
+      return response.text;
+    },
+    [session]
   );
 
   const markThreadStopped = useCallback((threadId: string) => {
@@ -2541,7 +2747,7 @@ export function App() {
     }
 
     if (screen === 'offline') {
-      return <OfflineScreen onRetry={() => void refresh()} />;
+      return <OfflineScreen onRetry={() => void refresh({ forceRetry: true })} />;
     }
 
     if (screen === 'revoked') {
@@ -2602,8 +2808,11 @@ export function App() {
           onOpenSettings={handleOpenAdmin}
           fetchTranscript={handleFetchTranscript}
           sendMessage={handleSendMessage}
+          transcribeVoiceAudio={handleTranscribeVoiceAudio}
+          voiceTranscriptionAvailable={health.voiceTranscription?.available === true}
           stopWork={handleStopWork}
           fetchOlderMessages={handleFetchOlderMessages}
+          onApplyFileChangeAction={handleApplyFileChangeAction}
           transcriptUpdates={transcripts}
           liveAssistantTextByThread={liveAssistantTextByThread}
           threadModels={threadModels}
@@ -2724,6 +2933,7 @@ export function App() {
     handleOpenAdmin,
     handlePair,
     handleSendMessage,
+    handleTranscribeVoiceAudio,
     handleStopWork,
     handleOpenThreadInCodex,
     handleDeleteThread,

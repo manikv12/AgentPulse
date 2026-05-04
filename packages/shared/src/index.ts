@@ -66,6 +66,13 @@ export const HelperHealthSchema = z.object({
   codexAppServer: z.enum(['connected', 'disconnected']),
   version: z.string().min(1),
   uptimeSec: z.number().int().nonnegative(),
+  voiceTranscription: z
+    .object({
+      available: z.boolean(),
+      reason: z.string().min(1).optional(),
+      maxBytes: z.number().int().positive().optional()
+    })
+    .optional(),
   remoteAccess: z
     .object({
       enabled: z.boolean(),
@@ -87,6 +94,12 @@ export const HelperHealthSchema = z.object({
 });
 
 export type HelperHealth = z.infer<typeof HelperHealthSchema>;
+
+export const VoiceTranscriptionResponseSchema = z.object({
+  text: z.string()
+});
+
+export type VoiceTranscriptionResponse = z.infer<typeof VoiceTranscriptionResponseSchema>;
 
 export const RemoteAccessChecklistSchema = z.object({
   dependencyInstalled: z.boolean(),
@@ -198,6 +211,21 @@ export const DeviceSessionRecoveryRequestSchema = z.object({
   fingerprint: z.string().min(8).max(240)
 });
 
+export const PairLookupResponseSchema = z.object({
+  baseUrl: z.string().min(1),
+  helperName: z.string().min(1).optional()
+});
+
+export const WatchPushRegisterRequestSchema = z.object({
+  pushToken: z.string().trim().min(8).max(512),
+  bundleId: z.string().trim().min(1).max(240).optional(),
+  environment: z.enum(['sandbox', 'production']).optional()
+});
+
+export const WatchPushRegisterResponseSchema = z.object({
+  ok: z.literal(true)
+});
+
 export const ThreadOpenRequestSchema = z.object({
   threadId: z.string().min(1),
   mode: z.enum(['open', 'sync']).optional()
@@ -261,10 +289,36 @@ export const ChatMessageSchema = z.object({
   text: z.string(),
   attachments: z.array(ChatAttachmentSchema).optional(),
   phase: z.string().min(1).optional(),
+  turnId: z.string().min(1).optional(),
   createdAt: isoUtcTimestamp
 });
 
 export type ChatMessage = z.infer<typeof ChatMessageSchema>;
+
+export const ThreadFileChangeFileSchema = z.object({
+  path: z.string().min(1),
+  linesAdded: z.number().int().nonnegative(),
+  linesDeleted: z.number().int().nonnegative()
+});
+
+export type ThreadFileChangeFile = z.infer<typeof ThreadFileChangeFileSchema>;
+
+export const ThreadFileChangeSummarySchema = z.object({
+  id: z.string().min(1),
+  threadId: z.string().min(1),
+  turnId: z.string().min(1).optional(),
+  itemId: z.string().min(1).optional(),
+  cwd: z.string().min(1).optional(),
+  fileCount: z.number().int().nonnegative(),
+  linesAdded: z.number().int().nonnegative(),
+  linesDeleted: z.number().int().nonnegative(),
+  files: z.array(ThreadFileChangeFileSchema),
+  action: z.enum(['undo', 'reapply']).default('undo'),
+  canUseCodexApplyPatch: z.boolean().default(false),
+  unavailableReason: z.string().min(1).optional()
+});
+
+export type ThreadFileChangeSummary = z.infer<typeof ThreadFileChangeSummarySchema>;
 
 export const ThreadSendStateSchema = z.object({
   canSend: z.boolean(),
@@ -304,7 +358,8 @@ export const ThreadTranscriptSchema = z.object({
   // thread/resume response so the tablet stays in sync with whatever the desktop changed
   // without us needing to listen for the snapshot broadcast.
   model: z.string().min(1).optional(),
-  reasoningEffort: z.string().min(1).optional()
+  reasoningEffort: z.string().min(1).optional(),
+  fileChanges: z.array(ThreadFileChangeSummarySchema).optional()
 });
 
 export type ThreadTranscript = z.input<typeof ThreadTranscriptSchema>;
@@ -648,10 +703,12 @@ export const ThreadModelUpdateRequestSchema = z.object({
 export const APPROVAL_METHODS = [
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
+  'item/fileRead/requestApproval',
   'item/permissions/requestApproval',
   'execCommandApproval',
   'applyPatchApproval',
   'item/tool/requestUserInput',
+  'tool/requestUserInput',
   'item/plan/requestImplementation',
   'mcpServer/elicitation/request',
   'claudeCode/canUseTool',
@@ -668,6 +725,19 @@ export type ApprovalDecisionRequest = z.infer<typeof ApprovalDecisionRequestSche
 export const ApprovalDecisionResponseSchema = z.object({
   ok: z.literal(true)
 });
+
+export const ThreadFileChangeActionRequestSchema = z.object({
+  action: z.enum(['undo', 'reapply'])
+});
+
+export type ThreadFileChangeActionRequest = z.infer<typeof ThreadFileChangeActionRequestSchema>;
+
+export const ThreadFileChangeActionResponseSchema = z.object({
+  ok: z.literal(true),
+  summary: ThreadFileChangeSummarySchema.optional()
+});
+
+export type ThreadFileChangeActionResponse = z.infer<typeof ThreadFileChangeActionResponseSchema>;
 
 // Approval request payload surfaced by the helper from Codex live state.
 export const PendingApprovalRequestSchema = z.object({
@@ -757,6 +827,13 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
     payload: z.object({
       threadId: z.string().min(1),
       requests: z.array(PendingApprovalRequestSchema)
+    })
+  }),
+  z.object({
+    type: z.literal('thread/file-changes/changed'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      summaries: z.array(ThreadFileChangeSummarySchema)
     })
   }),
   z.object({

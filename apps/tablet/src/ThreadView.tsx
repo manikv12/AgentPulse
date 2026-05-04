@@ -11,11 +11,13 @@ import type {
   HandoffSummaryDraft,
   OlderThreadMessagesResponse,
   Thread,
+  ThreadFileChangeSummary,
   ThreadMessageResponse,
   ThreadTranscript,
   TranscriptCommentDraft,
   ThreadUsage
 } from '@agent-pulse/shared';
+import { ThreadFileChangeSummarySchema } from '@agent-pulse/shared';
 import {
   ArrowUp,
   Brain,
@@ -28,6 +30,8 @@ import {
   Info,
   ListChecks,
   Menu,
+  Mic,
+  MoreVertical,
   Plus,
   Square,
   Terminal,
@@ -37,12 +41,14 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ClipboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type UIEvent,
 } from 'react';
 import ReactMarkdown from 'react-markdown';
@@ -80,6 +86,7 @@ const OLDER_MESSAGES_AUTO_LOAD_TOP_PX = 96;
 const NEAR_BOTTOM_PX = 60;
 const MAX_COMPOSER_IMAGE_ATTACHMENTS = 6;
 const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
+const VOICE_WAVE_BARS = [2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 16, 14, 12, 10, 8, 6, 5, 4, 6, 8, 12, 16, 18, 14, 10, 7, 5, 3, 2];
 
 export type ThreadPendingRequest = {
   id: string;
@@ -106,12 +113,14 @@ export type ThreadPendingRequest = {
 export type ApprovalMethodForUi =
   | 'item/commandExecution/requestApproval'
   | 'item/fileChange/requestApproval'
+  | 'item/fileRead/requestApproval'
   | 'item/permissions/requestApproval'
   | 'execCommandApproval'
   | 'applyPatchApproval'
   | 'claudeCode/canUseTool'
   | 'claudeCode/elicitation'
   | 'item/tool/requestUserInput'
+  | 'tool/requestUserInput'
   | 'item/plan/requestImplementation'
   | 'mcpServer/elicitation/request';
 
@@ -128,6 +137,8 @@ export type ThreadViewProps = {
     text: string,
     options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
   ) => Promise<ThreadMessageResponse>;
+  transcribeVoiceAudio?: (audio: Blob) => Promise<string>;
+  voiceTranscriptionAvailable?: boolean;
   stopWork?: (threadId: string) => Promise<void>;
   deleteThread?: (threadId: string) => Promise<void>;
   fetchOlderMessages?: (
@@ -135,6 +146,10 @@ export type ThreadViewProps = {
     limit?: number
   ) => Promise<OlderThreadMessagesResponse>;
   openThreadInCodex?: (threadId: string) => Promise<void>;
+  onApplyFileChangeAction?: (
+    changeId: string,
+    action: ThreadFileChangeSummary['action']
+  ) => Promise<void>;
   liveTranscript?: ThreadTranscript;
   // Optional per-token text overlay for the assistant reply currently in flight.
   // The renderer prefers this when it is *longer* than the matching transcript
@@ -222,6 +237,41 @@ function detectMentionAtCaret(
   return { trigger, query, start, end: caret };
 }
 
+function useDismissOnOutsidePointer<T extends HTMLElement>(
+  isOpen: boolean,
+  onClose: () => void
+) {
+  const ref = useRef<T | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && ref.current?.contains(target)) {
+        return;
+      }
+      onClose();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [isOpen, onClose]);
+
+  return ref;
+}
+
 function formatModelName(slug: string | undefined): string {
   const value = slug?.trim();
   if (!value) {
@@ -280,6 +330,169 @@ function imageFileToAttachment(file: File, index: number): Promise<ChatAttachmen
     };
     reader.readAsDataURL(file);
   });
+}
+
+function preferredVoiceMimeType(): string | undefined {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) {
+    return undefined;
+  }
+  return [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+    'audio/ogg'
+  ].find((candidate) => MediaRecorder.isTypeSupported(candidate));
+}
+
+type PcmVoiceRecorder = {
+  audioContext: AudioContext;
+  processor: ScriptProcessorNode;
+  source: MediaStreamAudioSourceNode;
+  silentGain: GainNode;
+  chunks: Float32Array[];
+  sampleRate: number;
+};
+
+const VOICE_WAV_SAMPLE_RATE = 24_000;
+
+function browserAudioContextConstructor(): typeof AudioContext | undefined {
+  return (
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+  );
+}
+
+function createPcmVoiceRecorder(stream: MediaStream): PcmVoiceRecorder | undefined {
+  const AudioContextConstructor = browserAudioContextConstructor();
+  if (!AudioContextConstructor) {
+    return undefined;
+  }
+  let audioContext: AudioContext | undefined;
+  try {
+    audioContext = new AudioContextConstructor();
+    const source = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    const silentGain = audioContext.createGain();
+    const chunks: Float32Array[] = [];
+    silentGain.gain.value = 0;
+    processor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(input));
+    };
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+    if (audioContext.state === 'suspended') {
+      void audioContext.resume().catch(() => undefined);
+    }
+    return {
+      audioContext,
+      processor,
+      source,
+      silentGain,
+      chunks,
+      sampleRate: audioContext.sampleRate
+    };
+  } catch {
+    if (audioContext && audioContext.state !== 'closed') {
+      void audioContext.close().catch(() => undefined);
+    }
+    return undefined;
+  }
+}
+
+function stopPcmVoiceRecorder(recorder: PcmVoiceRecorder): Blob {
+  recorder.processor.disconnect();
+  recorder.source.disconnect();
+  recorder.silentGain.disconnect();
+  void recorder.audioContext.close().catch(() => undefined);
+  const samples = flattenFloatSamples(recorder.chunks);
+  const resampled = resampleFloatSamples(samples, recorder.sampleRate, VOICE_WAV_SAMPLE_RATE);
+  return new Blob([encodePcmWav(resampled, VOICE_WAV_SAMPLE_RATE)], { type: 'audio/wav' });
+}
+
+function flattenFloatSamples(chunks: Float32Array[]): Float32Array {
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const samples = new Float32Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    samples.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return samples;
+}
+
+function resampleFloatSamples(samples: Float32Array, sourceRate: number, targetRate: number): Int16Array {
+  if (samples.length === 0) {
+    return new Int16Array();
+  }
+  if (!Number.isFinite(sourceRate) || sourceRate <= 0 || Math.abs(sourceRate - targetRate) < 1) {
+    return floatSamplesToInt16(samples);
+  }
+  const ratio = targetRate / sourceRate;
+  const outputLength = Math.max(1, Math.floor(samples.length * ratio));
+  const output = new Int16Array(outputLength);
+  const lastIndex = samples.length - 1;
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourceIndex = index / ratio;
+    const low = Math.floor(sourceIndex);
+    const high = Math.min(lastIndex, low + 1);
+    const mix = sourceIndex - low;
+    const sample = (samples[low] ?? 0) * (1 - mix) + (samples[high] ?? 0) * mix;
+    output[index] = floatSampleToInt16(sample);
+  }
+  return output;
+}
+
+function floatSamplesToInt16(samples: Float32Array): Int16Array {
+  const output = new Int16Array(samples.length);
+  for (let index = 0; index < samples.length; index += 1) {
+    output[index] = floatSampleToInt16(samples[index] ?? 0);
+  }
+  return output;
+}
+
+function floatSampleToInt16(sample: number): number {
+  const clamped = Math.max(-1, Math.min(1, sample));
+  return clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+}
+
+function encodePcmWav(samples: Int16Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeAscii(view, 8, 'WAVE');
+  writeAscii(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (const sample of samples) {
+    view.setInt16(offset, sample, true);
+    offset += 2;
+  }
+  return buffer;
+}
+
+function writeAscii(view: DataView, offset: number, text: string) {
+  for (let index = 0; index < text.length; index += 1) {
+    view.setUint8(offset + index, text.charCodeAt(index));
+  }
+}
+
+function formatVoiceDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -454,6 +667,22 @@ function pendingMessageIsConfirmed(pending: PendingChatMessage, messages: ChatMe
   );
 }
 
+function messageLooksFreshForPendingTurn(
+  pending: PendingChatMessage,
+  message: ChatMessage,
+  baselineMessageIds: Set<string>
+): boolean {
+  if (baselineMessageIds.has(message.id)) {
+    return false;
+  }
+  const pendingCreatedAt = Date.parse(pending.createdAt);
+  const messageCreatedAt = Date.parse(message.createdAt);
+  if (!Number.isFinite(pendingCreatedAt) || !Number.isFinite(messageCreatedAt)) {
+    return true;
+  }
+  return messageCreatedAt >= pendingCreatedAt - 10_000;
+}
+
 function attachmentsMatch(
   messageAttachments: ChatAttachment[] | undefined,
   expectedAttachments: ChatAttachment[]
@@ -566,6 +795,75 @@ function MessageAttachments({
         </div>
       ) : null}
     </>
+  );
+}
+
+function FileChangeSummaryCard({
+  summary,
+  actionState,
+  collapsed,
+  onAction,
+  onToggleCollapsed
+}: {
+  summary: ThreadFileChangeSummary;
+  actionState?: { pending?: boolean; error?: string };
+  collapsed?: boolean;
+  onAction?: (summary: ThreadFileChangeSummary) => void;
+  onToggleCollapsed?: () => void;
+}) {
+  const pending = actionState?.pending === true;
+  const actionLabel = summary.action === 'reapply' ? 'Reapply' : 'Undo';
+  const disabledReason =
+    summary.canUseCodexApplyPatch
+      ? undefined
+      : summary.unavailableReason ?? 'Open Codex on your Mac to use this action.';
+  return (
+    <section
+      className={`codex-file-change-card${collapsed ? ' codex-file-change-card--collapsed' : ''}`}
+      aria-label="Codex file changes"
+    >
+      <header className="codex-file-change-card-header">
+        <div className="codex-file-change-title">
+          <FileEdit size={16} aria-hidden="true" />
+          <span>{summary.fileCount} file{summary.fileCount === 1 ? '' : 's'} changed</span>
+          <span className="codex-file-change-added">+{summary.linesAdded}</span>
+          <span className="codex-file-change-deleted">-{summary.linesDeleted}</span>
+        </div>
+        <div className="codex-file-change-actions">
+          <button
+            type="button"
+            onClick={onToggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? 'Show file changes' : 'Hide file changes'}
+          >
+            {collapsed ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronUp size={14} aria-hidden="true" />}
+          </button>
+          <button
+            type="button"
+            onClick={() => onAction?.(summary)}
+            disabled={!onAction || pending || !summary.canUseCodexApplyPatch}
+            title={disabledReason}
+          >
+            {pending ? 'Working...' : actionLabel}
+          </button>
+        </div>
+      </header>
+      {collapsed ? null : (
+        <>
+          <div className="codex-file-change-list">
+            {summary.files.slice(0, 5).map((file) => (
+              <div key={file.path} className="codex-file-change-row">
+                <span className="codex-file-change-path">{file.path}</span>
+                <span className="codex-file-change-added">+{file.linesAdded}</span>
+                <span className="codex-file-change-deleted">-{file.linesDeleted}</span>
+              </div>
+            ))}
+          </div>
+          {disabledReason ? <p className="codex-file-change-hint">{disabledReason}</p> : null}
+          {actionState?.error ? <p className="codex-file-change-error">{actionState.error}</p> : null}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -788,10 +1086,13 @@ export function ThreadView({
   onOpenSidebar,
   fetchTranscript,
   sendMessage,
+  transcribeVoiceAudio,
+  voiceTranscriptionAvailable = false,
   stopWork,
   deleteThread,
   fetchOlderMessages,
   openThreadInCodex,
+  onApplyFileChangeAction,
   liveTranscript,
   liveAssistantText,
   modelName,
@@ -814,11 +1115,55 @@ export function ThreadView({
   selectedReasoningEffort,
   forceWorking = false
 }: ThreadViewProps) {
-  const [transcript, setTranscript] = useState<ThreadTranscript | undefined>();
+  const [transcriptState, setTranscript] = useState<ThreadTranscript | undefined>();
+  const transcript = transcriptState?.threadId === thread.threadId ? transcriptState : undefined;
   const [draft, setDraft] = useState('');
+  const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
+  const [voiceState, setVoiceState] = useState<'idle' | 'recording' | 'transcribing'>('idle');
+  const [voiceStartedAt, setVoiceStartedAt] = useState<number | undefined>();
+  const [voiceElapsedMs, setVoiceElapsedMs] = useState(0);
+  const [voiceWaveLevels, setVoiceWaveLevels] = useState<number[]>([]);
+  const [voiceError, setVoiceError] = useState('');
+  const [fileChangeActionState, setFileChangeActionState] = useState<
+    Record<string, { pending?: boolean; error?: string }>
+  >({});
+  const [collapsedFileChangeIds, setCollapsedFileChangeIds] = useState<Record<string, boolean>>({});
+  const fileChanges = useMemo<ThreadFileChangeSummary[]>(
+    () => (transcript?.fileChanges ?? []).map((summary) => ThreadFileChangeSummarySchema.parse(summary)),
+    [transcript?.fileChanges]
+  );
+  const handleFileChangeAction = async (summary: ThreadFileChangeSummary) => {
+    if (!onApplyFileChangeAction) {
+      return;
+    }
+    setFileChangeActionState((current) => ({
+      ...current,
+      [summary.id]: { pending: true }
+    }));
+    try {
+      await onApplyFileChangeAction(summary.id, summary.action);
+      setFileChangeActionState((current) => ({
+        ...current,
+        [summary.id]: {}
+      }));
+    } catch (error) {
+      setFileChangeActionState((current) => ({
+        ...current,
+        [summary.id]: {
+          error: error instanceof Error ? error.message : 'Could not apply Codex file change.'
+        }
+      }));
+    }
+  };
+  const toggleFileChangeCollapsed = (changeId: string) => {
+    setCollapsedFileChangeIds((current) => ({
+      ...current,
+      [changeId]: !current[changeId]
+    }));
+  };
   const [draftAttachments, setDraftAttachments] = useState<ChatAttachment[]>([]);
   const [loading, setLoading] = useState(Boolean(fetchTranscript));
-  const [sending, setSending] = useState(false);
+  const [sendingByThread, setSendingByThread] = useState<Record<string, boolean>>({});
   const [stopping, setStopping] = useState(false);
   const [openingCodex, setOpeningCodex] = useState(false);
   const [deletingThread, setDeletingThread] = useState(false);
@@ -831,6 +1176,15 @@ export function ThreadView({
   const [collaborationMode, setCollaborationMode] =
     useState<CollaborationModeKind>('default');
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
+  const [threadActionsOpen, setThreadActionsOpen] = useState(false);
+  const composerMenuRef = useDismissOnOutsidePointer<HTMLDivElement>(
+    composerMenuOpen,
+    () => setComposerMenuOpen(false)
+  );
+  const threadActionsMenuRef = useDismissOnOutsidePointer<HTMLDivElement>(
+    threadActionsOpen,
+    () => setThreadActionsOpen(false)
+  );
   const [handoffOpen, setHandoffOpen] = useState(false);
   const [handoffTargetProvider, setHandoffTargetProvider] = useState<AgentProvider>('claude-code');
   const [handoffInstruction, setHandoffInstruction] = useState('');
@@ -849,21 +1203,38 @@ export function ThreadView({
   // transcript fetch (which can lag several seconds while Codex is streaming the reply).
   // An entry is dropped as soon as a message with the same trimmed text appears in the
   // server transcript.
-  const [pendingMessages, setPendingMessages] = useState<PendingChatMessage[]>([]);
+  const [pendingMessagesByThread, setPendingMessagesByThread] = useState<Record<string, PendingChatMessage[]>>({});
   // Older history shown above the latest tail. The helper prefetch can include more than
   // the default latest two messages, so we keep the extra history in a separate bucket and
   // prepend it at render time. Reset whenever the active thread changes.
-  const [olderMessages, setOlderMessages] = useState<ChatMessage[]>([]);
-  const [hasMoreOlder, setHasMoreOlder] = useState(true);
-  const [loadingOlder, setLoadingOlder] = useState(false);
-  const [olderError, setOlderError] = useState('');
+  const [olderMessagesByThread, setOlderMessagesByThread] = useState<Record<string, ChatMessage[]>>({});
+  const [hasMoreOlderByThread, setHasMoreOlderByThread] = useState<Record<string, boolean>>({});
+  const [loadingOlderByThread, setLoadingOlderByThread] = useState<Record<string, boolean>>({});
+  const [olderErrorByThread, setOlderErrorByThread] = useState<Record<string, string>>({});
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null);
+  const voicePcmRecorderRef = useRef<PcmVoiceRecorder | null>(null);
+  const voiceStreamRef = useRef<MediaStream | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const voiceSubmitOnStopRef = useRef(false);
+  const voicePointerStartAtRef = useRef<number | undefined>(undefined);
+  const voiceIgnoreNextClickRef = useRef(false);
+  const voiceRecordingStartedAtRef = useRef<number | undefined>(undefined);
+  const voiceAudioContextRef = useRef<AudioContext | null>(null);
+  const voiceAnalyserFrameRef = useRef<number | undefined>(undefined);
+  const voiceAnalyserLastUpdateRef = useRef(0);
+  const voiceWaveHistoryRef = useRef<number[]>([]);
+  const planSessionThreadIdsRef = useRef<Set<string>>(new Set());
   const transcriptRequestsInFlight = useRef(0);
   // Tracks whether the user is "pinned" to the bottom of the conversation. When true we
   // auto-scroll on new messages; when false (because they scrolled up to read history)
   // we leave their position alone so a newly streamed token doesn't yank them down.
   const pinnedToBottomRef = useRef(true);
+  // Sends started from this tablet should stay attached to the bottom until the
+  // real transcript replaces the optimistic bubble. Without this, the short
+  // Thinking placeholder can collapse and leave the viewport at old history.
+  const forceScrollToBottomRef = useRef(false);
   const loadingOlderRef = useRef(false);
   const autoOlderLoadCursorRef = useRef<string | undefined>(undefined);
   // Anchor + scroll-height delta captured right before older messages are prepended.
@@ -914,11 +1285,101 @@ export function ThreadView({
     knownProviders.delete(provider);
     return [...knownProviders];
   }, [models, provider]);
+  const canCreateHandoff =
+    Boolean(onCreateHandoffSummaryDraft && onSendHandoff) && handoffTargetProviders.length > 0;
+  const hasThreadMenuActions =
+    canCreateHandoff || Boolean(openThreadInCodex && provider === 'codex') || Boolean(deleteThread);
   const normalizedSelectedModelSlug = normalizeProviderModelSlug(
     provider,
     selectedModelSlug ?? effectiveModelName
   );
   const canChangeModel = providerModels.length > 0;
+  const pendingMessages = pendingMessagesByThread[thread.threadId] ?? [];
+  const olderMessages = olderMessagesByThread[thread.threadId] ?? [];
+  const hasMoreOlder = hasMoreOlderByThread[thread.threadId] ?? true;
+  const loadingOlder = loadingOlderByThread[thread.threadId] ?? false;
+  const olderError = olderErrorByThread[thread.threadId] ?? '';
+  const sending = sendingByThread[thread.threadId] ?? false;
+
+  const updatePendingMessagesForThread = (
+    threadId: string,
+    updater: (current: PendingChatMessage[]) => PendingChatMessage[]
+  ) => {
+    setPendingMessagesByThread((current) => {
+      const nextMessages = updater(current[threadId] ?? []);
+      if (nextMessages.length === 0) {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return { ...current, [threadId]: nextMessages };
+    });
+  };
+
+  const updateOlderMessagesForThread = (
+    threadId: string,
+    updater: (current: ChatMessage[]) => ChatMessage[]
+  ) => {
+    setOlderMessagesByThread((current) => {
+      const nextMessages = updater(current[threadId] ?? []);
+      if (nextMessages.length === 0) {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return { ...current, [threadId]: nextMessages };
+    });
+  };
+
+  const setHasMoreOlderForThread = (threadId: string, value: boolean) => {
+    setHasMoreOlderByThread((current) => {
+      if (value) {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return { ...current, [threadId]: false };
+    });
+  };
+
+  const setLoadingOlderForThread = (threadId: string, value: boolean) => {
+    setLoadingOlderByThread((current) => {
+      if (!value) {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return { ...current, [threadId]: true };
+    });
+  };
+
+  const setOlderErrorForThread = (threadId: string, value: string) => {
+    setOlderErrorByThread((current) => {
+      if (!value) {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return { ...current, [threadId]: value };
+    });
+  };
+
+  const setSendingForThread = (threadId: string, value: boolean) => {
+    setSendingByThread((current) => {
+      if (!value) {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      }
+      return { ...current, [threadId]: true };
+    });
+  };
 
   const saveComposerDraft = (
     threadId: string,
@@ -942,6 +1403,33 @@ export function ThreadView({
       setModelPickerOpen(false);
     }
   }, [canChangeModel, modelPickerOpen]);
+
+  useEffect(() => {
+    if (voiceState !== 'recording' || !voiceStartedAt) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setVoiceElapsedMs(Date.now() - voiceStartedAt);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [voiceStartedAt, voiceState]);
+
+  useEffect(() => {
+    return () => {
+      voiceSubmitOnStopRef.current = false;
+      const recorder = voiceRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
+        recorder.stop();
+      }
+      const pcmRecorder = voicePcmRecorderRef.current;
+      voicePcmRecorderRef.current = null;
+      if (pcmRecorder) {
+        stopPcmVoiceRecorder(pcmRecorder);
+      }
+      stopVoiceAnalyser();
+      stopVoiceTracks();
+    };
+  }, []);
 
   useEffect(() => {
     if (!handoffTargetProviders.includes(handoffTargetProvider)) {
@@ -969,6 +1457,9 @@ export function ThreadView({
   }, [thread.threadId]);
 
   const applyTranscriptWindow = (nextTranscript: ThreadTranscript) => {
+    if (nextTranscript.threadId !== thread.threadId) {
+      return;
+    }
     // Seed the session baseline from the *first* transcript we ever see for this
     // thread, BEFORE we split. The full transcript is what tells us which user
     // messages are pre-existing history; everything user-authored after this is
@@ -993,7 +1484,9 @@ export function ThreadView({
       sessionUserBaselineIds: sessionUserBaselineRef.current
     });
     if (scrollback.length > 0) {
-      setOlderMessages((current) => mergeMessagesById(current, scrollback));
+      updateOlderMessagesForThread(nextTranscript.threadId, (current) =>
+        mergeMessagesById(current, scrollback)
+      );
     }
     setTranscript(visible);
   };
@@ -1039,14 +1532,20 @@ export function ThreadView({
   const isCodexActive =
     forceWorking || transcriptSaysMirrorWorking || threadSaysWaitingApproval || isCompacting;
   const isAgentWorking = isCodexActive && !isWaitingForApproval;
-  const showStopComposerAction = Boolean(stopWork && isAgentWorking);
+  const voiceBusy = voiceState !== 'idle';
+  const hasDraftContent = Boolean(trimmedDraft || draftAttachments.length > 0);
+  const showStopComposerAction = Boolean(stopWork && isAgentWorking && !voiceBusy && !hasDraftContent);
+  const canUseVoiceComposer = Boolean(
+    voiceTranscriptionAvailable && transcribeVoiceAudio && sendMessage && !sending
+  );
   const canUseComposer = Boolean(
     sendMessage &&
       !sending &&
+      !voiceBusy &&
       !isWaitingForApproval &&
       (transcript?.sendState.canSend || (isCodexActive && !isHardSendBlock))
   );
-  const canSend = Boolean(canUseComposer && (trimmedDraft || draftAttachments.length > 0));
+  const canSend = Boolean(canUseComposer && hasDraftContent);
   const displayedModelName = effectiveModelName ? formatModelName(effectiveModelName) : providerName;
 
   // Status bar text logic:
@@ -1111,21 +1610,40 @@ export function ThreadView({
     if (stillPending.length > 0) {
       const latestPending = stillPending[stillPending.length - 1]!;
       const baselineMessageIds = new Set(latestPending.baselineMessageIds);
-      const freshServerMessages = withLiveBuffer.filter((message) => !baselineMessageIds.has(message.id));
+      const freshServerMessages = withLiveBuffer.filter((message) =>
+        messageLooksFreshForPendingTurn(latestPending, message, baselineMessageIds)
+      );
+      const visibleAfterPending = [...stillPending, ...freshServerMessages];
+      const hasAgentActivityAfterPending = freshServerMessages.some((message) => message.role !== 'user');
+      if (!hasAgentActivityAfterPending) {
+        const pendingCreatedAt = Date.parse(latestPending.createdAt);
+        visibleAfterPending.push({
+          id: `pending-thinking-${latestPending.id}`,
+          role: 'activity',
+          kind: 'reasoning',
+          phase: 'pending_send',
+          text: `${providerName} is thinking...`,
+          createdAt: new Date(
+            Number.isFinite(pendingCreatedAt) ? pendingCreatedAt + 1 : Date.now()
+          ).toISOString()
+        });
+      }
       // Preserve the explicit insertion order — pending user bubble first, then
       // anything the helper has streamed since send. Skipping the timestamp
       // sort prevents the activity group from briefly jumping above the
       // optimistic user message when the tablet's clock runs even a few
       // milliseconds ahead of the helper's.
-      return buildRenderableEntries([...stillPending, ...freshServerMessages], {
+      return buildRenderableEntries(visibleAfterPending, {
         isLive: true,
-        preserveInputOrder: true
+        preserveInputOrder: true,
+        fileChanges
       });
     }
     return buildRenderableEntries(combined, {
-      isLive: isAgentWorking || Boolean(transcript?.activeTurnId)
+      isLive: isAgentWorking || Boolean(transcript?.activeTurnId),
+      fileChanges
     });
-  }, [transcript?.messages, olderMessages, pendingMessages, isAgentWorking, transcript?.activeTurnId, liveAssistantText]);
+  }, [transcript?.messages, olderMessages, pendingMessages, isAgentWorking, transcript?.activeTurnId, liveAssistantText, fileChanges, providerName]);
   // Identify the latest activity group so live work can stay expanded while older work
   // stays as a compact OpenAssist-style summary.
   const latestActivityGroupId = useMemo(() => {
@@ -1167,21 +1685,21 @@ export function ThreadView({
   // pending message, drop it from local state so duplicates don't pile up.
   useEffect(() => {
     if (pendingMessages.length === 0) return;
-    setPendingMessages((current) => {
+    updatePendingMessagesForThread(thread.threadId, (current) => {
       const next = current.filter((message) => !pendingMessageIsConfirmed(message, transcript?.messages ?? []));
       return next.length === current.length ? current : next;
     });
   }, [transcript?.messages, pendingMessages.length]);
 
-  // Clear pending state when switching threads — they're per-thread.
+  // Reset only view-local loading/scroll state when switching threads. Pending
+  // bubbles and older history are stored by thread id so they never bleed into
+  // another thread and are still there when the user comes back.
   useEffect(() => {
-    setPendingMessages([]);
-    setOlderMessages([]);
-    setHasMoreOlder(true);
-    setLoadingOlder(false);
+    setThreadActionsOpen(false);
+    setLoadingOlderForThread(thread.threadId, false);
     loadingOlderRef.current = false;
     autoOlderLoadCursorRef.current = undefined;
-    setOlderError('');
+    setOlderErrorForThread(thread.threadId, '');
     pinnedToBottomRef.current = true;
     hasPositionedInitialRef.current = false;
     // Reset the per-session user-message baseline. It will be seeded by the first
@@ -1214,6 +1732,7 @@ export function ThreadView({
       return;
     }
 
+    const shouldForceBottom = forceScrollToBottomRef.current;
     if (!hasPositionedInitialRef.current) {
       node.scrollTop = node.scrollHeight;
       pinnedToBottomRef.current = true;
@@ -1221,15 +1740,20 @@ export function ThreadView({
       return;
     }
 
-    if (pinnedToBottomRef.current) {
+    if (shouldForceBottom || pinnedToBottomRef.current) {
       node.scrollTop = node.scrollHeight;
+      pinnedToBottomRef.current = true;
+      if (shouldForceBottom && pendingMessages.length === 0 && !isAgentWorking && !transcript?.activeTurnId) {
+        forceScrollToBottomRef.current = false;
+      }
     }
   }, [
     transcriptMessageIds,
     transcriptContentLength,
     transcript?.activeTurnId,
     loading,
-    pendingMessages.length
+    pendingMessages.length,
+    isAgentWorking
   ]);
 
   // Apply live transcript updates immediately (WebSocket path)
@@ -1397,6 +1921,251 @@ export function ThreadView({
     });
   };
 
+  const stopVoiceAnalyser = () => {
+    if (voiceAnalyserFrameRef.current !== undefined) {
+      cancelAnimationFrame(voiceAnalyserFrameRef.current);
+      voiceAnalyserFrameRef.current = undefined;
+    }
+    const audioContext = voiceAudioContextRef.current;
+    voiceAudioContextRef.current = null;
+    if (audioContext && audioContext.state !== 'closed') {
+      void audioContext.close().catch(() => undefined);
+    }
+    voiceAnalyserLastUpdateRef.current = 0;
+    voiceWaveHistoryRef.current = [];
+    setVoiceWaveLevels([]);
+  };
+
+  const startVoiceAnalyser = (stream: MediaStream) => {
+    stopVoiceAnalyser();
+    const AudioContextConstructor = browserAudioContextConstructor();
+    if (!AudioContextConstructor) {
+      return;
+    }
+
+    try {
+      const audioContext = new AudioContextConstructor();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 128;
+      analyser.smoothingTimeConstant = 0.6;
+      audioContext.createMediaStreamSource(stream).connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      voiceAudioContextRef.current = audioContext;
+
+      const tick = () => {
+        analyser.getByteFrequencyData(data);
+        const nowMs = performance.now();
+        if (nowMs - voiceAnalyserLastUpdateRef.current > 80) {
+          voiceAnalyserLastUpdateRef.current = nowMs;
+          let total = 0;
+          for (let bin = 0; bin < data.length; bin += 1) {
+            total += data[bin] ?? 0;
+          }
+          const raw = total / Math.max(1, data.length);
+          const amplitude = Math.min(1, Math.max(0, (raw - 12) / 130));
+          const history = voiceWaveHistoryRef.current;
+          const prev = history[history.length - 1] ?? 0;
+          const smoothed = prev * 0.45 + amplitude * 0.55;
+          const next = [...history, smoothed];
+          if (next.length > VOICE_WAVE_BARS.length) {
+            next.splice(0, next.length - VOICE_WAVE_BARS.length);
+          }
+          voiceWaveHistoryRef.current = next;
+          setVoiceWaveLevels([...next]);
+        }
+        voiceAnalyserFrameRef.current = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch {
+      stopVoiceAnalyser();
+    }
+  };
+
+  const stopVoiceTracks = () => {
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    voiceStreamRef.current = null;
+  };
+
+  const finishVoiceRecording = (submit: boolean) => {
+    voiceSubmitOnStopRef.current = submit;
+    const pcmRecorder = voicePcmRecorderRef.current;
+    if (pcmRecorder) {
+      voicePcmRecorderRef.current = null;
+      const blob = stopPcmVoiceRecorder(pcmRecorder);
+      stopVoiceAnalyser();
+      stopVoiceTracks();
+      setVoiceStartedAt(undefined);
+      setVoiceElapsedMs(0);
+      if (submit) {
+        void transcribeVoiceBlob(blob);
+      } else {
+        setVoiceState('idle');
+      }
+      return;
+    }
+    const recorder = voiceRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop();
+      return;
+    }
+    stopVoiceTracks();
+    if (!submit) {
+      setVoiceState('idle');
+    }
+  };
+
+  const beginVoiceRecording = async () => {
+    if (!canUseVoiceComposer || voiceState !== 'idle') {
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setVoiceError('Voice recording is not supported in this browser.');
+      return;
+    }
+    setVoiceError('');
+    setError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const pcmRecorder = createPcmVoiceRecorder(stream);
+      if (pcmRecorder) {
+        const startedAt = Date.now();
+        voiceStreamRef.current = stream;
+        voicePcmRecorderRef.current = pcmRecorder;
+        voiceSubmitOnStopRef.current = false;
+        voiceRecordingStartedAtRef.current = startedAt;
+        setVoiceStartedAt(startedAt);
+        setVoiceElapsedMs(0);
+        startVoiceAnalyser(stream);
+        setVoiceState('recording');
+        return;
+      }
+      const mimeType = preferredVoiceMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      voiceChunksRef.current = [];
+      voiceStreamRef.current = stream;
+      voiceRecorderRef.current = recorder;
+      voiceSubmitOnStopRef.current = false;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          voiceChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        const shouldSubmit = voiceSubmitOnStopRef.current;
+        const chunks = voiceChunksRef.current;
+        const type = recorder.mimeType || mimeType || 'audio/webm';
+        voiceRecorderRef.current = null;
+        voiceChunksRef.current = [];
+        voiceSubmitOnStopRef.current = false;
+        stopVoiceAnalyser();
+        stopVoiceTracks();
+        if (!shouldSubmit) {
+          setVoiceState('idle');
+          setVoiceStartedAt(undefined);
+          setVoiceElapsedMs(0);
+          return;
+        }
+        void transcribeVoiceBlob(new Blob(chunks, { type }));
+      };
+      const startedAt = Date.now();
+      voiceRecordingStartedAtRef.current = startedAt;
+      setVoiceStartedAt(startedAt);
+      setVoiceElapsedMs(0);
+      startVoiceAnalyser(stream);
+      setVoiceState('recording');
+      recorder.start();
+    } catch (error) {
+      stopVoiceAnalyser();
+      stopVoiceTracks();
+      setVoiceState('idle');
+      setVoiceError(
+        error instanceof Error
+          ? error.message
+          : 'Could not start voice recording. Check microphone access.'
+      );
+    }
+  };
+
+  const transcribeVoiceBlob = async (blob: Blob) => {
+    if (!transcribeVoiceAudio) {
+      setVoiceState('idle');
+      setVoiceError('Voice transcription is not available.');
+      return;
+    }
+    if (blob.size === 0) {
+      setVoiceState('idle');
+      setVoiceError('Recorded audio was empty.');
+      return;
+    }
+    setVoiceState('transcribing');
+    setVoiceStartedAt(undefined);
+    setVoiceElapsedMs(0);
+    setVoiceWaveLevels(VOICE_WAVE_BARS.map(() => 0));
+    try {
+      const text = (await transcribeVoiceAudio(blob)).trim();
+      if (!text) {
+        throw new Error('The audio upload finished, but no transcript text came back.');
+      }
+      const nextDraft = draft.trim() ? `${draft.trimEnd()}\n${text}` : text;
+      setDraft(nextDraft);
+      saveComposerDraft(thread.threadId, nextDraft, draftAttachments, collaborationMode);
+      setVoiceError('');
+      setVoiceState('idle');
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+      });
+    } catch (error) {
+      setVoiceState('idle');
+      setVoiceError(
+        error instanceof Error
+          ? error.message
+          : 'Could not transcribe audio. Check Codex sign-in and microphone access.'
+      );
+    }
+  };
+
+  const cancelVoiceRecording = () => {
+    finishVoiceRecording(false);
+    setVoiceError('');
+  };
+
+  const handleVoiceButtonClick = () => {
+    if (voiceIgnoreNextClickRef.current) {
+      voiceIgnoreNextClickRef.current = false;
+      return;
+    }
+    if (voiceState === 'idle') {
+      void beginVoiceRecording();
+    } else if (voiceState === 'recording') {
+      finishVoiceRecording(true);
+    }
+  };
+
+  const handleVoicePointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0 || voiceState !== 'idle') {
+      return;
+    }
+    voicePointerStartAtRef.current = Date.now();
+    voiceIgnoreNextClickRef.current = true;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    void beginVoiceRecording();
+  };
+
+  const handleVoicePointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const startedAt = voicePointerStartAtRef.current;
+    voicePointerStartAtRef.current = undefined;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (!startedAt || voiceState !== 'recording') {
+      return;
+    }
+    if (Date.now() - startedAt >= 500) {
+      voiceIgnoreNextClickRef.current = true;
+      finishVoiceRecording(true);
+    }
+  };
+
   const handleSend = async () => {
     if (!sendMessage || !canSend) {
       return;
@@ -1407,6 +2176,12 @@ export function ThreadView({
     if (!textToSend && attachmentsToSend.length === 0) {
       return;
     }
+    const requestedCollaborationMode: CollaborationModeKind | undefined =
+      collaborationMode === 'plan'
+        ? 'plan'
+        : planSessionThreadIdsRef.current.has(thread.threadId)
+          ? 'default'
+          : undefined;
     const baselineMessageIds = new Set(
       [...olderMessages, ...(transcript?.messages ?? [])].map((message) => message.id)
     );
@@ -1441,19 +2216,20 @@ export function ThreadView({
       createdAt: new Date(pendingEpoch).toISOString(),
       baselineMessageIds: [...baselineMessageIds]
     };
-    setPendingMessages((current) => [...current, optimistic]);
+    updatePendingMessagesForThread(thread.threadId, (current) => [...current, optimistic]);
     setDraft('');
     setDraftAttachments([]);
     saveComposerDraft(thread.threadId, '', [], collaborationMode);
     setComposerMenuOpen(false);
-    setSending(true);
+    setSendingForThread(thread.threadId, true);
     setError('');
     // The user just sent a new message — re-pin to the bottom so their new bubble and
     // Codex's streaming reply are visible without them having to scroll down.
     pinnedToBottomRef.current = true;
+    forceScrollToBottomRef.current = true;
     try {
       const sendOptions = {
-        ...(collaborationMode === 'plan' ? { collaborationMode } : {}),
+        ...(requestedCollaborationMode ? { collaborationMode: requestedCollaborationMode } : {}),
         ...(attachmentsToSend.length > 0 ? { attachments: attachmentsToSend } : {})
       };
       const result =
@@ -1470,15 +2246,24 @@ export function ThreadView({
       ) {
         applyTranscriptWindow(result.transcript);
       }
+      if (requestedCollaborationMode === 'plan') {
+        planSessionThreadIdsRef.current.add(thread.threadId);
+      } else if (requestedCollaborationMode === 'default') {
+        planSessionThreadIdsRef.current.delete(thread.threadId);
+      }
     } catch (sendError) {
       // Roll back the optimistic bubble and restore the draft so the user can retry.
-      setPendingMessages((current) => current.filter((m) => m.id !== optimistic.id));
+      updatePendingMessagesForThread(thread.threadId, (current) =>
+        current.filter((m) => m.id !== optimistic.id)
+      );
       setDraft(textToSend);
       setDraftAttachments(attachmentsToSend);
+      setCollaborationMode(collaborationMode);
       saveComposerDraft(thread.threadId, textToSend, attachmentsToSend, collaborationMode);
       setError(sendError instanceof Error ? sendError.message : 'Could not send this message.');
+      forceScrollToBottomRef.current = false;
     } finally {
-      setSending(false);
+      setSendingForThread(thread.threadId, false);
     }
   };
 
@@ -1516,8 +2301,8 @@ export function ThreadView({
     }
     capturePendingOlderAnchor();
     loadingOlderRef.current = true;
-    setLoadingOlder(true);
-    setOlderError('');
+    setLoadingOlderForThread(thread.threadId, true);
+    setOlderErrorForThread(thread.threadId, '');
 
     try {
       const response = await fetchOlderMessages(oldestMessageId, OLDER_MESSAGES_PAGE_SIZE);
@@ -1525,20 +2310,21 @@ export function ThreadView({
         // Capture again right before we prepend, so the anchor reflects the view
         // after the loading header settled.
         capturePendingOlderAnchor();
-        setOlderMessages((current) => {
+        updateOlderMessagesForThread(thread.threadId, (current) => {
           const seen = new Set(current.map((m) => m.id));
           const additions = response.messages.filter((m) => !seen.has(m.id));
           return [...additions, ...current];
         });
       }
-      setHasMoreOlder(response.hasMore);
+      setHasMoreOlderForThread(thread.threadId, response.hasMore);
     } catch (loadError) {
-      setOlderError(
+      setOlderErrorForThread(
+        thread.threadId,
         loadError instanceof Error ? loadError.message : 'Could not load older messages.'
       );
     } finally {
       loadingOlderRef.current = false;
-      setLoadingOlder(false);
+      setLoadingOlderForThread(thread.threadId, false);
     }
   };
 
@@ -1552,6 +2338,11 @@ export function ThreadView({
     pendingOlderAnchorRef.current = null;
     const node = messagesRef.current;
     if (node) {
+      if (forceScrollToBottomRef.current) {
+        node.scrollTop = node.scrollHeight;
+        pinnedToBottomRef.current = true;
+        return;
+      }
       restoreScrollAnchor(node, pending.anchor, pending.fallbackScrollHeightMinusTop);
       pinnedToBottomRef.current = false;
     }
@@ -1563,7 +2354,11 @@ export function ThreadView({
       !hasMoreOlder ||
       !oldestMessageId ||
       loadingOlderRef.current ||
-      loading
+      loading ||
+      sending ||
+      pendingMessages.length > 0 ||
+      isAgentWorking ||
+      Boolean(transcript?.activeTurnId)
     ) {
       return;
     }
@@ -1596,7 +2391,11 @@ export function ThreadView({
     loadingOlder,
     oldestMessageId,
     olderMessages.length,
-    transcript?.messages.length
+    transcript?.messages.length,
+    pendingMessages.length,
+    sending,
+    isAgentWorking,
+    transcript?.activeTurnId
   ]);
 
   // Coalesce scroll-handler reads into one per animation frame. The handler reads
@@ -1848,6 +2647,26 @@ export function ThreadView({
     }
   };
 
+  const renderFileChangeCards = (summaries: ThreadFileChangeSummary[]) => {
+    if (summaries.length === 0) {
+      return null;
+    }
+    return (
+      <div className="codex-file-change-stack" role="region" aria-label="Codex file changes">
+        {summaries.map((summary) => (
+          <FileChangeSummaryCard
+            key={summary.id}
+            summary={summary}
+            collapsed={collapsedFileChangeIds[summary.id] === true}
+            actionState={fileChangeActionState[summary.id]}
+            onAction={onApplyFileChangeAction ? handleFileChangeAction : undefined}
+            onToggleCollapsed={() => toggleFileChangeCollapsed(summary.id)}
+          />
+        ))}
+      </div>
+    );
+  };
+
   return (
     <section className="codex-thread" data-testid="thread-chat-drawer">
       <header className="codex-thread-header">
@@ -1891,48 +2710,75 @@ export function ThreadView({
         ) : null}
 
         <div className="codex-thread-actions">
-          {onCreateHandoffSummaryDraft && onSendHandoff && handoffTargetProviders.length > 0 ? (
-            <button
-              className="codex-thread-icon-action"
-              type="button"
-              onClick={() => {
-                setHandoffOpen(true);
-                setHandoffDraft(undefined);
-                setHandoffSummaryText('');
-                setHandoffError('');
-              }}
-              aria-label="Hand off this task"
-              title="Hand off this task"
-              data-tooltip="Hand off this task"
+          {hasThreadMenuActions ? (
+            <div
+              ref={threadActionsMenuRef}
+              className={`codex-thread-action-menu ${threadActionsOpen ? 'is-open' : ''}`}
             >
-              <GitBranchPlus size={16} />
-            </button>
-          ) : null}
-          {openThreadInCodex && provider === 'codex' ? (
-            <button
-              className="codex-thread-icon-action"
-              type="button"
-              onClick={() => void handleOpenInCodex()}
-              disabled={openingCodex}
-              aria-label={openingCodex ? 'Opening in Codex' : 'Open in Codex'}
-              title={openingCodex ? 'Opening in Codex' : 'Open in Codex'}
-              data-tooltip={openingCodex ? 'Opening in Codex' : 'Open in Codex'}
-            >
-              {openingCodex ? <Spinner size={16} /> : <ExternalLink size={16} />}
-            </button>
-          ) : null}
-          {deleteThread ? (
-            <button
-              className="codex-thread-icon-action is-danger"
-              type="button"
-              onClick={() => void handleDeleteThread()}
-              disabled={deletingThread}
-              aria-label={deletingThread ? 'Deleting thread' : 'Delete thread'}
-              title={deletingThread ? 'Deleting thread' : 'Delete thread'}
-              data-tooltip={deletingThread ? 'Deleting thread' : 'Delete thread'}
-            >
-              {deletingThread ? <Spinner size={16} /> : <Trash2 size={16} />}
-            </button>
+              <button
+                className="codex-thread-icon-action"
+                type="button"
+                onClick={() => setThreadActionsOpen((open) => !open)}
+                aria-label="Open thread actions"
+                aria-expanded={threadActionsOpen}
+                aria-haspopup="menu"
+                title="Thread actions"
+                data-tooltip="Thread actions"
+              >
+                <MoreVertical size={16} />
+              </button>
+              {threadActionsOpen ? (
+                <div className="codex-thread-action-popover" role="menu">
+                  {canCreateHandoff ? (
+                    <button
+                      type="button"
+                      className="codex-thread-action-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setThreadActionsOpen(false);
+                        setHandoffOpen(true);
+                        setHandoffDraft(undefined);
+                        setHandoffSummaryText('');
+                        setHandoffError('');
+                      }}
+                    >
+                      <GitBranchPlus size={14} aria-hidden="true" />
+                      <span>Hand off this task</span>
+                    </button>
+                  ) : null}
+                  {openThreadInCodex && provider === 'codex' ? (
+                    <button
+                      type="button"
+                      className="codex-thread-action-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setThreadActionsOpen(false);
+                        void handleOpenInCodex();
+                      }}
+                      disabled={openingCodex}
+                    >
+                      {openingCodex ? <Spinner size={14} /> : <ExternalLink size={14} aria-hidden="true" />}
+                      <span>{openingCodex ? 'Opening in Codex' : 'Open in Codex'}</span>
+                    </button>
+                  ) : null}
+                  {deleteThread ? (
+                    <button
+                      type="button"
+                      className="codex-thread-action-menu-item is-danger"
+                      role="menuitem"
+                      onClick={() => {
+                        setThreadActionsOpen(false);
+                        void handleDeleteThread();
+                      }}
+                      disabled={deletingThread}
+                    >
+                      {deletingThread ? <Spinner size={14} /> : <Trash2 size={14} aria-hidden="true" />}
+                      <span>{deletingThread ? 'Deleting thread' : 'Delete thread'}</span>
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           ) : null}
           {onClose ? (
             <button
@@ -2009,7 +2855,11 @@ export function ThreadView({
           </div>
         ) : null}
         {olderError ? <p className="codex-thread-older-error">{olderError}</p> : null}
-        {!loadingOlder && !hasMoreOlder && (olderMessages.length > 0 || (transcript?.messages.length ?? 0) > 0) ? (
+        {!loadingOlder &&
+        !hasMoreOlder &&
+        pendingMessages.length === 0 &&
+        !sending &&
+        (olderMessages.length > 0 || (transcript?.messages.length ?? 0) > 0) ? (
           <p className="codex-thread-older-status">Beginning of conversation.</p>
         ) : null}
         {loading ? (
@@ -2020,100 +2870,136 @@ export function ThreadView({
         {!loading && !transcript && !error ? (
           <p className="codex-thread-placeholder">Transcript is unavailable.</p>
         ) : null}
-        {!loading && transcript?.messages.length === 0 ? (
+        {!loading && transcript?.messages.length === 0 && pendingMessages.length === 0 ? (
           <p className="codex-thread-placeholder">No visible chat messages yet.</p>
         ) : null}
 
         {renderable.map((entry) => {
+          if (entry.type === 'fileChanges') {
+            return <Fragment key={entry.id}>{renderFileChangeCards(entry.summaries)}</Fragment>;
+          }
+
           if (entry.type === 'activityGroup') {
             return (
-              <ActivityGroupRow
-                key={entry.group.id}
-                group={entry.group}
-                plugins={plugins}
-                providerToneName={providerTone(provider)}
-                isLatest={entry.group.id === latestActivityGroupId}
-              />
+              <Fragment key={entry.group.id}>
+                <ActivityGroupRow
+                  group={entry.group}
+                  plugins={plugins}
+                  providerToneName={providerTone(provider)}
+                  isLatest={entry.group.id === latestActivityGroupId}
+                />
+              </Fragment>
             );
           }
 
           const { message } = entry;
 
+          const msgText = message.text.trim();
+          const estimatedLines = msgText
+            ? msgText.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / 80)), 0)
+            : 0;
+          const isLong = estimatedLines > 25;
+          const isExpanded = expandedMessages.has(message.id);
+          const toggleExpanded = () =>
+            setExpandedMessages((prev) => {
+              const next = new Set(prev);
+              if (next.has(message.id)) next.delete(message.id);
+              else next.add(message.id);
+              return next;
+            });
+
           if (message.role === 'user') {
             return (
-              <div
-                key={message.id}
-                className="codex-message codex-message--user"
-                data-role="user-message"
-                data-message-id={message.id}
-                data-scroll-anchor="true"
-              >
-                <MessageAttachments attachments={message.attachments} />
-                <article className="codex-bubble codex-bubble--user">
-                  {message.text.trim() ? <p>{message.text}</p> : null}
-                </article>
-                <span className="codex-message-tag codex-message-tag--user">You</span>
-              </div>
+              <Fragment key={message.id}>
+                <div
+                  className="codex-message codex-message--user"
+                  data-role="user-message"
+                  data-message-id={message.id}
+                  data-scroll-anchor="true"
+                >
+                  <MessageAttachments attachments={message.attachments} />
+                  <article className={`codex-bubble codex-bubble--user${isLong && !isExpanded ? ' is-collapsed' : ''}`}>
+                    {msgText ? <p>{msgText}</p> : null}
+                    {isLong ? (
+                      <div className={`codex-message-expand-wrap${!isExpanded ? ' is-faded' : ''}`}>
+                        <button className="codex-message-expand" type="button" onClick={toggleExpanded}>
+                          {isExpanded ? 'Show less' : 'Show more'}
+                        </button>
+                      </div>
+                    ) : null}
+                  </article>
+                  <span className="codex-message-tag codex-message-tag--user">You</span>
+                </div>
+              </Fragment>
             );
           }
 
           return (
-            <div
-              key={message.id}
-              className="codex-message codex-message--assistant"
-              data-message-id={message.id}
-              data-scroll-anchor="true"
-            >
-              <div className={`codex-message-avatar provider-${providerTone(provider)}`} aria-hidden="true">
-                <ProviderMark provider={provider} size="sm" />
+            <Fragment key={message.id}>
+              <div
+                className="codex-message codex-message--assistant"
+                data-message-id={message.id}
+                data-scroll-anchor="true"
+              >
+                <div className={`codex-message-avatar provider-${providerTone(provider)}`} aria-hidden="true">
+                  <ProviderMark provider={provider} size="sm" />
+                </div>
+                <div className="codex-message-body">
+                  <MessageAttachments attachments={message.attachments} />
+                  <article className={`codex-prose${isLong && !isExpanded ? ' is-collapsed' : ''}`}>
+                    {msgText ? <MessageMarkdown text={msgText} /> : null}
+                    {isLong ? (
+                      <div className={`codex-message-expand-wrap codex-message-expand-wrap--prose${!isExpanded ? ' is-faded' : ''}`}>
+                        <button className="codex-message-expand" type="button" onClick={toggleExpanded}>
+                          {isExpanded ? 'Show less' : 'Show more'}
+                        </button>
+                      </div>
+                    ) : null}
+                  </article>
+                </div>
               </div>
-              <div className="codex-message-body">
-                <MessageAttachments attachments={message.attachments} />
-                <article className="codex-prose">
-                  {message.text.trim() ? <MessageMarkdown text={message.text} /> : null}
-                </article>
-              </div>
-            </div>
+            </Fragment>
           );
         })}
       </div>
 
       <div className="codex-thread-bottom-panel">
-      {commentSelection ? (
-        <div className="transcript-comment-card" role="region" aria-label="Selected transcript text">
-          <div>
-            <strong>Reply about selected text</strong>
-            <p>{commentSelection.text}</p>
-            {commentSelection.trimmed ? <span>Selection was shortened.</span> : null}
+        {commentSelection ? (
+          <div className="transcript-comment-card" role="region" aria-label="Selected transcript text">
+            <div>
+              <strong>Reply about selected text</strong>
+              <p>{commentSelection.text}</p>
+              {commentSelection.trimmed ? <span>Selection was shortened.</span> : null}
+            </div>
+            <button type="button" onClick={() => void handleReplyAboutSelection()}>
+              Reply
+            </button>
           </div>
-          <button type="button" onClick={() => void handleReplyAboutSelection()}>
-            Reply
-          </button>
-        </div>
-      ) : null}
-      {pendingRequests.length > 0 ? (
-        <div className="codex-pending-requests" role="region" aria-label="Codex needs input">
-          {pendingRequests.map((request) => (
-            <PendingRequestRow
-              key={request.id}
-              request={request}
-              transcript={transcript}
-              onApprovalDecision={onApprovalDecision}
-            />
-          ))}
-        </div>
-      ) : threadSaysWaitingApproval ? (
-        <div className="codex-pending-requests" role="region" aria-label="Codex needs approval">
-          <article className="codex-pending-request">
-            <header className="codex-pending-request-title">Codex is waiting for approval</header>
-            <p className="codex-pending-request-hint">
-              Waiting for the live approval details. Open Codex on your Mac if the buttons do not
-              appear.
-            </p>
-          </article>
-        </div>
-      ) : null}
-      {error ? <p className="codex-thread-error">{error}</p> : null}
+        ) : null}
+        {pendingRequests.length > 0 ? (
+          <div className="codex-pending-requests" role="region" aria-label="Codex needs input">
+            {pendingRequests.map((request) => (
+              <PendingRequestRow
+                key={request.id}
+                request={request}
+                transcript={transcript}
+                onApprovalDecision={onApprovalDecision}
+              />
+            ))}
+          </div>
+        ) : threadSaysWaitingApproval ? (
+          <div className="codex-pending-requests" role="region" aria-label="Codex needs approval">
+            <article className="codex-pending-request">
+              <header className="codex-pending-request-title">Codex is waiting for approval</header>
+              <p className="codex-pending-request-hint">
+                Waiting for the live approval details. Open Codex on your Mac if the buttons do not
+                appear.
+              </p>
+            </article>
+          </div>
+        ) : null}
+        {error ? <p className="codex-thread-error">{error}</p> : null}
+        {voiceError ? <p className="codex-thread-error">{voiceError}</p> : null}
 
       <form
         className="codex-composer"
@@ -2166,36 +3052,23 @@ export function ThreadView({
           <label className="sr-only" htmlFor={`message-${thread.threadId}`}>
             Message {providerName}
           </label>
-          <textarea
-            id={`message-${thread.threadId}`}
-            ref={textareaRef}
-            className="codex-composer-input"
-            placeholder={`Ask ${providerName} anything`}
-            rows={1}
-            value={draft}
-            onChange={(event) => onDraftChange(event.target.value, event.target.selectionStart ?? 0)}
-            onPaste={handleComposerPaste}
-            onClick={(event) =>
-              updateMentionFromCursor(
-                (event.currentTarget as HTMLTextAreaElement).value,
-                (event.currentTarget as HTMLTextAreaElement).selectionStart ?? 0
-              )
-            }
-            onKeyUp={(event) => {
-              if (
-                event.key === 'ArrowDown' ||
-                event.key === 'ArrowUp' ||
-                event.key === 'Enter' ||
-                event.key === 'Tab' ||
-                event.key === 'Escape'
-              ) {
-                return;
+          {voiceState === 'idle' ? (
+            <textarea
+              id={`message-${thread.threadId}`}
+              ref={textareaRef}
+              className="codex-composer-input"
+              placeholder={`Ask ${providerName} anything`}
+              rows={1}
+              value={draft}
+              onChange={(event) => onDraftChange(event.target.value, event.target.selectionStart ?? 0)}
+              onPaste={handleComposerPaste}
+              onClick={(event) =>
+                updateMentionFromCursor(
+                  (event.currentTarget as HTMLTextAreaElement).value,
+                  (event.currentTarget as HTMLTextAreaElement).selectionStart ?? 0
+                )
               }
-              const target = event.currentTarget as HTMLTextAreaElement;
-              updateMentionFromCursor(target.value, target.selectionStart ?? 0);
-            }}
-            onKeyDown={(event) => {
-              if (mention) {
+              onKeyUp={(event) => {
                 if (
                   event.key === 'ArrowDown' ||
                   event.key === 'ArrowUp' ||
@@ -2205,20 +3078,94 @@ export function ThreadView({
                 ) {
                   return;
                 }
-              }
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                if (showStopComposerAction) {
-                  return;
+                const target = event.currentTarget as HTMLTextAreaElement;
+                updateMentionFromCursor(target.value, target.selectionStart ?? 0);
+              }}
+              onKeyDown={(event) => {
+                if (mention) {
+                  if (
+                    event.key === 'ArrowDown' ||
+                    event.key === 'ArrowUp' ||
+                    event.key === 'Enter' ||
+                    event.key === 'Tab' ||
+                    event.key === 'Escape'
+                  ) {
+                    return;
+                  }
                 }
-                void handleSend();
-              }
-            }}
-            disabled={!canUseComposer}
-          />
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  if (showStopComposerAction) {
+                    return;
+                  }
+                  void handleSend();
+                }
+              }}
+              disabled={!canUseComposer}
+            />
+          ) : (
+            <div className={`codex-composer-voice-panel is-${voiceState}`} role="status" aria-live="polite">
+              <div className="codex-composer-voice-orb">
+                {voiceState === 'transcribing' ? <Spinner size={18} /> : <Mic size={18} aria-hidden="true" />}
+              </div>
+              <div className="codex-composer-voice-copy">
+                <span className="sr-only">{voiceState === 'recording' ? 'Listening' : 'Transcribing...'}</span>
+                <div className={`codex-composer-voice-wave${voiceState === 'recording' ? ' is-scrolling' : ''}`} aria-hidden="true">
+                  <span>
+                    {voiceState === 'recording'
+                      ? voiceWaveLevels.map((amplitude, index) => {
+                          const total = voiceWaveLevels.length;
+                          const age = total > 1 ? (total - 1 - index) / (total - 1) : 0;
+                          return (
+                            <i
+                              key={index}
+                              style={
+                                {
+                                  '--voice-bar-height': `${Math.max(2, Math.round(2 + amplitude * 28))}px`,
+                                  '--voice-bar-index': index,
+                                  '--voice-bar-age': age,
+                                } as React.CSSProperties
+                              }
+                            />
+                          );
+                        })
+                      : VOICE_WAVE_BARS.map((baseHeight, index) => (
+                          <i
+                            key={index}
+                            style={
+                              {
+                                '--voice-bar-height': `${baseHeight}px`,
+                                '--voice-bar-delay': `${index * 28}ms`,
+                                '--voice-bar-index': index,
+                                '--voice-bar-age': 0,
+                              } as React.CSSProperties
+                            }
+                          />
+                        ))}
+                  </span>
+                </div>
+              </div>
+              <div className="codex-composer-voice-time" aria-label="Recording duration">
+                {voiceState === 'recording' ? formatVoiceDuration(voiceElapsedMs) : '...'}
+              </div>
+              {voiceState === 'recording' ? (
+                <button
+                  type="button"
+                  className="codex-composer-voice-cancel"
+                  onClick={cancelVoiceRecording}
+                  aria-label="Cancel voice recording"
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
+              ) : null}
+            </div>
+          )}
           <div className="codex-composer-row">
             <div className="codex-composer-row-left">
-              <div className={`codex-composer-add-menu ${composerMenuOpen ? 'is-open' : ''}`}>
+              <div
+                ref={composerMenuRef}
+                className={`codex-composer-add-menu ${composerMenuOpen ? 'is-open' : ''}`}
+              >
                 <button
                   className="codex-composer-add"
                   type="button"
@@ -2288,36 +3235,67 @@ export function ThreadView({
               ) : null}
             </div>
             <div className="codex-composer-actions">
-              <button
-                className={`codex-composer-send ${showStopComposerAction ? 'is-stop' : ''}`}
-                type={showStopComposerAction ? 'button' : 'submit'}
-                onClick={showStopComposerAction ? () => void handleStopWork() : undefined}
-                disabled={showStopComposerAction ? stopping : !canSend}
-                aria-label={
-                  showStopComposerAction
-                    ? stopping
-                      ? `Stopping ${providerName}`
-                      : `Stop ${providerName}`
-                    : sending
-                      ? 'Sending'
+              {voiceTranscriptionAvailable ? (
+                <button
+                  className={`codex-composer-voice-button ${voiceState === 'recording' ? 'is-recording' : ''}`}
+                  type="button"
+                  onClick={handleVoiceButtonClick}
+                  onPointerDown={handleVoicePointerDown}
+                  onPointerUp={handleVoicePointerUp}
+                  onPointerCancel={() => {
+                    voicePointerStartAtRef.current = undefined;
+                  }}
+                  disabled={!canUseVoiceComposer && voiceState === 'idle'}
+                  aria-label={
+                    voiceState === 'recording'
+                      ? 'Stop and transcribe voice'
+                      : voiceState === 'transcribing'
+                        ? 'Transcribing voice'
+                        : 'Record voice message'
+                  }
+                  title="Record voice message"
+                >
+                  {voiceState === 'transcribing' ? (
+                    <Spinner size={15} />
+                  ) : voiceState === 'recording' ? (
+                    <Square size={10} fill="currentColor" />
+                  ) : (
+                    <Mic size={16} />
+                  )}
+                </button>
+              ) : null}
+              {!voiceBusy ? (
+                <button
+                  className={`codex-composer-send ${showStopComposerAction ? 'is-stop' : ''}`}
+                  type={showStopComposerAction ? 'button' : 'submit'}
+                  onClick={showStopComposerAction ? () => void handleStopWork() : undefined}
+                  disabled={showStopComposerAction ? stopping : !canSend}
+                  aria-label={
+                    showStopComposerAction
+                      ? stopping
+                        ? `Stopping ${providerName}`
+                        : `Stop ${providerName}`
+                      : sending
+                        ? 'Sending'
+                        : 'Send message'
+                  }
+                  title={
+                    showStopComposerAction
+                      ? stopping
+                        ? `Stopping ${providerName}`
+                        : `Stop ${providerName}`
                       : 'Send message'
-                }
-                title={
-                  showStopComposerAction
-                    ? stopping
-                      ? `Stopping ${providerName}`
-                      : `Stop ${providerName}`
-                    : 'Send message'
-                }
-              >
-                {showStopComposerAction ? (
-                  <Square size={11} fill="currentColor" />
-                ) : sending ? (
-                  <Spinner size={16} />
-                ) : (
-                  <ArrowUp size={16} />
-                )}
-              </button>
+                  }
+                >
+                  {showStopComposerAction ? (
+                    <Square size={11} fill="currentColor" />
+                  ) : sending ? (
+                    <Spinner size={16} />
+                  ) : (
+                    <ArrowUp size={16} />
+                  )}
+                </button>
+              ) : null}
             </div>
           </div>
           {showContextBar ? (
@@ -2382,6 +3360,12 @@ export function ThreadView({
                     </option>
                   ))}
                 </select>
+                {handoffTargetProvider === 'copilot' ? (
+                  <span className="handoff-field-note">
+                    This starts a GitHub Copilot CLI chat. If Copilot later delegates work to its own
+                    cloud flow, that happens inside Copilot, not through a separate Agent Pulse target.
+                  </span>
+                ) : null}
               </label>
               <label className="handoff-field">
                 <span>What should the agent do?</span>
@@ -2581,6 +3565,7 @@ function ModelChip({
     : selected?.defaultReasoningLevel
       ? capitalize(selected.defaultReasoningLevel)
       : undefined;
+  const modelMenuRef = useDismissOnOutsidePointer<HTMLDivElement>(isOpen, onClose);
 
   useEffect(() => {
     if (!isOpen && expandedGroupIds.length > 0) {
@@ -2598,7 +3583,7 @@ function ModelChip({
   }
 
   return (
-    <div className={`codex-composer-model-chip ${isOpen ? 'is-open' : ''}`}>
+    <div ref={modelMenuRef} className={`codex-composer-model-chip ${isOpen ? 'is-open' : ''}`}>
       <button
         type="button"
         className="codex-composer-model-toggle"
@@ -2737,12 +3722,14 @@ function capitalize(value: string): string {
 const APPROVAL_METHODS_FOR_UI = new Set<ApprovalMethodForUi>([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
+  'item/fileRead/requestApproval',
   'item/permissions/requestApproval',
   'execCommandApproval',
   'applyPatchApproval',
   'claudeCode/canUseTool',
   'claudeCode/elicitation',
   'item/tool/requestUserInput',
+  'tool/requestUserInput',
   'item/plan/requestImplementation',
   'mcpServer/elicitation/request'
 ]);
@@ -2936,7 +3923,7 @@ function PendingRequestRow({
                 <Spinner size={14} /> Starting...
               </>
             ) : (
-              'Implement'
+              'Implement plan'
             )}
           </button>
           <button
@@ -3105,6 +4092,9 @@ function QuestionAnswerForm({
         const value = answers[question.id] ?? '';
         return (
           <div key={question.id} className="codex-pending-request-question-block">
+            {question.header ? (
+              <p className="codex-pending-request-question-header">{question.header}</p>
+            ) : null}
             {question.text ? (
               <p className="codex-pending-request-question-text">{question.text}</p>
             ) : null}

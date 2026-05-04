@@ -13,14 +13,15 @@ import type {
   OlderThreadMessagesResponse,
   Project,
   Thread,
+  ThreadFileChangeSummary,
   ThreadListGroup,
   ThreadMessageResponse,
   ThreadTranscript,
   TouchCommand,
   TranscriptCommentDraft
 } from '@agent-pulse/shared';
-import { CheckCheck, ClipboardCheck, Command, Menu, MessagesSquare, X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { CheckCheck, ClipboardCheck, Menu, MessagesSquare, X } from 'lucide-react';
+import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
 import type { FetchThreadTranscriptOptions } from './api';
 import { DashboardInsights } from './DashboardInsights';
 import { ProviderMark } from './ProviderMark';
@@ -32,7 +33,6 @@ import { relativeTime, statusLabels, statusTone, isAttentionStatus, threadNeedsR
 
 const SEEN_ACTIVITY_KEY = 'agent-pulse:seen-thread-activity';
 const ACTIVE_THREAD_KEY = 'agent-pulse:active-thread';
-const TOUCH_COMMAND_POSITION_KEY = 'agent-pulse:touch-command-position';
 
 export type DashboardProps = {
   health: HelperHealth;
@@ -83,12 +83,19 @@ export type DashboardProps = {
     text: string,
     options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
   ) => Promise<ThreadMessageResponse>;
+  transcribeVoiceAudio?: (audio: Blob) => Promise<string>;
+  voiceTranscriptionAvailable?: boolean;
   stopWork?: (threadId: string) => Promise<void>;
   fetchOlderMessages?: (
     threadId: string,
     beforeMessageId: string,
     limit?: number
   ) => Promise<OlderThreadMessagesResponse>;
+  onApplyFileChangeAction?: (
+    threadId: string,
+    changeId: string,
+    action: ThreadFileChangeSummary['action']
+  ) => Promise<void>;
   transcriptUpdates?: Record<string, ThreadTranscript>;
   // Per-thread per-token assistant text overlay produced by the WebSocket
   // `thread/assistant/text-delta` stream. Forwarded as-is to ThreadView so
@@ -161,7 +168,6 @@ export function Dashboard({
   projects = [],
   handoffs = [],
   approvalInboxItems = [],
-  touchCommands = [],
   onNewThread,
   onShowMoreThreads,
   onShowLessThreads,
@@ -175,8 +181,11 @@ export function Dashboard({
   onOpenSettings,
   fetchTranscript,
   sendMessage,
+  transcribeVoiceAudio,
+  voiceTranscriptionAvailable = false,
   stopWork,
   fetchOlderMessages,
+  onApplyFileChangeAction,
   transcriptUpdates = {},
   liveAssistantTextByThread = {},
   threadModels = {},
@@ -204,17 +213,6 @@ export function Dashboard({
   const [newThreadError, setNewThreadError] = useState('');
   const [creatingTargetId, setCreatingTargetId] = useState<string | undefined>();
   const [approvalInboxOpen, setApprovalInboxOpen] = useState(false);
-  const [commandSheetOpen, setCommandSheetOpen] = useState(false);
-  const [touchCommandPosition, setTouchCommandPosition] = useState<{
-    left: number;
-    top: number;
-  } | undefined>(() => readTouchCommandPosition());
-  const touchCommandDragRef = useRef<{
-    offsetX: number;
-    offsetY: number;
-    moved: boolean;
-    latestPosition?: { left: number; top: number };
-  } | null>(null);
   const [localSeenThreadActivity, setLocalSeenThreadActivity] = useState<Record<string, number>>(
     () => readSeenThreadActivity()
   );
@@ -241,7 +239,8 @@ export function Dashboard({
       // about them. The handler is responsible for de-duping & broadcasting.
       if (onMarkThreadSeen) {
         for (const [threadId, seenAt] of Object.entries(next)) {
-          if ((current[threadId] ?? 0) < seenAt) {
+          const helperSeenAt = seenThreadActivityOverride?.[threadId] ?? 0;
+          if ((current[threadId] ?? 0) < seenAt || helperSeenAt < seenAt) {
             onMarkThreadSeen(threadId, seenAt);
           }
         }
@@ -381,7 +380,7 @@ export function Dashboard({
         if (!Number.isFinite(activityAt) || (next[thread.threadId] ?? 0) >= activityAt) {
           continue;
         }
-        next[thread.threadId] = activityAt;
+        next[thread.threadId] = reviewedAtForActivity(activityAt);
         changed = true;
       }
       return changed ? next : current;
@@ -459,6 +458,8 @@ export function Dashboard({
             onClose={handleCloseThread}
             onOpenSidebar={() => setSidebarOpen(true)}
             fetchTranscript={fetchTranscript}
+            transcribeVoiceAudio={transcribeVoiceAudio}
+            voiceTranscriptionAvailable={voiceTranscriptionAvailable}
             sendMessage={
               sendMessage
                 ? async (threadId, text, options) => {
@@ -487,6 +488,12 @@ export function Dashboard({
                 : undefined
             }
             openThreadInCodex={onOpenThreadInCodex}
+            onApplyFileChangeAction={
+              onApplyFileChangeAction
+                ? (changeId, action) =>
+                    onApplyFileChangeAction(activeThread.threadId, changeId, action)
+                : undefined
+            }
             liveTranscript={transcriptUpdates[activeThread.threadId]}
             liveAssistantText={liveAssistantTextByThread[activeThread.threadId]}
             modelName={threadModels[activeThread.threadId] ?? activeThread.model}
@@ -540,65 +547,6 @@ export function Dashboard({
           />
         )}
       </main>
-      <button
-        type="button"
-        className={`touch-command-fab ${touchCommandPosition ? 'is-positioned' : ''}`}
-        style={
-          touchCommandPosition
-            ? { left: touchCommandPosition.left, top: touchCommandPosition.top }
-            : undefined
-        }
-        onPointerDown={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect();
-          touchCommandDragRef.current = {
-            offsetX: event.clientX - rect.left,
-            offsetY: event.clientY - rect.top,
-            moved: false,
-            latestPosition: touchCommandPosition ?? { left: rect.left, top: rect.top }
-          };
-          event.currentTarget.setPointerCapture(event.pointerId);
-        }}
-        onPointerMove={(event) => {
-          const drag = touchCommandDragRef.current;
-          if (!drag) {
-            return;
-          }
-          const next = clampTouchCommandPosition({
-            left: event.clientX - drag.offsetX,
-            top: event.clientY - drag.offsetY
-          });
-          if (
-            Math.abs(next.left - (drag.latestPosition?.left ?? next.left)) > 2 ||
-            Math.abs(next.top - (drag.latestPosition?.top ?? next.top)) > 2
-          ) {
-            drag.moved = true;
-          }
-          drag.latestPosition = next;
-          setTouchCommandPosition(next);
-        }}
-        onPointerUp={(event) => {
-          const drag = touchCommandDragRef.current;
-          touchCommandDragRef.current = null;
-          try {
-            event.currentTarget.releasePointerCapture(event.pointerId);
-          } catch {
-            // Pointer capture may already be released by the browser.
-          }
-          if (drag?.latestPosition) {
-            saveTouchCommandPosition(drag.latestPosition);
-          }
-          if (!drag?.moved) {
-            setCommandSheetOpen(true);
-          }
-        }}
-        onClick={(event) => event.preventDefault()}
-        aria-label="Open command sheet"
-      >
-        <Command size={18} />
-        {approvalInboxItems.length > 0 ? (
-          <span className="touch-command-count">{approvalInboxItems.length}</span>
-        ) : null}
-      </button>
       {!activeThread ? (
         <DashboardInsights
           threads={visibleThreads}
@@ -616,37 +564,6 @@ export function Dashboard({
             setApprovalInboxOpen(false);
           }}
           onClose={() => setApprovalInboxOpen(false)}
-        />
-      ) : null}
-      {commandSheetOpen ? (
-        <TouchCommandSheet
-          commands={touchCommands}
-          activeThread={activeThread}
-          onClose={() => setCommandSheetOpen(false)}
-          onNewThread={() => {
-            setCommandSheetOpen(false);
-            handleNewThread(activeThread?.workspacePath ? undefined : undefined);
-          }}
-          onShowApprovals={() => {
-            setCommandSheetOpen(false);
-            setApprovalInboxOpen(true);
-          }}
-          onSearch={() => {
-            setCommandSheetOpen(false);
-            setSidebarOpen(true);
-          }}
-          onOpenOnMac={() => {
-            setCommandSheetOpen(false);
-            if (activeThread) {
-              void onOpenThreadInCodex?.(activeThread.threadId);
-            }
-          }}
-          onStopWork={() => {
-            setCommandSheetOpen(false);
-            if (activeThread) {
-              void stopWork?.(activeThread.threadId);
-            }
-          }}
         />
       ) : null}
       {newThreadDialogOpen ? (
@@ -678,48 +595,6 @@ function targetKeyForNewThread(target: NewThreadTarget): string {
     return `chat:${target.provider ?? 'codex'}`;
   }
   return 'projectId' in target ? target.projectId : target.cwd;
-}
-
-function readTouchCommandPosition(): { left: number; top: number } | undefined {
-  if (typeof window === 'undefined') {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(
-      window.localStorage.getItem(TOUCH_COMMAND_POSITION_KEY) ?? 'null'
-    ) as { left?: unknown; top?: unknown } | null;
-    if (typeof parsed?.left !== 'number' || typeof parsed.top !== 'number') {
-      return undefined;
-    }
-    return clampTouchCommandPosition({ left: parsed.left, top: parsed.top });
-  } catch {
-    return undefined;
-  }
-}
-
-function saveTouchCommandPosition(position: { left: number; top: number }): void {
-  if (typeof window === 'undefined') {
-    return;
-  }
-  window.localStorage.setItem(
-    TOUCH_COMMAND_POSITION_KEY,
-    JSON.stringify(clampTouchCommandPosition(position))
-  );
-}
-
-function clampTouchCommandPosition(position: { left: number; top: number }): {
-  left: number;
-  top: number;
-} {
-  if (typeof window === 'undefined') {
-    return position;
-  }
-  const size = 54;
-  const margin = 10;
-  return {
-    left: Math.min(Math.max(position.left, margin), window.innerWidth - size - margin),
-    top: Math.min(Math.max(position.top, margin), window.innerHeight - size - margin)
-  };
 }
 
 function readSeenThreadActivity(): Record<string, number> {
@@ -772,9 +647,13 @@ function markThreadSeen(
     }
     return {
       ...current,
-      [thread.threadId]: activityAt
+      [thread.threadId]: reviewedAtForActivity(activityAt)
     };
   });
+}
+
+function reviewedAtForActivity(activityAt: number): number {
+  return Math.max(activityAt, Date.now());
 }
 
 function ApprovalInboxDrawer({
@@ -843,72 +722,6 @@ function ApprovalInboxDrawer({
           )}
         </div>
       </aside>
-    </div>
-  );
-}
-
-function TouchCommandSheet({
-  commands,
-  activeThread,
-  onClose,
-  onNewThread,
-  onShowApprovals,
-  onSearch,
-  onOpenOnMac,
-  onStopWork
-}: {
-  commands: TouchCommand[];
-  activeThread?: Thread;
-  onClose: () => void;
-  onNewThread: () => void;
-  onShowApprovals: () => void;
-  onSearch: () => void;
-  onOpenOnMac: () => void;
-  onStopWork: () => void;
-}) {
-  const runCommand = (command: TouchCommand) => {
-    if (!command.enabled) return;
-    if (command.action === 'new_thread') onNewThread();
-    if (command.action === 'show_approvals') onShowApprovals();
-    if (command.action === 'search_threads') onSearch();
-    if (command.action === 'open_on_mac') onOpenOnMac();
-    if (command.action === 'stop_work') onStopWork();
-  };
-
-  return (
-    <div className="touch-sheet-backdrop" role="presentation" onClick={onClose}>
-      <section
-        className="touch-sheet"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Command sheet"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header className="touch-sheet-header">
-          <div>
-            <h2>Actions</h2>
-            <p>{activeThread ? activeThread.title : 'Dashboard'}</p>
-          </div>
-          <button type="button" onClick={onClose} aria-label="Close actions">
-            <X size={18} />
-          </button>
-        </header>
-        <div className="touch-sheet-grid">
-          {commands.map((command) => (
-            <button
-              key={command.id}
-              type="button"
-              className="touch-sheet-action"
-              onClick={() => runCommand(command)}
-              disabled={!command.enabled}
-              title={command.disabledReason}
-            >
-              <span>{command.label}</span>
-              <small>{command.enabled ? command.description : command.disabledReason}</small>
-            </button>
-          ))}
-        </div>
-      </section>
     </div>
   );
 }

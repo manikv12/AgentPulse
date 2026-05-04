@@ -2,15 +2,21 @@ import type {
   ChatAttachment,
   ChatMessage,
   PendingApprovalRequest,
+  ThreadFileChangeSummary,
   ThreadMessageResponse,
   ThreadSendState,
   ThreadTranscript
 } from '@agent-pulse/shared';
-import { ThreadMessageResponseSchema } from '@agent-pulse/shared';
+import { ThreadFileChangeSummarySchema, ThreadMessageResponseSchema } from '@agent-pulse/shared';
 import { debugLog } from '../debug';
 import { SendBlockedError } from './app-server-chat';
 import type { CodexAppServerChat } from './app-server-chat';
 import type { IpcClient } from './ipc-client';
+import {
+  CodexTranscriptionAuthError,
+  parseCodexTranscriptionAuthContext,
+  type CodexTranscriptionAuthContext
+} from './transcription-auth';
 
 export type CodexMirrorBroadcast = {
   method: string;
@@ -30,6 +36,10 @@ export type CodexMirrorOptions = {
   onPendingApprovalsChange?: (event: {
     threadId: string;
     requests: PendingApprovalRequest[];
+  }) => void;
+  onFileChangesChange?: (event: {
+    threadId: string;
+    summaries: ThreadFileChangeSummary[];
   }) => void;
   hostId?: string;
   followerRequestTimeoutMs?: number;
@@ -67,6 +77,13 @@ export type CodexMirror = {
     method: ApprovalMethod,
     response: ApprovalResponse
   ): Promise<void>;
+  applyFileChangeAction(
+    threadId: string,
+    changeId: string,
+    action: 'undo' | 'reapply'
+  ): Promise<ThreadFileChangeSummary>;
+  resolveTranscriptionAuthContext(refreshToken?: boolean): Promise<CodexTranscriptionAuthContext>;
+  getFileChangeSummaries(threadId: string): ThreadFileChangeSummary[];
   isThreadStreaming(threadId: string): boolean;
   isThreadCompacting(threadId: string): boolean;
   isThreadWaitingForApproval(threadId: string): boolean;
@@ -85,6 +102,9 @@ export type CodexMirror = {
   onPendingApprovalsChange(
     listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
   ): () => void;
+  onFileChangesChange(
+    listener: (event: { threadId: string; summaries: ThreadFileChangeSummary[] }) => void
+  ): () => void;
   isThreadOwned(threadId: string): boolean;
   waitForOwnership(threadId: string, timeoutMs: number): Promise<boolean>;
   isConnected(): boolean;
@@ -94,6 +114,9 @@ export type CodexMirror = {
 export type ApprovalMethod =
   | 'item/commandExecution/requestApproval'
   | 'item/fileChange/requestApproval'
+  | 'item/fileRead/requestApproval'
+  | 'item/tool/requestUserInput'
+  | 'tool/requestUserInput'
   | 'item/permissions/requestApproval'
   | 'mcpServer/elicitation/request';
 
@@ -110,6 +133,9 @@ const THREAD_UNAVAILABLE_ERROR_MARKERS = [
 const APPROVAL_REQUEST_METHODS = new Set([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
+  'item/fileRead/requestApproval',
+  'item/tool/requestUserInput',
+  'tool/requestUserInput',
   'item/permissions/requestApproval',
   'mcpServer/elicitation/request'
 ]);
@@ -134,6 +160,13 @@ type AppThreadStreamState = {
 
 type JsonRecord = Record<string, unknown>;
 
+type CodexFileChangeRecord = {
+  summary: ThreadFileChangeSummary;
+  unifiedDiff: string;
+  cwd?: string;
+  hostId: string;
+};
+
 export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   const ipc = options.ipc;
   const hostId = options.hostId ?? DEFAULT_HOST_ID;
@@ -154,6 +187,10 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
   >();
   const pendingApprovalListeners = new Set<
     (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
+  >();
+  const fileChangeSummariesByThread = new Map<string, Map<string, CodexFileChangeRecord>>();
+  const fileChangeListeners = new Set<
+    (event: { threadId: string; summaries: ThreadFileChangeSummary[] }) => void
   >();
   // Threads where a Codex window currently reports streamRole.role === 'owner'.
   // Required for follower IPC methods (set-model-and-reasoning, approval decisions, etc.)
@@ -240,6 +277,57 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         // ignore listener errors
       }
     }
+  }
+
+  function notifyFileChangesChanged(conversationId: string): void {
+    const summaries = getFileChangeSummaries(conversationId);
+    const event = { threadId: conversationId, summaries };
+    try {
+      options.onFileChangesChange?.(event);
+    } catch {
+      // ignore listener errors
+    }
+    for (const listener of fileChangeListeners) {
+      try {
+        listener(event);
+      } catch {
+        // ignore listener errors
+      }
+    }
+  }
+
+  function updateFileChangesFromAppChange(
+    conversationId: string,
+    change: JsonRecord,
+    hostId?: string
+  ): void {
+    const changeType = typeof change.type === 'string' ? change.type : null;
+    const summaries = collectFileChangeRecords(conversationId, change, hostId);
+    if (changeType === 'snapshot') {
+      if (summaries.length === 0) {
+        const previous = fileChangeSummariesByThread.get(conversationId);
+        if (previous && previous.size > 0) {
+          fileChangeSummariesByThread.delete(conversationId);
+          notifyFileChangesChanged(conversationId);
+        }
+        return;
+      }
+      fileChangeSummariesByThread.set(
+        conversationId,
+        new Map(summaries.map((summary) => [summary.summary.id, summary]))
+      );
+      notifyFileChangesChanged(conversationId);
+      return;
+    }
+    if (summaries.length === 0) {
+      return;
+    }
+    const existing = fileChangeSummariesByThread.get(conversationId) ?? new Map();
+    for (const summary of summaries) {
+      existing.set(summary.summary.id, summary);
+    }
+    fileChangeSummariesByThread.set(conversationId, existing);
+    notifyFileChangesChanged(conversationId);
   }
 
   function updateStreamingFromAppChange(conversationId: string, change: JsonRecord): boolean | null {
@@ -353,10 +441,16 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       }
       // Note: we used to filter by params.hostId === 'local'. Codex windows broadcast with their
       // own connector/host id (a UUID per session), so that filter dropped every ownership flip.
-      // We now accept all hosts and key state purely on conversationId. The local hostId is still
-      // used when *we* construct outgoing requests.
-      void hostId;
+      // We now accept all hosts and key state purely on conversationId. File-change actions reuse
+      // the broadcast host id so Codex Desktop receives the same apply-patch shape it uses itself.
       const change = objectField(params, 'change');
+      if (change) {
+        updateFileChangesFromAppChange(
+          conversationId,
+          change,
+          typeof params.hostId === 'string' ? params.hostId : hostId
+        );
+      }
       const streamRole = change ? objectField(change, 'streamRole') : null;
       const derivedStreaming = change ? updateStreamingFromAppChange(conversationId, change) : null;
       debugLog('[ownership] broadcast received', {
@@ -570,11 +664,22 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       });
       return;
     }
-    if (method === 'item/fileChange/requestApproval') {
+    if (method === 'item/fileChange/requestApproval' || method === 'item/fileRead/requestApproval') {
       await sendFollowerRequest('thread-follower-file-approval-decision', {
         conversationId: threadId,
         requestId: ipcRequestId,
         decision: response
+      });
+      return;
+    }
+    if (method === 'item/tool/requestUserInput' || method === 'tool/requestUserInput') {
+      await sendFollowerRequest('thread-follower-submit-user-input', {
+        conversationId: threadId,
+        requestId: ipcRequestId,
+        response:
+          response && typeof response === 'object' && !Array.isArray(response)
+            ? response
+            : { answers: {} }
       });
       return;
     }
@@ -635,6 +740,94 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     return state ? pendingApprovalsFromState(state) : [];
   }
 
+  function getFileChangeSummaries(threadId: string): ThreadFileChangeSummary[] {
+    return [...(fileChangeSummariesByThread.get(threadId)?.values() ?? [])]
+      .map((record) => record.summary)
+      .sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  async function applyFileChangeAction(
+    threadId: string,
+    changeId: string,
+    action: 'undo' | 'reapply'
+  ): Promise<ThreadFileChangeSummary> {
+    const record = fileChangeSummariesByThread.get(threadId)?.get(changeId);
+    if (!record) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'This Codex file-change summary is no longer available.'
+      );
+    }
+    if (!record.summary.canUseCodexApplyPatch) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        record.summary.unavailableReason ?? 'Codex did not expose an applyable diff for this change.'
+      );
+    }
+    if (!record.cwd) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Codex did not expose the workspace path for this file change.'
+      );
+    }
+    try {
+      await sendFollowerRequest('apply-patch', {
+        diff: record.unifiedDiff,
+        cwd: record.cwd,
+        hostConfig: { id: record.hostId },
+        revert: action === 'undo'
+      });
+    } catch (error) {
+      const message = describeIpcError(error);
+      if (THREAD_UNAVAILABLE_ERROR_MARKERS.some((marker) => message.includes(marker))) {
+        throw new SendBlockedError(
+          'thread_unavailable',
+          'Codex Desktop has the apply-patch command, but this app build does not expose it to Agent Pulse yet. Open Codex on your Mac to use Undo/Reapply for now.'
+        );
+      }
+      throw error;
+    }
+
+    const nextSummary = ThreadFileChangeSummarySchema.parse({
+      ...record.summary,
+      action: action === 'undo' ? 'reapply' : 'undo'
+    });
+    record.summary = nextSummary;
+    fileChangeSummariesByThread.get(threadId)?.set(changeId, record);
+    notifyFileChangesChanged(threadId);
+    return nextSummary;
+  }
+
+  async function resolveTranscriptionAuthContext(
+    refreshToken = true
+  ): Promise<CodexTranscriptionAuthContext> {
+    if (!ipc.isReady()) {
+      throw new SendBlockedError(
+        'thread_unavailable',
+        'Codex Desktop is not connected. Open Codex on your Mac to use voice transcription.'
+      );
+    }
+
+    const params = { includeToken: true, refreshToken };
+    let lastError: unknown;
+    for (const method of ['getAuthStatus', 'account/getAuthStatus']) {
+      try {
+        const response = await sendFollowerRequest(method, params);
+        return parseTranscriptionAuthContext(response);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (lastError instanceof Error) {
+      throw lastError;
+    }
+    throw new SendBlockedError(
+      'thread_unavailable',
+      'Codex did not provide transcription authentication.'
+    );
+  }
+
   function clearPendingApprovalsForThread(threadId: string): boolean {
     const state = appThreadStreamStates.get(threadId);
     if (!state || state.approvalRequestsByKey.size === 0) {
@@ -684,6 +877,9 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     isThreadCompacting,
     isThreadWaitingForApproval,
     getPendingApprovalRequests,
+    getFileChangeSummaries,
+    applyFileChangeAction,
+    resolveTranscriptionAuthContext,
     clearPendingApprovalsForThread,
     onStreamingChange(listener) {
       streamingListeners.add(listener);
@@ -708,6 +904,23 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         pendingApprovalListeners.delete(listener);
       };
     },
+    onFileChangesChange(listener) {
+      fileChangeListeners.add(listener);
+      for (const [threadId] of fileChangeSummariesByThread) {
+        const summaries = getFileChangeSummaries(threadId);
+        if (summaries.length === 0) {
+          continue;
+        }
+        try {
+          listener({ threadId, summaries });
+        } catch {
+          // ignore listener errors
+        }
+      }
+      return () => {
+        fileChangeListeners.delete(listener);
+      };
+    },
     isThreadOwned,
     waitForOwnership,
     isConnected: () => ipc.isReady(),
@@ -725,6 +938,8 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       lastEmittedPendingApprovals.clear();
       streamingListeners.clear();
       pendingApprovalListeners.clear();
+      fileChangeListeners.clear();
+      fileChangeSummariesByThread.clear();
       ownedThreads.clear();
       ownershipWaiters.clear();
     }
@@ -760,6 +975,140 @@ function pendingApprovalsFromState(state: AppThreadStreamState): PendingApproval
     }
   }
   return [...byId.values()];
+}
+
+function collectFileChangeRecords(
+  threadId: string,
+  root: JsonRecord,
+  hostId = 'local'
+): CodexFileChangeRecord[] {
+  const records: CodexFileChangeRecord[] = [];
+  const seen = new Set<unknown>();
+
+  const visit = (value: unknown, context: { turnId?: string; itemId?: string; cwd?: string } = {}) => {
+    if (!value || typeof value !== 'object' || seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    const object = value as JsonRecord;
+    const itemType = stringField(object, 'type');
+    const objectId = stringField(object, 'id');
+    const nextContext = {
+      turnId:
+        stringField(object, 'turnId') ??
+        stringField(object, 'turn_id') ??
+        (isCodexTurnObject(object) ? objectId : undefined) ??
+        context.turnId,
+      itemId:
+        stringField(object, 'itemId') ??
+        (itemType === 'fileChange' ? objectId : undefined) ??
+        context.itemId,
+      cwd: stringField(object, 'cwd') ?? context.cwd
+    };
+    const unifiedDiff =
+      stringField(object, 'unifiedDiff') ??
+      stringField(object, 'unified_diff') ??
+      stringField(object, 'diff');
+    if (unifiedDiff && looksLikeUnifiedDiff(unifiedDiff)) {
+      const parsed = summarizeUnifiedDiff(unifiedDiff);
+      if (parsed.fileCount > 0) {
+        const id = [
+          nextContext.turnId ?? 'turn',
+          nextContext.itemId ?? stableDiffId(unifiedDiff)
+        ].join(':');
+        const cwd = nextContext.cwd?.trim() || undefined;
+        records.push({
+          unifiedDiff,
+          cwd,
+          hostId,
+          summary: ThreadFileChangeSummarySchema.parse({
+            id,
+            threadId,
+            turnId: nextContext.turnId,
+            itemId: nextContext.itemId,
+            cwd,
+            ...parsed,
+            action: 'undo',
+            canUseCodexApplyPatch: Boolean(cwd),
+            ...(cwd
+              ? {}
+              : {
+                  unavailableReason:
+                    'Codex did not expose the workspace path for this file change.'
+                })
+          })
+        });
+      }
+    }
+    for (const child of Object.values(object)) {
+      if (child && typeof child === 'object') {
+        visit(child, nextContext);
+      }
+    }
+  };
+
+  visit(root);
+  return records;
+}
+
+function looksLikeUnifiedDiff(value: string): boolean {
+  return value.includes('diff --git ') || value.includes('\n+++ ') || value.includes('\n--- ');
+}
+
+function isCodexTurnObject(object: JsonRecord): boolean {
+  return typeof object.id === 'string' && Array.isArray(object.items);
+}
+
+function summarizeUnifiedDiff(unifiedDiff: string): Pick<
+  ThreadFileChangeSummary,
+  'fileCount' | 'linesAdded' | 'linesDeleted' | 'files'
+> {
+  const files = new Map<string, { path: string; linesAdded: number; linesDeleted: number }>();
+  let currentPath: string | null = null;
+  for (const line of unifiedDiff.split(/\r?\n/)) {
+    const diffMatch = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (diffMatch) {
+      currentPath = diffMatch[2] ?? diffMatch[1] ?? null;
+      if (currentPath && !files.has(currentPath)) {
+        files.set(currentPath, { path: currentPath, linesAdded: 0, linesDeleted: 0 });
+      }
+      continue;
+    }
+    if (line.startsWith('+++ b/')) {
+      currentPath = line.slice(6);
+      if (currentPath && !files.has(currentPath)) {
+        files.set(currentPath, { path: currentPath, linesAdded: 0, linesDeleted: 0 });
+      }
+      continue;
+    }
+    if (!currentPath) {
+      continue;
+    }
+    const entry = files.get(currentPath);
+    if (!entry) {
+      continue;
+    }
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      entry.linesAdded += 1;
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      entry.linesDeleted += 1;
+    }
+  }
+  const parsedFiles = [...files.values()];
+  return {
+    fileCount: parsedFiles.length,
+    linesAdded: parsedFiles.reduce((sum, file) => sum + file.linesAdded, 0),
+    linesDeleted: parsedFiles.reduce((sum, file) => sum + file.linesDeleted, 0),
+    files: parsedFiles
+  };
+}
+
+function stableDiffId(value: string): string {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(16);
 }
 
 function arraysOfRequestsEqual(
@@ -1264,6 +1613,17 @@ function conversationStatePatchPath(path: unknown[]): unknown[] {
     return path.slice(2);
   }
   return path;
+}
+
+function parseTranscriptionAuthContext(raw: unknown): CodexTranscriptionAuthContext {
+  try {
+    return parseCodexTranscriptionAuthContext(raw);
+  } catch (error) {
+    if (error instanceof CodexTranscriptionAuthError) {
+      throw new SendBlockedError('thread_unavailable', error.message);
+    }
+    throw error;
+  }
 }
 
 function numericPathPart(value: unknown): number | null {

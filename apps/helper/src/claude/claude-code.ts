@@ -32,6 +32,7 @@ const MAX_SESSIONS = 5_000;
 const MAX_IDLE_THREADS_PER_PROJECT = 8;
 const CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000;
 const CLAUDE_DEFAULT_REASONING_EFFORT = 'medium';
+const CLAUDE_DEFAULT_PERMISSION_MODE = 'auto';
 const CLAUDE_REASONING_LEVELS = [
   { effort: 'low', description: 'Fastest Claude Code reasoning.' },
   { effort: 'medium', description: 'Balanced Claude Code reasoning.' },
@@ -150,8 +151,8 @@ export class ClaudeCodeProvider {
 
   async listProjects(): Promise<Project[]> {
     const paths = new Set<string>();
-    for (const workspacePath of await this.readProjectPaths()) {
-      paths.add(workspacePath);
+    for (const session of await this.readSessions({ defaultLimit: MAX_SESSIONS })) {
+      paths.add(session.workspacePath);
     }
     for (const draft of this.drafts.values()) {
       paths.add(draft.cwd);
@@ -454,21 +455,6 @@ export class ClaudeCodeProvider {
     this.liveSessions.clear();
   }
 
-  private async readProjectPaths(): Promise<string[]> {
-    const projectsDir = path.join(this.claudeHome, 'projects');
-    let dirs;
-    try {
-      dirs = await readdir(projectsDir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-
-    return dirs
-      .filter((dir) => dir.isDirectory())
-      .map((dir) => fallbackPathFromProjectName(dir.name))
-      .filter((workspacePath) => workspacePath && path.isAbsolute(workspacePath));
-  }
-
   private async readSessions(options: ClaudeThreadListOptions = {}): Promise<ParsedClaudeSession[]> {
     const projectsDir = path.join(this.claudeHome, 'projects');
     let dirs;
@@ -518,8 +504,35 @@ export class ClaudeCodeProvider {
   }
 
   private async readSessionByNativeId(nativeSessionId: string): Promise<ParsedClaudeSession | undefined> {
-    const sessions = await this.readSessions();
-    return sessions.find((session) => session.nativeSessionId === nativeSessionId);
+    const sessionFile = await this.findSessionFileByNativeId(nativeSessionId);
+    if (!sessionFile) {
+      return undefined;
+    }
+    return parseClaudeSessionFile(sessionFile.filePath, sessionFile.encodedProjectName);
+  }
+
+  private async findSessionFileByNativeId(
+    nativeSessionId: string
+  ): Promise<{ filePath: string; encodedProjectName: string } | undefined> {
+    const projectsDir = path.join(this.claudeHome, 'projects');
+    let dirs;
+    try {
+      dirs = await readdir(projectsDir, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+
+    const fileName = `${nativeSessionId}.jsonl`;
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      const filePath = path.join(projectsDir, dir.name, fileName);
+      const fileStat = await stat(filePath).catch(() => undefined);
+      if (fileStat?.isFile()) {
+        return { filePath, encodedProjectName: dir.name };
+      }
+    }
+
+    return undefined;
   }
 
   private threadFromSession(session: ParsedClaudeSession): Thread {
@@ -638,7 +651,7 @@ export class ClaudeCodeProvider {
       '--include-partial-messages',
       '--replay-user-messages',
       '--permission-mode',
-      'default',
+      CLAUDE_DEFAULT_PERMISSION_MODE,
       ...(model ? ['--model', model] : []),
       ...(effort ? ['--effort', effort] : []),
       ...(launchMode === 'new' ? ['--session-id', nativeSessionId] : ['--resume', nativeSessionId])
@@ -1158,6 +1171,9 @@ async function parseClaudeSessionFile(filePath: string, encodedProjectName: stri
   let lastTurnSummary = '';
   let model: string | undefined;
   let usage: ThreadUsage | undefined;
+  const noteVisibleActivity = (createdAt: string) => {
+    lastActivityAt = createdAt;
+  };
 
   for (const [index, line] of lines.entries()) {
     let payload: Record<string, unknown>;
@@ -1167,9 +1183,7 @@ async function parseClaudeSessionFile(filePath: string, encodedProjectName: stri
       continue;
     }
     const timestamp = stringField(payload, 'timestamp');
-    if (timestamp && !Number.isNaN(Date.parse(timestamp))) {
-      lastActivityAt = new Date(timestamp).toISOString();
-    }
+    const createdAt = timestampToIso(timestamp, fileStat.mtime);
     const cwd = stringField(payload, 'cwd');
     if (cwd && path.isAbsolute(cwd)) {
       workspacePath = cwd;
@@ -1189,9 +1203,10 @@ async function parseClaudeSessionFile(filePath: string, encodedProjectName: stri
         role: 'user',
         kind: 'message',
         text,
-        createdAt: timestampToIso(timestamp, fileStat.mtime),
+        createdAt,
         ...(attachments.length > 0 ? { attachments } : {})
       }));
+      noteVisibleActivity(createdAt);
     } else if (type === 'assistant') {
       const message = recordField(payload, 'message');
       model = normalizeClaudeModelAlias(stringField(message, 'model')) ?? model;
@@ -1204,12 +1219,17 @@ async function parseClaudeSessionFile(filePath: string, encodedProjectName: stri
           role: 'assistant',
           kind: 'message',
           text,
-          createdAt: timestampToIso(timestamp, fileStat.mtime),
+          createdAt,
           ...(attachments.length > 0 ? { attachments } : {})
         }));
+        noteVisibleActivity(createdAt);
       }
-      for (const plan of extractPlanMessagesFromClaudeMessage(message, index, timestampToIso(timestamp, fileStat.mtime))) {
+      const plans = extractPlanMessagesFromClaudeMessage(message, index, createdAt);
+      for (const plan of plans) {
         messages.push(plan);
+      }
+      if (plans.length > 0) {
+        noteVisibleActivity(createdAt);
       }
     }
   }

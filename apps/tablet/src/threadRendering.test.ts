@@ -236,6 +236,75 @@ describe('thread rendering helpers', () => {
     expect(entries[1].group.messages.map((item) => item.id)).toEqual(['tool-old-1', 'tool-old-2']);
   });
 
+  it('labels the synthetic pending-send activity as Thinking', () => {
+    const entries = buildRenderableEntries(
+      [
+        message({
+          id: 'pending-user',
+          role: 'user',
+          kind: 'message',
+          text: 'Slow prompt',
+          createdAt: '2026-04-25T16:14:30Z'
+        }),
+        message({
+          id: 'pending-thinking',
+          role: 'activity',
+          kind: 'reasoning',
+          phase: 'pending_send',
+          text: 'Codex is thinking...',
+          createdAt: '2026-04-25T16:14:31Z'
+        })
+      ],
+      { isLive: true, preserveInputOrder: true }
+    );
+
+    expect(entries.map((entry) => entry.type)).toEqual(['message', 'activityGroup']);
+    if (entries[1].type !== 'activityGroup') {
+      throw new Error('Expected an activity group');
+    }
+    expect(entries[1].group).toMatchObject({
+      title: 'Thinking',
+      status: 'running'
+    });
+    expect(entries[1].group.items[0]).toMatchObject({
+      title: 'Thinking',
+      detail: 'Codex is thinking...'
+    });
+  });
+
+  it('labels context compaction activity clearly', () => {
+    const entries = buildRenderableEntries([
+      message({
+        id: 'user-1',
+        role: 'user',
+        kind: 'message',
+        text: 'Continue.',
+        createdAt: '2026-04-25T16:14:30Z'
+      }),
+      message({
+        id: 'compact-1',
+        role: 'activity',
+        kind: 'status',
+        phase: 'context_compaction',
+        text: 'Automatically compacting context',
+        createdAt: '2026-04-25T16:14:31Z'
+      })
+    ]);
+
+    expect(entries.map((entry) => entry.type)).toEqual(['message', 'activityGroup']);
+    if (entries[1].type !== 'activityGroup') {
+      throw new Error('Expected an activity group');
+    }
+    expect(entries[1].group).toMatchObject({
+      title: 'Compacting context',
+      status: 'running'
+    });
+    expect(entries[1].group.items[0]).toMatchObject({
+      title: 'Compacting context',
+      detail: 'Automatically compacting context'
+    });
+  });
+
   it('extracts the latest final_answer per turn even when several assistant messages share the same phase (Copilot multi-message turn)', () => {
     // Regression for the screenshot bug: Copilot turns can emit several
     // `assistant.message` chunks (progress updates + final big answer). All
@@ -388,6 +457,185 @@ describe('thread rendering helpers', () => {
     expect(entries[2]).toMatchObject({
       type: 'message',
       message: { id: 'assistant-final' }
+    });
+  });
+
+  it('renders file changes inside the turn that owns the fileChange item', () => {
+    const entries = buildRenderableEntries(
+      [
+        message({
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'First task',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:00Z'
+        }),
+        message({
+          id: 'file-change-1',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:10Z'
+        }),
+        message({
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          phase: 'final_answer',
+          text: 'First done.',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:20Z'
+        }),
+        message({
+          id: 'user-2',
+          role: 'user',
+          kind: 'message',
+          text: 'Second task',
+          turnId: 'turn-2',
+          createdAt: '2026-04-25T16:15:00Z'
+        }),
+        message({
+          id: 'file-change-2',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          turnId: 'turn-2',
+          createdAt: '2026-04-25T16:15:10Z'
+        }),
+        message({
+          id: 'assistant-2',
+          role: 'assistant',
+          kind: 'message',
+          phase: 'final_answer',
+          text: 'Second done.',
+          turnId: 'turn-2',
+          createdAt: '2026-04-25T16:15:20Z'
+        })
+      ],
+      {
+        fileChanges: [
+          {
+            id: 'turn-1:file-change-1',
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            itemId: 'file-change-1',
+            fileCount: 1,
+            linesAdded: 1,
+            linesDeleted: 0,
+            files: [{ path: 'first.ts', linesAdded: 1, linesDeleted: 0 }],
+            action: 'undo',
+            canUseCodexApplyPatch: true
+          },
+          {
+            id: 'turn-2:file-change-2',
+            threadId: 'thread-1',
+            turnId: 'turn-2',
+            itemId: 'file-change-2',
+            fileCount: 1,
+            linesAdded: 2,
+            linesDeleted: 0,
+            files: [{ path: 'second.ts', linesAdded: 2, linesDeleted: 0 }],
+            action: 'undo',
+            canUseCodexApplyPatch: true
+          }
+        ]
+      }
+    );
+
+    expect(entries.map((entry) => entry.type)).toEqual([
+      'message',
+      'activityGroup',
+      'message',
+      'fileChanges',
+      'message',
+      'activityGroup',
+      'message',
+      'fileChanges'
+    ]);
+    expect(entries[3]).toMatchObject({
+      type: 'fileChanges',
+      summaries: [{ id: 'turn-1:file-change-1' }]
+    });
+    expect(entries[7]).toMatchObject({
+      type: 'fileChanges',
+      summaries: [{ id: 'turn-2:file-change-2' }]
+    });
+  });
+
+  it('does not move a hidden file-change card into the next visible agent response', () => {
+    const entries = buildRenderableEntries(
+      [
+        message({
+          id: 'file-change-hidden',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:10Z'
+        }),
+        message({
+          id: 'user-2',
+          role: 'user',
+          kind: 'message',
+          text: 'Second task',
+          turnId: 'turn-2',
+          createdAt: '2026-04-25T16:15:00Z'
+        }),
+        message({
+          id: 'file-change-2',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          turnId: 'turn-2',
+          createdAt: '2026-04-25T16:15:10Z'
+        }),
+        message({
+          id: 'assistant-2',
+          role: 'assistant',
+          kind: 'message',
+          phase: 'final_answer',
+          text: 'Second done.',
+          turnId: 'turn-2',
+          createdAt: '2026-04-25T16:15:20Z'
+        })
+      ],
+      {
+        fileChanges: [
+          {
+            id: 'hidden:file-change-1',
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            itemId: 'file-change-hidden',
+            fileCount: 1,
+            linesAdded: 1,
+            linesDeleted: 0,
+            files: [{ path: 'old.ts', linesAdded: 1, linesDeleted: 0 }],
+            action: 'undo',
+            canUseCodexApplyPatch: true
+          },
+          {
+            id: 'turn-2:file-change-2',
+            threadId: 'thread-1',
+            turnId: 'turn-2',
+            itemId: 'file-change-2',
+            fileCount: 1,
+            linesAdded: 2,
+            linesDeleted: 0,
+            files: [{ path: 'second.ts', linesAdded: 2, linesDeleted: 0 }],
+            action: 'undo',
+            canUseCodexApplyPatch: true
+          }
+        ]
+      }
+    );
+
+    const fileChangeEntries = entries.filter((entry) => entry.type === 'fileChanges');
+    expect(fileChangeEntries).toHaveLength(1);
+    expect(fileChangeEntries[0]).toMatchObject({
+      type: 'fileChanges',
+      summaries: [{ id: 'turn-2:file-change-2' }]
     });
   });
 });

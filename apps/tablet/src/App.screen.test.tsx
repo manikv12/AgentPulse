@@ -78,8 +78,10 @@ describe('App screen routing', () => {
 
     expect(await screen.findByRole('heading', { name: 'Agent Pulse settings' })).toBeInTheDocument();
 
-    act(() => {
+    await act(async () => {
       sockets[0]?.onclose?.();
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
     await waitFor(() => {
@@ -138,8 +140,8 @@ describe('App screen routing', () => {
     expect(screen.queryByRole('heading', { name: 'Helper offline' })).not.toBeInTheDocument();
     expect(screen.getByText('Reconnecting to helper...')).toBeInTheDocument();
 
-    act(() => {
-      vi.advanceTimersByTime(1000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     expect(sockets.length).toBe(2);

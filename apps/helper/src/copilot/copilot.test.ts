@@ -206,6 +206,58 @@ describe('CopilotProvider', () => {
     }
   });
 
+  it('keeps Copilot thread activity pinned to the latest visible transcript event', async () => {
+    const copilotHome = await tempCopilotHome();
+    const sessionDir = path.join(copilotHome, 'session-state', 'session-review');
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      path.join(sessionDir, 'workspace.yaml'),
+      [
+        'cwd: /Users/me/projects/CodexPulse',
+        'updated_at: 2026-04-25T16:16:00.000Z'
+      ].join('\n')
+    );
+    await writeFile(
+      path.join(sessionDir, 'events.jsonl'),
+      [
+        JSON.stringify({
+          type: 'session.start',
+          data: { selectedModel: 'gpt-5.4', context: { cwd: '/Users/me/projects/CodexPulse' } },
+          id: 'session-start',
+          timestamp: '2026-04-25T16:14:00Z'
+        }),
+        JSON.stringify({
+          type: 'user.message',
+          data: { content: 'Check the review badge' },
+          id: 'message-user',
+          timestamp: '2026-04-25T16:14:05Z'
+        }),
+        JSON.stringify({
+          type: 'assistant.message',
+          data: { messageId: 'assistant-final', content: 'Looks good now.', toolRequests: [] },
+          id: 'message-assistant-final',
+          timestamp: '2026-04-25T16:15:00Z'
+        }),
+        JSON.stringify({
+          type: 'assistant.turn_start',
+          data: { reasoningEffort: 'high' },
+          id: 'turn-start',
+          timestamp: '2026-04-25T16:16:30Z'
+        })
+      ].join('\n')
+    );
+
+    const provider = new CopilotProvider({
+      copilotHome,
+      usageReader: { readUsage: async () => undefined }
+    });
+
+    const [thread] = await provider.listThreads();
+
+    expect(thread?.lastActivityAt).toBe('2026-04-25T16:15:00.000Z');
+    expect(thread?.lastTurnSummary).toBe('Looks good now.');
+  });
+
   it('deletes Copilot session-state folders from local history', async () => {
     const copilotHome = await tempCopilotHome();
     const sessionDir = path.join(copilotHome, 'session-state', 'session-delete');

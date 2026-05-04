@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ThreadTranscript } from '@agent-pulse/shared';
+import type { CatalogModel, ThreadMessageResponse, ThreadTranscript } from '@agent-pulse/shared';
 import { App, extractLatestModel, extractLatestReasoningEffort, extractPendingRequests } from './App';
+import { TranscriptFetchTimeoutError } from './api';
 import { Dashboard } from './Dashboard';
 import { ThreadView } from './ThreadView';
 
@@ -21,6 +22,70 @@ describe('Agent Pulse tablet UI', () => {
     const stopButton = await screen.findByRole('button', { name: 'Stop Codex' });
     expect(screen.queryByText('Codex is working')).not.toBeInTheDocument();
     return stopButton;
+  };
+
+  const installVoiceRecordingMocks = () => {
+    const stopTrack = vi.fn();
+    const getUserMedia = vi.fn(async () => ({
+      getTracks: () => [{ stop: stopTrack }]
+    }));
+
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia }
+    });
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true);
+
+      state: RecordingState = 'inactive';
+      mimeType = 'audio/webm';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: (() => void) | null = null;
+
+      constructor(_stream: MediaStream, options?: MediaRecorderOptions) {
+        if (options?.mimeType) {
+          this.mimeType = options.mimeType;
+        }
+      }
+
+      start() {
+        this.state = 'recording';
+      }
+
+      stop() {
+        this.state = 'inactive';
+        this.ondataavailable?.({
+          data: new Blob([new Uint8Array([1, 2, 3])], { type: this.mimeType })
+        } as BlobEvent);
+        this.onstop?.();
+      }
+    }
+
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder as unknown as typeof MediaRecorder);
+
+    return { getUserMedia, stopTrack };
+  };
+
+  const voiceThread = {
+    threadId: 'voice-thread',
+    title: 'Voice composer',
+    workspace: 'Agent Pulse',
+    status: 'idle',
+    lastActivityAt: '2026-04-25T16:18:00Z',
+    lastTurnSummary: ''
+  } as const;
+
+  const readyVoiceTranscript: ThreadTranscript = {
+    threadId: 'voice-thread',
+    provider: 'codex',
+    activeTurnId: null,
+    sendState: {
+      canSend: true,
+      reason: 'ready',
+      label: 'Ready'
+    },
+    messages: []
   };
 
   it('extracts model changes from Codex stream-state broadcast shapes', () => {
@@ -277,7 +342,8 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete thread' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Open thread actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete thread' }));
 
     await waitFor(() => expect(deleteThread).toHaveBeenCalledWith('thread-live'));
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/delete this thread/i));
@@ -657,7 +723,115 @@ describe('Agent Pulse tablet UI', () => {
     expect(sockets.at(-1)?.url).toContain('token=fresh-token-1234567890');
   });
 
-  it('keeps the saved session and goes offline when session recovery times out', async () => {
+  it('repairs a stale saved device token after the live event socket is rejected', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'stale-token',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const threadListTokens: string[] = [];
+    const sockets: MockWebSocket[] = [];
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      readonly close = vi.fn();
+
+      constructor(readonly url: string | URL) {
+        sockets.push(this);
+      }
+    }
+
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/health/get') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            codexAppServer: 'connected',
+            version: '0.1.0',
+            uptimeSec: 60
+          })
+        };
+      }
+
+      if (url === '/threads/list') {
+        const headers = new Headers(init?.headers);
+        const token = (headers.get('authorization') ?? '').replace(/^Bearer\s+/, '');
+        threadListTokens.push(token);
+        return {
+          ok: true,
+          json: async () => ({ threads: [] })
+        };
+      }
+
+      if (url === '/device/session/recover') {
+        expect(init?.body).toBe(
+          JSON.stringify({ deviceId: 'device-1', fingerprint: 'browser-fingerprint' })
+        );
+        return {
+          ok: true,
+          json: async () => ({
+            token: 'fresh-token-1234567890',
+            deviceId: 'device-1',
+            deviceName: 'Desk tablet'
+          })
+        };
+      }
+
+      if (url === '/projects/list') {
+        return { ok: true, json: async () => ({ projects: [] }) };
+      }
+
+      if (url === '/catalog/plugins') {
+        return { ok: true, json: async () => ({ plugins: [] }) };
+      }
+
+      if (url === '/catalog/skills') {
+        return { ok: true, json: async () => ({ skills: [] }) };
+      }
+
+      if (url === '/catalog/commands') {
+        return { ok: true, json: async () => ({ commands: [] }) };
+      }
+
+      if (url === '/catalog/models') {
+        return { ok: true, json: async () => ({ models: [] }) };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Agent Pulse' })).toBeInTheDocument();
+    await waitFor(() => expect(sockets).toHaveLength(1));
+    expect(String(sockets[0]?.url)).toContain('token=stale-token');
+
+    act(() => {
+      sockets[0]?.onclose?.({} as CloseEvent);
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/device/session/recover', expect.anything()));
+    await waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    expect(String(sockets.at(-1)?.url)).toContain('token=fresh-token-1234567890');
+    expect(JSON.parse(localStorage.getItem('agent-pulse-session') ?? '{}')).toMatchObject({
+      token: 'fresh-token-1234567890',
+      deviceId: 'device-1'
+    });
+    expect(threadListTokens).toContain('fresh-token-1234567890');
+  });
+
+  it('keeps the dashboard visible when session recovery times out but helper health is reachable', async () => {
     localStorage.setItem(
       'agent-pulse-session',
       JSON.stringify({
@@ -718,7 +892,9 @@ describe('Agent Pulse tablet UI', () => {
 
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: 'Helper offline' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Agent Pulse' })).toBeInTheDocument();
+    expect(await screen.findByText('Reconnecting to helper...')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Helper offline' })).not.toBeInTheDocument();
     expect(threadListTokens).toEqual(['stale-token']);
     expect(JSON.parse(localStorage.getItem('agent-pulse-session') ?? '{}')).toMatchObject({
       token: 'stale-token',
@@ -726,9 +902,75 @@ describe('Agent Pulse tablet UI', () => {
     });
     expect(screen.queryByRole('heading', { name: 'How will you use this?' })).not.toBeInTheDocument();
     expect(sockets).toHaveLength(1);
-    await waitFor(() => {
-      expect(sockets[0]?.close).toHaveBeenCalled();
-    });
+    expect(sockets[0]?.close).not.toHaveBeenCalled();
+  });
+
+  it('lets the offline retry button recover after a temporary helper connection failure', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    let healthAttempts = 0;
+    const sockets: Array<{ url: string; close: ReturnType<typeof vi.fn> }> = [];
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      readonly close = vi.fn();
+
+      constructor(readonly url: string | URL) {
+        sockets.push({ url: String(url), close: this.close });
+      }
+    }
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/health/get') {
+          healthAttempts += 1;
+          if (healthAttempts === 1) {
+            throw new Error('temporary tunnel refresh');
+          }
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return {
+            ok: true,
+            json: async () => ({ threads: [], groups: [] })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Helper offline' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Try again/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Agent Pulse' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Helper offline' })).not.toBeInTheDocument();
+    expect(healthAttempts).toBe(2);
+    expect(sockets.length).toBeGreaterThanOrEqual(1);
   });
 
   it('shows reconnect pins for paired devices in admin settings', async () => {
@@ -3287,6 +3529,44 @@ describe('Agent Pulse tablet UI', () => {
     expect(tile.getAttribute('aria-label')).toMatch(/Review/);
   });
 
+  it('marks review threads with the current time and syncs helper when helper state is older', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-03T20:00:00.000Z'));
+    const onMarkThreadSeen = vi.fn();
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'review-1',
+            title: 'Fix review repeat',
+            workspace: 'CodexPulse',
+            status: 'idle',
+            lastActivityAt: '2026-05-03T19:55:00.000Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        seenThreadActivityOverride={{
+          'review-1': Date.parse('2026-05-03T19:50:00.000Z')
+        }}
+        onMarkThreadSeen={onMarkThreadSeen}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Mark all reviewed/i }));
+
+    expect(onMarkThreadSeen).toHaveBeenCalledWith(
+      'review-1',
+      Date.parse('2026-05-03T20:00:00.000Z')
+    );
+  });
+
   it('shows provider hints in recent activity lists', () => {
     render(
       <Dashboard
@@ -3739,7 +4019,7 @@ describe('Agent Pulse tablet UI', () => {
 
     fireEvent.click(within(sidebar).getByRole('button', { name: 'Clear search' }));
     expect(search).toHaveValue('');
-    expect(within(sidebar).getByText('Search by chat or project')).toBeInTheDocument();
+    expect(within(sidebar).queryByRole('button', { name: 'Clear search' })).not.toBeInTheDocument();
   });
 
   it('shows waiting approval instead of working when the thread status is approval-blocked', async () => {
@@ -3865,7 +4145,8 @@ describe('Agent Pulse tablet UI', () => {
     const drawer = await screen.findByTestId('thread-chat-drawer');
     expect(fetchTranscript).toHaveBeenNthCalledWith(1, 'running-1', { messageLimit: 40 });
     expect(within(drawer).queryByRole('button', { name: 'Close' })).not.toBeInTheDocument();
-    fireEvent.click(within(drawer).getByRole('button', { name: 'Open in Codex' }));
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Open thread actions' }));
+    fireEvent.click(within(drawer).getByRole('menuitem', { name: 'Open in Codex' }));
     await waitFor(() => expect(openThreadInCodex).toHaveBeenCalledWith('running-1'));
     expect(within(drawer).queryByText('Sync')).not.toBeInTheDocument();
     expect(await screen.findByText('I am working on it.')).toBeInTheDocument();
@@ -3931,6 +4212,489 @@ describe('Agent Pulse tablet UI', () => {
         collaborationMode: 'plan'
       })
     );
+    fireEvent.click(screen.getByRole('button', { name: 'Open composer options' }));
+    expect(screen.getByRole('menuitemcheckbox', { name: /Plan mode/i })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+  });
+
+  it('keeps follow-up messages in plan mode until the user turns Plan off', async () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const sendMessage = vi.fn().mockResolvedValue({
+      ok: true,
+      mode: 'start',
+      turnId: 'turn-1',
+      transcript
+    });
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Plan work',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open composer options' }));
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: /Plan mode/i }));
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Make a plan before editing.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenNthCalledWith(1, 'running-1', 'Make a plan before editing.', {
+        collaborationMode: 'plan'
+      })
+    );
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Revise the plan first.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenNthCalledWith(2, 'running-1', 'Revise the plan first.', {
+        collaborationMode: 'plan'
+      })
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open composer options' }));
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: /Plan mode/i }));
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Leave plan mode now.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenNthCalledWith(3, 'running-1', 'Leave plan mode now.', {
+        collaborationMode: 'default'
+      })
+    );
+  });
+
+  it('shows the voice button only when helper transcription is available', () => {
+    render(
+      <ThreadView
+        thread={voiceThread}
+        liveTranscript={readyVoiceTranscript}
+        sendMessage={vi.fn()}
+        transcribeVoiceAudio={vi.fn()}
+        voiceTranscriptionAvailable={false}
+      />
+    );
+
+    expect(screen.queryByRole('button', { name: 'Record voice message' })).not.toBeInTheDocument();
+
+    cleanup();
+
+    render(
+      <ThreadView
+        thread={voiceThread}
+        liveTranscript={readyVoiceTranscript}
+        sendMessage={vi.fn()}
+        transcribeVoiceAudio={vi.fn()}
+        voiceTranscriptionAvailable
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Record voice message' })).toBeEnabled();
+  });
+
+  it('records voice, transcribes it, and places editable text in the composer', async () => {
+    installVoiceRecordingMocks();
+    let resolveTranscript: (value: string) => void = () => undefined;
+    const transcriptPromise = new Promise<string>((resolve) => {
+      resolveTranscript = resolve;
+    });
+    const transcribeVoiceAudio = vi.fn(() => transcriptPromise);
+
+    render(
+      <ThreadView
+        thread={voiceThread}
+        liveTranscript={readyVoiceTranscript}
+        sendMessage={vi.fn()}
+        transcribeVoiceAudio={transcribeVoiceAudio}
+        voiceTranscriptionAvailable
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Record voice message' }));
+
+    expect(await screen.findByText('Listening')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop and transcribe voice' }));
+
+    expect(await screen.findByText('Transcribing...')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send message' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
+
+    resolveTranscript('Please update the streaming code.');
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Message Codex')).toHaveValue('Please update the streaming code.')
+    );
+    expect(transcribeVoiceAudio).toHaveBeenCalledWith(expect.any(Blob));
+    await waitFor(() => expect(screen.getByLabelText('Message Codex')).toHaveFocus());
+  });
+
+  it('allows voice transcription while Codex is already working', async () => {
+    installVoiceRecordingMocks();
+    const workingTranscript: ThreadTranscript = {
+      threadId: 'voice-thread',
+      provider: 'codex',
+      activeTurnId: 'turn-working',
+      sendState: {
+        canSend: false,
+        reason: 'thread_changed',
+        label: 'Codex is working'
+      },
+      messages: []
+    };
+    const transcribeVoiceAudio = vi.fn(async () => 'Queue this as my next note.');
+    const sendMessage = vi.fn(async (): Promise<ThreadMessageResponse> => ({
+      ok: true,
+      mode: 'steer',
+      turnId: 'turn-working',
+      transcript: workingTranscript
+    }));
+
+    render(
+      <ThreadView
+        thread={{ ...voiceThread, status: 'running' }}
+        liveTranscript={workingTranscript}
+        sendMessage={sendMessage}
+        stopWork={vi.fn()}
+        transcribeVoiceAudio={transcribeVoiceAudio}
+        voiceTranscriptionAvailable
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Record voice message' }));
+    expect(await screen.findByText('Listening')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Stop and transcribe voice' }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Message Codex')).toHaveValue('Queue this as my next note.')
+    );
+    expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenCalledWith('voice-thread', 'Queue this as my next note.')
+    );
+  });
+
+  it('supports press-and-hold recording before transcription', async () => {
+    installVoiceRecordingMocks();
+    let now = 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const transcribeVoiceAudio = vi.fn(async () => 'Hold recorded draft.');
+
+    render(
+      <ThreadView
+        thread={voiceThread}
+        liveTranscript={readyVoiceTranscript}
+        sendMessage={vi.fn()}
+        transcribeVoiceAudio={transcribeVoiceAudio}
+        voiceTranscriptionAvailable
+      />
+    );
+
+    const button = screen.getByRole('button', { name: 'Record voice message' });
+    fireEvent.pointerDown(button, { button: 0, pointerId: 7 });
+
+    expect(await screen.findByText('Listening')).toBeInTheDocument();
+
+    now = 1_650;
+    fireEvent.pointerUp(screen.getByRole('button', { name: 'Stop and transcribe voice' }), {
+      pointerId: 7
+    });
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Message Codex')).toHaveValue('Hold recorded draft.')
+    );
+    expect(transcribeVoiceAudio).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the previous draft safe when voice transcription fails', async () => {
+    installVoiceRecordingMocks();
+    const transcribeVoiceAudio = vi.fn(async () => {
+      throw undefined;
+    });
+
+    render(
+      <ThreadView
+        thread={voiceThread}
+        liveTranscript={readyVoiceTranscript}
+        sendMessage={vi.fn()}
+        transcribeVoiceAudio={transcribeVoiceAudio}
+        voiceTranscriptionAvailable
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Keep this draft.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Record voice message' }));
+    expect(await screen.findByText('Listening')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Stop and transcribe voice' }));
+
+    expect(
+      await screen.findByText('Could not transcribe audio. Check Codex sign-in and microphone access.')
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('Message Codex')).toHaveValue('Keep this draft.');
+  });
+
+  it('closes thread, composer, and model popups when clicking outside', async () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'popup-thread',
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Hello',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const models: CatalogModel[] = [
+      {
+        slug: 'gpt-5.5',
+        displayName: 'GPT-5.5',
+        provider: 'codex',
+        defaultReasoningLevel: 'medium',
+        supportedReasoningLevels: [
+          { effort: 'medium', description: 'Balanced reasoning.' },
+          { effort: 'high', description: 'Deeper reasoning.' }
+        ],
+        visibility: 'visible'
+      },
+      {
+        slug: 'gpt-5.4',
+        displayName: 'GPT-5.4',
+        provider: 'codex',
+        defaultReasoningLevel: 'medium',
+        supportedReasoningLevels: [{ effort: 'medium', description: 'Balanced reasoning.' }],
+        visibility: 'visible'
+      }
+    ];
+    const sendPopupMessage = vi.fn(
+      async (): Promise<ThreadMessageResponse> => ({
+        ok: true,
+        mode: 'steer',
+        turnId: 'turn-1',
+        transcript
+      })
+    );
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'popup-thread',
+          provider: 'codex',
+          title: 'Popup thread',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: '',
+          model: 'gpt-5.5'
+        }}
+        liveTranscript={transcript}
+        sendMessage={sendPopupMessage}
+        deleteThread={vi.fn(async () => undefined)}
+        models={models}
+        selectedModelSlug="gpt-5.5"
+        selectedReasoningEffort="medium"
+        onChangeModel={vi.fn(async () => undefined)}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open thread actions' }));
+    expect(screen.getByRole('menuitem', { name: 'Delete thread' })).toBeInTheDocument();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('menuitem', { name: 'Delete thread' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open composer options' }));
+    expect(screen.getByRole('menuitemcheckbox', { name: /Plan mode/i })).toBeInTheDocument();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('menuitemcheckbox', { name: /Plan mode/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /GPT-5.5/i }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByText('GPT-5.4')).toBeInTheDocument();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByText('GPT-5.4')).not.toBeInTheDocument();
+  });
+
+  it('shows the sent message and Thinking state while waiting for agent startup', async () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const sendMessage = vi.fn(
+      (): Promise<ThreadMessageResponse> => new Promise<ThreadMessageResponse>(() => undefined)
+    );
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Slow startup',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Please check the slow send.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenCalledWith('running-1', 'Please check the slow send.')
+    );
+    expect(await screen.findByText('Please check the slow send.')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Thinking/ })).toHaveLength(2);
+    expect(screen.getByText(/Codex is thinking/i)).toBeInTheDocument();
+    expect(screen.queryByText('Beginning of conversation.')).not.toBeInTheDocument();
+    expect(screen.queryByText('No visible chat messages yet.')).not.toBeInTheDocument();
+  });
+
+  it('stays at the bottom when Thinking is replaced by the final assistant response', async () => {
+    const baseTranscript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'old-user',
+          role: 'user',
+          kind: 'message',
+          text: 'Old question',
+          createdAt: '2026-04-25T16:10:00Z'
+        },
+        {
+          id: 'old-assistant',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Old answer',
+          createdAt: '2026-04-25T16:11:00Z'
+        }
+      ]
+    };
+    const finalTranscript: ThreadTranscript = {
+      ...baseTranscript,
+      messages: [
+        ...baseTranscript.messages,
+        {
+          id: 'new-user',
+          role: 'user',
+          kind: 'message',
+          text: 'Please finish this.',
+          createdAt: '2026-04-25T16:12:00Z'
+        },
+        {
+          id: 'new-assistant',
+          role: 'assistant',
+          kind: 'message',
+          phase: 'final_answer',
+          text: 'Done with the fix.',
+          createdAt: '2026-04-25T16:13:00Z'
+        }
+      ]
+    };
+    const sendMessage = vi.fn(
+      (): Promise<ThreadMessageResponse> => new Promise<ThreadMessageResponse>(() => undefined)
+    );
+    const { container, rerender } = render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Slow startup',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={baseTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    const scroller = container.querySelector('.codex-thread-messages') as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { value: 1000, configurable: true },
+      clientHeight: { value: 300, configurable: true }
+    });
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Please finish this.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByText('Please finish this.')).toBeInTheDocument();
+    expect(screen.getByText(/Codex is thinking/i)).toBeInTheDocument();
+
+    scroller.scrollTop = 0;
+    rerender(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Slow startup',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={finalTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    expect(await screen.findByText('Done with the fix.')).toBeInTheDocument();
+    await waitFor(() => expect(scroller.scrollTop).toBe(1000));
   });
 
   it('keeps unsent composer drafts separated by thread', async () => {
@@ -4151,7 +4915,7 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Implement' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Implement plan' }));
 
     await waitFor(() =>
       expect(onApprovalDecision).toHaveBeenCalledWith(
@@ -5036,6 +5800,245 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.queryByRole('button', { name: /Worked for 2m 51s/ })).not.toBeInTheDocument();
   });
 
+  it('keeps pending sends isolated to their own thread while switching between threads', async () => {
+    const transcripts: Record<string, ThreadTranscript> = {
+      'thread-a': {
+        threadId: 'thread-a',
+        activeTurnId: null,
+        sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+        messages: [
+          {
+            id: 'a-user-1',
+            role: 'user',
+            kind: 'message',
+            text: 'Old A question',
+            createdAt: '2026-04-25T16:14:00Z'
+          },
+          {
+            id: 'a-assistant-1',
+            role: 'assistant',
+            kind: 'message',
+            text: 'Old A answer',
+            createdAt: '2026-04-25T16:15:00Z'
+          }
+        ]
+      },
+      'thread-b': {
+        threadId: 'thread-b',
+        activeTurnId: null,
+        sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+        messages: [
+          {
+            id: 'b-user-1',
+            role: 'user',
+            kind: 'message',
+            text: 'Old B question',
+            createdAt: '2026-04-25T16:16:00Z'
+          },
+          {
+            id: 'b-assistant-1',
+            role: 'assistant',
+            kind: 'message',
+            text: 'Old B answer',
+            createdAt: '2026-04-25T16:17:00Z'
+          }
+        ]
+      }
+    };
+    const fetchTranscript = vi.fn(async (threadId: string) => transcripts[threadId]!);
+    const sendMessage = vi.fn(
+      () =>
+        new Promise<{
+          ok: true;
+          mode: 'start';
+          turnId: string;
+          transcript: ThreadTranscript;
+        }>(() => undefined)
+    );
+
+    render(
+      <Dashboard
+        health={{
+          status: 'ok',
+          codexAppServer: 'connected',
+          version: '0.1.0',
+          uptimeSec: 60
+        }}
+        threads={[
+          {
+            threadId: 'thread-a',
+            title: 'Thread A',
+            workspace: 'CodexPulse',
+            status: 'idle',
+            lastActivityAt: '2026-04-25T16:15:00Z',
+            lastTurnSummary: ''
+          },
+          {
+            threadId: 'thread-b',
+            title: 'Thread B',
+            workspace: 'CodexPulse',
+            status: 'idle',
+            lastActivityAt: '2026-04-25T16:17:00Z',
+            lastTurnSummary: ''
+          }
+        ]}
+        fetchTranscript={fetchTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Open chat for Thread A/ }));
+    expect(await screen.findByText('Old A answer')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Pending only in A' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByText('Pending only in A')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open sidebar' }));
+    fireEvent.click(screen.getByRole('button', { name: /Open chat for Thread B/ }));
+    expect(await screen.findByText('Old B answer')).toBeInTheDocument();
+    expect(screen.queryByText('Pending only in A')).not.toBeInTheDocument();
+    expect(screen.queryByText('Sending to Codex...')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open sidebar' }));
+    fireEvent.click(screen.getByRole('button', { name: /Open chat for Thread A/ }));
+    expect(await screen.findByText('Pending only in A')).toBeInTheDocument();
+  });
+
+  it('keeps warm cached messages visible when a transcript refresh times out', async () => {
+    const warmTranscript: ThreadTranscript = {
+      threadId: 'thread-warm',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'warm-user',
+          role: 'user',
+          kind: 'message',
+          text: 'Warm cached question',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'warm-assistant',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Warm cached answer',
+          createdAt: '2026-04-25T16:15:00Z'
+        }
+      ]
+    };
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-warm',
+          title: 'Warm thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={warmTranscript}
+        fetchTranscript={vi.fn(async () => {
+          throw new TranscriptFetchTimeoutError();
+        })}
+      />
+    );
+
+    expect(await screen.findByText('Warm cached question')).toBeInTheDocument();
+    expect(screen.getByText('Warm cached answer')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText('Conversation is taking too long to load. Try again.')).not.toBeInTheDocument();
+    });
+  });
+
+  it('does not place old unseen tool calls under a new pending message', async () => {
+    const baseTranscript: ThreadTranscript = {
+      threadId: 'thread-stale-tools',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'old-user',
+          role: 'user',
+          kind: 'message',
+          text: 'Old question',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'old-answer',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Old answer',
+          createdAt: '2026-04-25T16:15:00Z'
+        }
+      ]
+    };
+    const staleTranscript: ThreadTranscript = {
+      ...baseTranscript,
+      messages: [
+        ...baseTranscript.messages,
+        {
+          id: 'old-unseen-tool',
+          role: 'activity',
+          kind: 'tool',
+          text: 'browser.screenshot completed from old turn',
+          createdAt: '2026-04-25T16:14:20Z'
+        }
+      ]
+    };
+    const sendMessage = vi.fn(
+      () =>
+        new Promise<{
+          ok: true;
+          mode: 'start';
+          turnId: string;
+          transcript: ThreadTranscript;
+        }>(() => undefined)
+    );
+
+    const { rerender } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-stale-tools',
+          title: 'Stale tools',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={baseTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'New pending message' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByText('New pending message')).toBeInTheDocument();
+
+    rerender(
+      <ThreadView
+        thread={{
+          threadId: 'thread-stale-tools',
+          title: 'Stale tools',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={staleTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText('New pending message')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /browser.screenshot completed from old turn/ })).not.toBeInTheDocument();
+  });
+
   it('groups agent work between chat messages and expands screenshots on demand', async () => {
     const transcript: ThreadTranscript = {
       threadId: 'running-1',
@@ -5301,6 +6304,78 @@ describe('Agent Pulse tablet UI', () => {
     expect(container.querySelector('.codex-message--assistant')).toBeNull();
   });
 
+  it('explains that Copilot handoffs start a local Copilot CLI chat', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'codex-thread-handoff',
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'codex-thread-handoff',
+          provider: 'codex',
+          title: 'Handoff target note',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-05-03T10:00:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        onCreateHandoffSummaryDraft={vi.fn(async () => ({
+          sourceThreadId: 'codex-thread-handoff',
+          sourceProvider: 'codex' as const,
+          targetProvider: 'claude-code' as const,
+          workspace: 'CodexPulse',
+          userInstruction: 'Investigate the failing handoff.',
+          summary: 'Summary',
+          prompt: 'Prompt',
+          evidence: {
+            filesMentioned: [],
+            messageCount: 0
+          }
+        }))}
+        onSendHandoff={vi.fn(async () => ({
+          handoffId: 'handoff-1',
+          sourceThreadId: 'codex-thread-handoff',
+          sourceProvider: 'codex' as const,
+          targetProvider: 'claude-code' as const,
+          targetThreadId: 'claude-code:thread-1',
+          targetTitle: 'Claude thread',
+          status: 'starting' as const,
+          latestProgressSummary: 'Starting handoff.',
+          lastActivityAt: '2026-05-03T10:00:00Z',
+          blockers: [],
+          workspace: 'CodexPulse',
+          userInstruction: 'Investigate the failing handoff.',
+          summary: 'Summary',
+          prompt: 'Prompt',
+          createdAt: '2026-05-03T10:00:00Z',
+          updatedAt: '2026-05-03T10:00:00Z'
+        }))}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open thread actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Hand off this task' }));
+    fireEvent.change(screen.getByLabelText('Target agent'), {
+      target: { value: 'copilot' }
+    });
+
+    expect(
+      screen.getByText(
+        'This starts a GitHub Copilot CLI chat. If Copilot later delegates work to its own cloud flow, that happens inside Copilot, not through a separate Agent Pulse target.'
+      )
+    ).toBeInTheDocument();
+  });
+
   it('summarizes hidden exploration and searches like OpenAssist', async () => {
     const transcript: ThreadTranscript = {
       threadId: 'running-1',
@@ -5378,6 +6453,290 @@ describe('Agent Pulse tablet UI', () => {
     expect(screen.getAllByRole('button', { name: /web_search completed/ })).toHaveLength(4);
     fireEvent.click(summary);
     expect(screen.queryByText(/web_search completed/)).not.toBeInTheDocument();
+  });
+
+  it('keeps Codex file changes attached to the agent response that made them', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'codex-file-thread',
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'First change',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'file-change-1',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          createdAt: '2026-04-25T16:14:10Z'
+        },
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'First answer.',
+          createdAt: '2026-04-25T16:14:20Z',
+          phase: 'final_answer'
+        } as ThreadTranscript['messages'][number],
+        {
+          id: 'user-2',
+          role: 'user',
+          kind: 'message',
+          text: 'Second change',
+          createdAt: '2026-04-25T16:15:00Z'
+        },
+        {
+          id: 'file-change-2',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          createdAt: '2026-04-25T16:15:10Z'
+        },
+        {
+          id: 'assistant-2',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Second answer.',
+          createdAt: '2026-04-25T16:15:20Z',
+          phase: 'final_answer'
+        } as ThreadTranscript['messages'][number]
+      ],
+      fileChanges: [
+        {
+          id: 'turn-1:file-change-1',
+          threadId: 'codex-file-thread',
+          turnId: 'turn-1',
+          itemId: 'file-change-1',
+          fileCount: 1,
+          linesAdded: 4,
+          linesDeleted: 1,
+          files: [{ path: 'apps/tablet/src/First.tsx', linesAdded: 4, linesDeleted: 1 }],
+          action: 'undo',
+          canUseCodexApplyPatch: true
+        },
+        {
+          id: 'turn-2:file-change-2',
+          threadId: 'codex-file-thread',
+          turnId: 'turn-2',
+          itemId: 'file-change-2',
+          fileCount: 1,
+          linesAdded: 2,
+          linesDeleted: 0,
+          files: [{ path: 'apps/tablet/src/Second.tsx', linesAdded: 2, linesDeleted: 0 }],
+          action: 'undo',
+          canUseCodexApplyPatch: true
+        }
+      ]
+    };
+
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'codex-file-thread',
+          provider: 'codex',
+          title: 'File changes',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:20Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+      />
+    );
+
+    const renderedOrder = Array.from(
+      container.querySelectorAll(
+        '.codex-message--user, .codex-activity-group, .codex-message--assistant, .codex-file-change-stack'
+      )
+    ).map((node) =>
+      node.classList.contains('codex-message--user')
+        ? 'user'
+        : node.classList.contains('codex-activity-group')
+          ? 'activity'
+          : node.classList.contains('codex-message--assistant')
+            ? 'assistant'
+            : 'files'
+    );
+    expect(renderedOrder).toEqual([
+      'user',
+      'activity',
+      'assistant',
+      'files',
+      'user',
+      'activity',
+      'assistant',
+      'files'
+    ]);
+    expect(screen.getByText('apps/tablet/src/First.tsx')).toBeInTheDocument();
+    expect(screen.getByText('apps/tablet/src/Second.tsx')).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByLabelText('Hide file changes')[0]!);
+    expect(screen.queryByText('apps/tablet/src/First.tsx')).not.toBeInTheDocument();
+    expect(screen.getByText('apps/tablet/src/Second.tsx')).toBeInTheDocument();
+  });
+
+  it('matches Codex file changes by turn id when item ids differ', () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'codex-turn-file-thread',
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Make a change',
+          turnId: 'turn-real',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'file-message-real',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          turnId: 'turn-real',
+          createdAt: '2026-04-25T16:14:10Z'
+        },
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Changed it.',
+          turnId: 'turn-real',
+          createdAt: '2026-04-25T16:14:20Z',
+          phase: 'final_answer'
+        } as ThreadTranscript['messages'][number]
+      ],
+      fileChanges: [
+        {
+          id: 'turn-real:patch-object-id',
+          threadId: 'codex-turn-file-thread',
+          turnId: 'turn-real',
+          itemId: 'patch-object-id',
+          fileCount: 1,
+          linesAdded: 1,
+          linesDeleted: 0,
+          files: [{ path: 'apps/tablet/src/TurnMatch.tsx', linesAdded: 1, linesDeleted: 0 }],
+          action: 'undo',
+          canUseCodexApplyPatch: true
+        }
+      ]
+    };
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'codex-turn-file-thread',
+          provider: 'codex',
+          title: 'Turn file changes',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:14:20Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+      />
+    );
+
+    expect(screen.getByText('apps/tablet/src/TurnMatch.tsx')).toBeInTheDocument();
+  });
+
+  it('shows only collapse and Codex undo actions on file-change cards', async () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'codex-undo-file-thread',
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          kind: 'message',
+          text: 'Make a change',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:00Z'
+        },
+        {
+          id: 'file-change-1',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:10Z'
+        },
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Changed it.',
+          turnId: 'turn-1',
+          createdAt: '2026-04-25T16:14:20Z',
+          phase: 'final_answer'
+        } as ThreadTranscript['messages'][number]
+      ],
+      fileChanges: [
+        {
+          id: 'turn-1:file-change-1',
+          threadId: 'codex-undo-file-thread',
+          turnId: 'turn-1',
+          itemId: 'file-change-1',
+          fileCount: 1,
+          linesAdded: 1,
+          linesDeleted: 0,
+          files: [{ path: 'apps/tablet/src/UndoOnly.tsx', linesAdded: 1, linesDeleted: 0 }],
+          action: 'undo',
+          canUseCodexApplyPatch: true
+        }
+      ]
+    };
+    const applyFileChangeAction = vi.fn(async () => undefined);
+    const openThreadInCodex = vi.fn(async () => undefined);
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'codex-undo-file-thread',
+          provider: 'codex',
+          title: 'Undo file changes',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:14:20Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        onApplyFileChangeAction={applyFileChangeAction}
+        openThreadInCodex={openThreadInCodex}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Hide file changes' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /review/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+    await waitFor(() =>
+      expect(applyFileChangeAction).toHaveBeenCalledWith('turn-1:file-change-1', 'undo')
+    );
+    expect(openThreadInCodex).not.toHaveBeenCalled();
   });
 
   it('keeps leading live activity attached to the first visible user message', () => {
@@ -5641,7 +7000,8 @@ describe('Agent Pulse tablet UI', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Delete thread' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open thread actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete thread' }));
 
     await waitFor(() => expect(deleteThread).toHaveBeenCalledWith('claude-code:thread-delete'));
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/local Claude history/i));
