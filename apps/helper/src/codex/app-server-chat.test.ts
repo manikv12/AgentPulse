@@ -248,6 +248,45 @@ describe('Codex App Server same-thread chat', () => {
     expect(liveStateChanges).toContain('thread-1');
   });
 
+  it('uses the goal update turn id when stopping an active goal thread', async () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+
+    transport.emitNotification({
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'thread-goal',
+        turnId: 'goal-turn-1',
+        goal: {
+          threadId: 'thread-goal',
+          objective: 'Keep working until stopped',
+          status: 'active',
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1_777_000_000,
+          updatedAt: 1_777_000_000
+        }
+      }
+    });
+
+    const visible = chat.applyLiveState(emptyTranscript('thread-goal'), 'thread-goal');
+
+    expect(chat.isThreadStreaming('thread-goal')).toBe(true);
+    expect(visible.activeTurnId).toBe('goal-turn-1');
+
+    await chat.interruptTurn('thread-goal');
+
+    expect(transport.calls).toContainEqual({
+      method: 'turn/interrupt',
+      params: {
+        threadId: 'thread-goal',
+        turnId: 'goal-turn-1'
+      }
+    });
+    expect(chat.isThreadStreaming('thread-goal')).toBe(false);
+  });
+
   it('keeps a thread working when a stale idle status arrives before turn completion', () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);

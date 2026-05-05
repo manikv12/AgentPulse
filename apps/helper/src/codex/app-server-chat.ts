@@ -1242,8 +1242,18 @@ export class CodexAppServerChat {
 
     if (notification.method === 'thread/goal/updated') {
       const goal = normalizeAppServerGoal(recordFromUnknown(params.goal));
+      const goalTurnId = stringField(params, 'turnId');
       state.goal = goal;
       this.resetGoalTokenBaseline(threadId, goal);
+      if (goal?.status === 'active' && goalTurnId) {
+        state.activeTurnId = goalTurnId;
+        state.isStreaming = true;
+        state.isCompacting = false;
+      } else if (goalTurnId && state.activeTurnId === goalTurnId) {
+        state.activeTurnId = null;
+        state.isStreaming = false;
+        state.isCompacting = false;
+      }
       this.emitLiveEvent({
         type: 'thread/goal/changed',
         payload: { threadId, goal }
