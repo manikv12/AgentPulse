@@ -820,18 +820,31 @@ function createApp(
       .catch(() => undefined);
   };
 
+  const watchFinishedNotification = async (threadId: string): Promise<WatchPushNotification> => {
+    const thread = (await listAllThreads().catch(() => ({ threads: [] as Thread[] }))).threads
+      .find((candidate) => candidate.threadId === threadId);
+    const provider = thread ? providerForMemoryThread(thread) : providerForThreadId(threadId);
+    const providerName = displayNameForProvider(provider);
+    const cachedTranscript = transcriptCache.get(threadId);
+    return buildWatchFinishedNotification(threadId, providerName, thread, cachedTranscript);
+  };
+
   const maybeNotifyWatchOfStatusChange = (threadId: string, nextStatus: Thread['status']): void => {
     const previous = lastStatusByThread.get(threadId);
     lastStatusByThread.set(threadId, nextStatus);
     if (previous === nextStatus) return;
 
     if (nextStatus === 'idle' && (previous === 'running' || previous === 'compacting')) {
-      notifyWatchDevices({
-        threadId,
-        kind: 'finished',
-        title: 'Agent stopped',
-        body: 'The agent stopped working. Review the result on your watch.'
-      });
+      void watchFinishedNotification(threadId)
+        .then((notification) => notifyWatchDevices(notification))
+        .catch(() =>
+          notifyWatchDevices({
+            threadId,
+            kind: 'finished',
+            title: 'Agent stopped',
+            body: 'Review the result on your watch.'
+          })
+        );
       return;
     }
     if (nextStatus === 'error') {
@@ -5111,6 +5124,55 @@ function watchApprovalNotificationSummary(requests: PendingApprovalRequest[]): {
     body: truncateForSummary(bodyParts.join(' - ') || 'Tap Approve or open the thread to review it.', 160),
     approvalType
   };
+}
+
+function buildWatchFinishedNotification(
+  threadId: string,
+  providerName: string,
+  thread: Thread | undefined,
+  transcript: ThreadTranscript | undefined
+): WatchPushNotification {
+  const project = watchThreadProjectLabel(thread);
+  const snippet = watchFinishedMessageSnippet(thread, transcript);
+  const body = [project, snippet]
+    .filter((part): part is string => Boolean(part))
+    .join(': ');
+  return {
+    threadId,
+    kind: 'finished',
+    title: `${providerName} finished`,
+    body: truncateForSummary(body || 'Review the result on your watch.', 180)
+  };
+}
+
+function watchThreadProjectLabel(thread: Thread | undefined): string | undefined {
+  if (!thread) {
+    return undefined;
+  }
+  const workspacePath = thread.workspacePath?.trim();
+  if (workspacePath && thread.workspaceKind !== 'chat') {
+    return path.basename(workspacePath) || workspacePath;
+  }
+  const workspace = thread.workspace.trim();
+  if (workspace && workspace.toLowerCase() !== 'chat' && workspace.toLowerCase() !== 'chats') {
+    return workspace;
+  }
+  return thread.title.trim() || undefined;
+}
+
+function watchFinishedMessageSnippet(
+  thread: Thread | undefined,
+  transcript: ThreadTranscript | undefined
+): string | undefined {
+  const transcriptMessage = [...(transcript?.messages ?? [])]
+    .reverse()
+    .find((message) => message.role === 'assistant' && message.kind === 'message' && message.text.trim());
+  const text = transcriptMessage?.text || thread?.lastTurnSummary;
+  const normalized = text?.replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized === 'No summary yet.') {
+    return undefined;
+  }
+  return truncateForSummary(normalized, 120);
 }
 
 function mergePendingApprovalRequests(

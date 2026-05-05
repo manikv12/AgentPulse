@@ -6041,7 +6041,8 @@ describe('Agent Pulse helper API', () => {
       threadId: 'thread-finished-watch-push',
       provider: 'codex',
       title: 'Finished thread',
-      workspace: 'chat',
+      workspace: 'CodexPulse',
+      workspacePath: '/Users/test/Projects/CodexPulse',
       status: 'idle',
       lastActivityAt: '2026-05-04T12:00:00Z',
       lastTurnSummary: 'Ready to review'
@@ -6099,8 +6100,8 @@ describe('Agent Pulse helper API', () => {
         expect.objectContaining({
           threadId: thread.threadId,
           kind: 'finished',
-          title: 'Agent stopped',
-          body: 'The agent stopped working. Review the result on your watch.'
+          title: 'Codex finished',
+          body: 'CodexPulse: Ready to review'
         })
       );
 
@@ -6260,7 +6261,7 @@ describe('Agent Pulse helper API', () => {
         expect.objectContaining({
           threadId: thread.threadId,
           kind: 'finished',
-          title: 'Agent stopped'
+          title: expect.stringMatching(/^(Codex|Claude Code|GitHub Copilot) finished$/)
         })
       );
     } finally {
