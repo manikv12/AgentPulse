@@ -14,6 +14,26 @@ log() {
   echo "[agent-pulse] $*"
 }
 
+filter_cloudflared_logs() {
+  grep -Ev ' INF (Tunnel connection curve preferences|Registered tunnel connection)\b' || true
+}
+
+run_cloudflared() {
+  cloudflared "$@" > >(filter_cloudflared_logs) 2> >(filter_cloudflared_logs >&2)
+}
+
+load_local_env() {
+  local env_path="$repo_root/.env.local"
+  if [[ ! -f "$env_path" ]]; then
+    return
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_path"
+  set +a
+}
+
 read_settings() {
   node --input-type=module - "$settings_path" <<'NODE'
 import { readFileSync } from 'node:fs';
@@ -142,6 +162,8 @@ wait_for_pid_exit() {
 }
 
 echo
+load_local_env
+
 log "Removing previous helper build so the next start always loads fresh code..."
 rm -rf "$repo_root/apps/helper/dist"
 
@@ -298,10 +320,10 @@ ingress:
 EOF
 
   log "Cloudflare tunnel target: $tunnel_origin"
-  cloudflared tunnel --protocol "$tunnel_protocol" --config "$dev_config_path" run "$tunnel_name"
+  run_cloudflared tunnel --protocol "$tunnel_protocol" --config "$dev_config_path" run "$tunnel_name"
   exit $?
 fi
 
 origin_url="$tunnel_origin"
 log "Starting Cloudflare quick tunnel for $origin_url..."
-cloudflared tunnel --protocol "$tunnel_protocol" --url "$origin_url"
+run_cloudflared tunnel --protocol "$tunnel_protocol" --url "$origin_url"

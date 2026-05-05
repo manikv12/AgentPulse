@@ -218,7 +218,29 @@ describe('shared schemas', () => {
       modelSlug: 'gpt-5.2',
       reasoningEffort: 'high'
     });
+    expect(
+      ThreadCreateRequestSchema.parse({
+        location: 'chat',
+        permissionMode: 'autoReview'
+      })
+    ).toEqual({
+      provider: 'codex',
+      location: 'chat',
+      permissionMode: 'autoReview'
+    });
     expect(() => ThreadCreateRequestSchema.parse({})).toThrow();
+    expect(() =>
+      ThreadCreateRequestSchema.parse({
+        location: 'chat',
+        permissionMode: 'sandbox'
+      })
+    ).toThrow();
+    expect(() =>
+      ThreadCreateRequestSchema.parse({
+        location: 'chat',
+        permissionMode: 'auto'
+      })
+    ).toThrow();
     expect(() =>
       ThreadCreateRequestSchema.parse({
         location: 'chat',

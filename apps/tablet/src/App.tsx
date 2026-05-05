@@ -10,6 +10,7 @@ import {
   type CatalogSkill,
   type ChatAttachment,
   type CollaborationModeKind,
+  type SelectableCodexPermissionModeId,
   type AgentProvider,
   type HelperHealth,
   type ApprovalInboxItem,
@@ -21,6 +22,7 @@ import {
   type Project,
   type RemoteAccessSettings,
   type Thread,
+  type ThreadGoal,
   type ThreadFileChangeSummary,
   type ThreadListGroup,
   type TouchCommand,
@@ -57,6 +59,7 @@ import {
   clearAdminToken,
   clearSession,
   checkRemoteAccess,
+  clearThreadGoal,
   createTranscriptCommentDraft,
   createHandoffSummaryDraft,
   deleteHandoff,
@@ -69,6 +72,7 @@ import {
   fetchHealth,
   fetchHandoffs,
   fetchTouchCommands,
+  fetchThreadGoal,
   fetchProjectFiles,
   fetchProjects,
   fetchOlderThreadMessages,
@@ -93,6 +97,7 @@ import {
   sendThreadMessage,
   sendHandoff,
   startThread,
+  updateThreadGoal,
   stopThreadWork,
   transcribeVoiceAudio,
   updateRemoteAccess,
@@ -132,6 +137,7 @@ const SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS = [750, 1_500];
 const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
 const THREAD_LIST_PAGE_SIZE = 6;
 const THREAD_LIST_CHAT_GROUP_KEY = 'agent-pulse-chats';
+const GOAL_START_MESSAGE = 'Please start working on the goal.';
 
 const ADMIN_FLEX_SCREENS = new Set<AppScreen>(['settings', 'admin-login', 'chooser']);
 const BACKGROUND_STABLE_SCREENS = new Set<AppScreen>(['settings', 'admin-login']);
@@ -234,6 +240,20 @@ function transcriptAfterStop(transcript: ThreadTranscript): ThreadTranscript {
             reason: 'ready',
             label: 'Ready'
           }
+  });
+}
+
+function transcriptAfterApprovalCleared(transcript: ThreadTranscript): ThreadTranscript {
+  if (transcript.sendState.reason !== 'waiting_on_approval') {
+    return transcript;
+  }
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    sendState: {
+      canSend: false,
+      reason: 'thread_changed',
+      label: `${providerLabel(transcript.provider)} is working`
+    }
   });
 }
 
@@ -1205,14 +1225,38 @@ function upsertTranscriptCache(
     !transcript.usage && previous?.usage
       ? { ...transcript, usage: previous.usage }
       : transcript;
+  const withStableGoal =
+    stableTranscript.goal === undefined && previous?.goal !== undefined
+      ? { ...stableTranscript, goal: previous.goal }
+      : stableTranscript;
 
-  if (previous && transcriptLooksOlder(stableTranscript, previous)) {
+  if (previous && transcriptLooksOlder(withStableGoal, previous)) {
     return current;
   }
 
   return {
     ...current,
-    [transcript.threadId]: cacheableTranscript(stableTranscript)
+    [transcript.threadId]: cacheableTranscript(withStableGoal)
+  };
+}
+
+function upsertTranscriptGoal(
+  current: Record<string, ThreadTranscript>,
+  threadId: string,
+  goal: ThreadGoal | null
+): Record<string, ThreadTranscript> {
+  const previous = current[threadId];
+  if (!previous) {
+    return current;
+  }
+  return {
+    ...current,
+    [threadId]: cacheableTranscript(
+      ThreadTranscriptSchema.parse({
+        ...previous,
+        goal
+      })
+    )
   };
 }
 
@@ -1283,12 +1327,22 @@ function transcriptHasFreshPostSendMessage(
   transcript: ThreadTranscript,
   guard: ActiveSendGuard
 ): boolean {
+  const activeTurnId = transcript.activeTurnId;
   return transcript.messages.some((message) => {
     if (guard.baselineMessageIds.has(message.id)) {
       return false;
     }
+    if (message.role === 'user') {
+      return false;
+    }
+    if (message.role === 'assistant' && message.kind === 'message') {
+      return false;
+    }
+    if (activeTurnId && message.turnId) {
+      return message.turnId === activeTurnId;
+    }
     const createdAt = Date.parse(message.createdAt);
-    return !Number.isFinite(createdAt) || createdAt >= guard.startedAt - 10_000;
+    return Number.isFinite(createdAt) && createdAt >= guard.startedAt;
   });
 }
 
@@ -1398,6 +1452,8 @@ export function App() {
   const [transcripts, setTranscripts] = useState<Record<string, ThreadTranscript>>(() =>
     readCachedTranscripts(loadSession())
   );
+  const threadsRef = useRef(threads);
+  const transcriptsRef = useRef(transcripts);
   const activeSendGuardsRef = useRef<Map<string, ActiveSendGuard>>(new Map());
   const [threadModels, setThreadModels] = useState<Record<string, string>>({});
   const [threadReasoningEfforts, setThreadReasoningEfforts] = useState<Record<string, string>>({});
@@ -1477,6 +1533,15 @@ export function App() {
   // local optimistic state so taps register instantly even before the broadcast
   // round-trips.
   const [seenThreadActivity, setSeenThreadActivity] = useState<Record<string, number>>({});
+  const [seenThreadActivityLoaded, setSeenThreadActivityLoaded] = useState(false);
+
+  useEffect(() => {
+    threadsRef.current = threads;
+  }, [threads]);
+
+  useEffect(() => {
+    transcriptsRef.current = transcripts;
+  }, [transcripts]);
 
   const markThreadWorking = useCallback((threadId: string) => {
     setStreamingThreadIds((current) => {
@@ -1576,7 +1641,13 @@ export function App() {
       void (async () => {
         try {
           const transcript = await fetchThreadTranscript(currentSession, threadId);
-          setTranscripts((current) => upsertTranscriptCache(current, transcript));
+          const guard = activeSendGuardsRef.current.get(threadId);
+          if (shouldAcceptTranscriptForActiveSend(transcript, guard)) {
+            setTranscripts((current) => upsertTranscriptCache(current, transcript));
+            if (guard && transcriptConfirmsActiveSend(transcript, guard)) {
+              activeSendGuardsRef.current.delete(threadId);
+            }
+          }
           applyTranscriptActivityState(transcript);
           applyTranscriptModel(threadId, transcript.model, transcript.reasoningEffort);
         } catch {
@@ -1608,8 +1679,10 @@ export function App() {
   );
 
   const requestSettledTranscriptRefresh = useCallback(
-    (threadId: string) => {
-      requestTranscriptRefresh(threadId);
+    (threadId: string, options: { immediate?: boolean } = {}) => {
+      if (options.immediate !== false) {
+        requestTranscriptRefresh(threadId);
+      }
       const timersByThread = settledTranscriptRefreshTimersRef.current;
       for (const timer of timersByThread.get(threadId) ?? []) {
         window.clearTimeout(timer);
@@ -1631,6 +1704,51 @@ export function App() {
       timersByThread.set(threadId, timers);
     },
     [requestTranscriptRefresh]
+  );
+
+  const clearApprovalWaitingState = useCallback(
+    (threadId: string) => {
+      const threadIsWaiting = threadsRef.current.some(
+        (thread) => thread.threadId === threadId && thread.status === 'waiting_approval'
+      );
+      const transcriptIsWaiting =
+        transcriptsRef.current[threadId]?.sendState.reason === 'waiting_on_approval';
+      if (!threadIsWaiting && !transcriptIsWaiting) {
+        return;
+      }
+      setThreads((current) =>
+        current.map((thread) =>
+          thread.threadId === threadId && thread.status === 'waiting_approval'
+            ? { ...thread, status: 'running' }
+            : thread
+        )
+      );
+      setHandoffs((current) =>
+        current.map((handoff) =>
+          handoff.targetThreadId === threadId && handoff.status === 'waiting_approval'
+            ? {
+                ...handoff,
+                status: handoffStatusFromThread('running'),
+                blockers: [],
+                updatedAt: new Date().toISOString()
+              }
+            : handoff
+        )
+      );
+      setTranscripts((current) => {
+        const transcript = current[threadId];
+        if (!transcript) {
+          return current;
+        }
+        const nextTranscript = transcriptAfterApprovalCleared(transcript);
+        if (nextTranscript === transcript) {
+          return current;
+        }
+        return upsertTranscriptCache(current, nextTranscript);
+      });
+      requestSettledTranscriptRefresh(threadId, { immediate: false });
+    },
+    [requestSettledTranscriptRefresh]
   );
 
   useEffect(
@@ -1747,12 +1865,16 @@ export function App() {
       setTouchCommands([]);
       setTranscripts({});
       setLiveAssistantTextByThread({});
+      setSeenThreadActivity({});
+      setSeenThreadActivityLoaded(false);
       setThreadsLoaded(false);
       setActiveThreadId(undefined);
       return;
     }
 
     setThreads(readCachedThreads(session));
+    setSeenThreadActivity({});
+    setSeenThreadActivityLoaded(false);
     setThreadListGroups([]);
     setThreadGroupLimits((current) => (Object.keys(current).length === 0 ? current : {}));
     setTranscripts(readCachedTranscripts(session));
@@ -1806,6 +1928,8 @@ export function App() {
         setTouchCommands([]);
         setTranscripts({});
         setLiveAssistantTextByThread({});
+        setSeenThreadActivity({});
+        setSeenThreadActivityLoaded(false);
         setThreadsLoaded(false);
         setActiveThreadId(undefined);
         setScreen(screenAfterClearingSession);
@@ -1889,6 +2013,10 @@ export function App() {
         } catch {
           // Soft-fail — Dashboard falls back to its localStorage copy when the
           // override is empty.
+        } finally {
+          if (sameSession(loadSession(), requestSession)) {
+            setSeenThreadActivityLoaded(true);
+          }
         }
       })();
       fetchCatalogPlugins(requestSession)
@@ -1986,6 +2114,8 @@ export function App() {
         setTouchCommands([]);
         setTranscripts({});
         setLiveAssistantTextByThread({});
+        setSeenThreadActivity({});
+        setSeenThreadActivityLoaded(false);
         setThreadsLoaded(false);
         setActiveThreadId(undefined);
         setScreen(screenAfterClearingSession);
@@ -2123,6 +2253,12 @@ export function App() {
           );
         }
 
+        if (liveEvent.type === 'thread/goal/changed') {
+          setTranscripts((current) =>
+            upsertTranscriptGoal(current, liveEvent.payload.threadId, liveEvent.payload.goal)
+          );
+        }
+
         if (liveEvent.type === 'thread/status/changed') {
           const { threadId, status } = liveEvent.payload;
           setThreads((current) =>
@@ -2147,6 +2283,26 @@ export function App() {
                 : handoff
             )
           );
+          if (status !== 'waiting_approval') {
+            setThreadPendingRequests((current) => {
+              const list = current[threadId] ?? [];
+              if (list.length === 0) {
+                return current;
+              }
+              return { ...current, [threadId]: [] };
+            });
+            setTranscripts((current) => {
+              const transcript = current[threadId];
+              if (!transcript) {
+                return current;
+              }
+              const nextTranscript = transcriptAfterApprovalCleared(transcript);
+              if (nextTranscript === transcript) {
+                return current;
+              }
+              return upsertTranscriptCache(current, nextTranscript);
+            });
+          }
           if (status === 'running' || status === 'waiting_approval' || status === 'compacting') {
             markThreadWorking(threadId);
           } else {
@@ -2207,6 +2363,16 @@ export function App() {
             ...current,
             [threadId]: summaries
           }));
+          if (summaries.length > 0) {
+            setThreads((current) =>
+              current.map((thread) =>
+                thread.threadId === threadId ? { ...thread, status: 'waiting_approval' } : thread
+              )
+            );
+            markThreadWorking(threadId);
+          } else {
+            clearApprovalWaitingState(threadId);
+          }
         }
 
         if (liveEvent.type === 'thread/file-changes/changed') {
@@ -2238,6 +2404,7 @@ export function App() {
             }
             return { ...current, [threadId]: seenAt };
           });
+          setSeenThreadActivityLoaded(true);
         }
 
         if (liveEvent.type === 'handoff/changed') {
@@ -2306,6 +2473,7 @@ export function App() {
     sessionRecoverySuspended,
     applyTranscriptActivityState,
     applyTranscriptModel,
+    clearApprovalWaitingState,
     markThreadReady,
     markThreadWorking,
     requestTranscriptRefresh,
@@ -2573,7 +2741,11 @@ export function App() {
     async (
       threadId: string,
       text: string,
-      options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
+      options?: {
+        collaborationMode?: CollaborationModeKind;
+        permissionMode?: SelectableCodexPermissionModeId;
+        attachments?: ChatAttachment[];
+      }
     ) => {
       if (!session) {
         return Promise.reject(new Error('Not connected.'));
@@ -2618,6 +2790,60 @@ export function App() {
       return result;
     },
     [session, transcripts, applyTranscriptActivityState, applyTranscriptModel]
+  );
+
+  const mergeThreadGoal = useCallback((threadId: string, goal: ThreadGoal | null) => {
+    setTranscripts((current) => upsertTranscriptGoal(current, threadId, goal));
+  }, []);
+
+  const handleFetchThreadGoal = useCallback(
+    async (threadId: string): Promise<ThreadGoal | null> => {
+      if (!session) {
+        throw new Error('Not connected.');
+      }
+      const goal = await fetchThreadGoal(session, threadId);
+      mergeThreadGoal(threadId, goal);
+      return goal;
+    },
+    [session, mergeThreadGoal]
+  );
+
+  const handleUpdateThreadGoal = useCallback(
+    async (
+      threadId: string,
+      input: { objective?: string; status?: ThreadGoal['status']; tokenBudget?: number | null }
+    ): Promise<ThreadGoal> => {
+      if (!session) {
+        throw new Error('Not connected.');
+      }
+      const goal = await updateThreadGoal(session, threadId, input);
+      mergeThreadGoal(threadId, goal);
+      const shouldSendGoalStartMessage =
+        typeof input.objective === 'string' &&
+        input.objective.trim().length > 0 &&
+        (input.status ?? 'active') === 'active';
+      if (shouldSendGoalStartMessage) {
+        try {
+          await handleSendMessage(threadId, GOAL_START_MESSAGE);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`Goal was saved, but Codex did not accept the start message: ${detail}`);
+        }
+      }
+      return goal;
+    },
+    [session, mergeThreadGoal, handleSendMessage]
+  );
+
+  const handleClearThreadGoal = useCallback(
+    async (threadId: string): Promise<void> => {
+      if (!session) {
+        throw new Error('Not connected.');
+      }
+      await clearThreadGoal(session, threadId);
+      mergeThreadGoal(threadId, null);
+    },
+    [session, mergeThreadGoal]
   );
 
   const handleTranscribeVoiceAudio = useCallback(
@@ -2896,6 +3122,9 @@ export function App() {
                 }
               : undefined
           }
+          onFetchThreadGoal={handleFetchThreadGoal}
+          onUpdateThreadGoal={handleUpdateThreadGoal}
+          onClearThreadGoal={handleClearThreadGoal}
           onApprovalDecision={
             session
               ? async (threadId, requestId, method, decision) => {
@@ -2910,10 +3139,12 @@ export function App() {
                   setApprovalInboxItems((current) =>
                     current.filter((item) => item.threadId !== threadId || item.requestId !== requestId)
                   );
+                  clearApprovalWaitingState(threadId);
                 }
               : undefined
           }
           seenThreadActivityOverride={seenThreadActivity}
+          reviewStateReady={seenThreadActivityLoaded}
           onMarkThreadSeen={handleMarkThreadSeen}
         />
         {message ? <div className="toast">{message}</div> : null}
@@ -2933,6 +3164,10 @@ export function App() {
     handleOpenAdmin,
     handlePair,
     handleSendMessage,
+    handleFetchThreadGoal,
+    handleUpdateThreadGoal,
+    handleClearThreadGoal,
+    clearApprovalWaitingState,
     handleTranscribeVoiceAudio,
     handleStopWork,
     handleOpenThreadInCodex,
@@ -2961,6 +3196,7 @@ export function App() {
     threadsLoaded,
     transcripts,
     seenThreadActivity,
+    seenThreadActivityLoaded,
     handleMarkThreadSeen
   ]);
 

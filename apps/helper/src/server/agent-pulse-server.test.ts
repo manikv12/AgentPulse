@@ -2,7 +2,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import type { CatalogModel, LiveEvent, Project, RemoteAccessSettings, Thread, ThreadTranscript } from '@agent-pulse/shared';
+import type {
+  CatalogModel,
+  LiveEvent,
+  PendingApprovalRequest,
+  Project,
+  RemoteAccessSettings,
+  Thread,
+  ThreadTranscript
+} from '@agent-pulse/shared';
 import { WebSocket, type RawData } from 'ws';
 import { AdminAuth } from '../auth/admin';
 import { DeviceRegistry, MemoryDeviceStore, PairingManager } from '../auth/pairing';
@@ -54,6 +62,127 @@ describe('Agent Pulse helper API', () => {
       expect(alias.status).toBe(200);
       await expect(canonical.json()).resolves.toMatchObject({ status: 'ok', version: '0.1.0' });
       await expect(alias.json()).resolves.toMatchObject({ status: 'ok', version: '0.1.0' });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('proxies Codex goal get, set, and clear through the app-server bridge', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const goal = {
+      threadId: 'thread-goal',
+      objective: 'Finish the integration.',
+      status: 'active' as const,
+      tokenBudget: 100000,
+      tokensUsed: 1200,
+      timeUsedSeconds: 60,
+      createdAt: 1777900000,
+      updatedAt: 1777900060
+    };
+    const appServer = {
+      isConnected: () => true,
+      readGoal: vi.fn(async () => goal),
+      setGoal: vi.fn(async (
+        _threadId: string,
+        input: { objective?: string; status?: typeof goal.status; tokenBudget?: number | null }
+      ) => ({
+        ...goal,
+        objective: input.objective ?? goal.objective,
+        status: input.status ?? goal.status,
+        tokenBudget: input.tokenBudget ?? goal.tokenBudget
+      })),
+      clearGoal: vi.fn(async () => true),
+      readTranscript: vi.fn(async (): Promise<ThreadTranscript> => ({
+        threadId: 'thread-goal',
+        activeTurnId: null,
+        sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+        messages: []
+      })),
+      sendMessage: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+
+      const getResponse = await fetch(`${server.url}/threads/thread-goal/goal`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(getResponse.status).toBe(200);
+      await expect(getResponse.json()).resolves.toMatchObject({ goal });
+
+      const setResponse = await fetch(`${server.url}/threads/thread-goal/goal`, {
+        method: 'PUT',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          objective: 'Ship goal mode.',
+          status: 'active',
+          tokenBudget: 200000
+        })
+      });
+      expect(setResponse.status).toBe(200);
+      await expect(setResponse.json()).resolves.toMatchObject({
+        goal: {
+          objective: 'Ship goal mode.',
+          status: 'active',
+          tokenBudget: 200000
+        }
+      });
+      expect(appServer.setGoal).toHaveBeenCalledWith('thread-goal', {
+        objective: 'Ship goal mode.',
+        status: 'active',
+        tokenBudget: 200000
+      });
+
+      const clearResponse = await fetch(`${server.url}/threads/thread-goal/goal`, {
+        method: 'DELETE',
+        headers: authHeaders(token, deviceId)
+      });
+      expect(clearResponse.status).toBe(200);
+      await expect(clearResponse.json()).resolves.toEqual({ cleared: true });
+      expect(appServer.clearGoal).toHaveBeenCalledWith('thread-goal');
+
+      const slashResponse = await fetch(`${server.url}/threads/thread-goal/messages`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ text: '/goal Finish this from the tablet.' })
+      });
+      expect(slashResponse.status).toBe(200);
+      await expect(slashResponse.json()).resolves.toMatchObject({
+        transcript: {
+          goal: {
+            objective: 'Finish this from the tablet.',
+            status: 'active'
+          }
+        }
+      });
+      expect(appServer.setGoal).toHaveBeenLastCalledWith('thread-goal', {
+        objective: 'Finish this from the tablet.',
+        status: 'active'
+      });
     } finally {
       await server.stop();
     }
@@ -728,6 +857,16 @@ describe('Agent Pulse helper API', () => {
         threads: threads.slice(0, 12),
         groups: [{ groupKey: workspacePath, total: 13, visible: 12 }]
       });
+
+      const watchSizedResponse = await fetch(`${server.url}/threads/list?limit=5`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(watchSizedResponse.status).toBe(200);
+      await expect(watchSizedResponse.json()).resolves.toMatchObject({
+        threads: threads.slice(0, 5),
+        hasMore: true
+      });
     } finally {
       await server.stop();
     }
@@ -1393,6 +1532,7 @@ describe('Agent Pulse helper API', () => {
   it('rejects WebSocket upgrades from an untrusted Origin', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const settings = {
       port: await pickFreeHighPort(),
       lanEnabled: false,
@@ -1426,7 +1566,46 @@ describe('Agent Pulse helper API', () => {
       });
 
       await expect(waitForSocketRejected(websocket)).resolves.toBe(true);
+      expect(warnSpy).not.toHaveBeenCalled();
     } finally {
+      warnSpy.mockRestore();
+      await server.stop();
+    }
+  });
+
+  it('rejects invalid WebSocket auth without noisy console warnings', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const params = new URLSearchParams({
+        token: 'invalid-token',
+        deviceId: 'device-1',
+        fingerprint: 'fingerprint-123'
+      });
+      const websocket = new WebSocket(`${server.url.replace('http:', 'ws:')}/events?${params}`);
+
+      await expect(waitForSocketRejected(websocket)).resolves.toBe(true);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
       await server.stop();
     }
   });
@@ -2269,6 +2448,13 @@ describe('Agent Pulse helper API', () => {
           }
         ]
       });
+
+      const limitedResponse = await fetch(`${server.url}/threads/thread-1/transcript?view=watch&limit=2`, {
+        headers: authHeaders(token, deviceId)
+      });
+      expect(limitedResponse.status).toBe(200);
+      const limitedBody = (await limitedResponse.json()) as ThreadTranscript;
+      expect(limitedBody.messages.map((message) => message.id)).toEqual(['assistant-final-1', 'user-2']);
     } finally {
       await server.stop();
     }
@@ -2484,6 +2670,46 @@ describe('Agent Pulse helper API', () => {
       });
       expect(authed.status).toBe(200);
     } finally {
+      await server.stop();
+    }
+  });
+
+  it('rejects malformed device session recovery without logging a Zod stack', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const response = await fetch(`${server.url}/device/session/recover`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: 'device-1',
+          fingerprint: 'fp'
+        })
+      });
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toEqual({ error: 'invalid' });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
       await server.stop();
     }
   });
@@ -3117,12 +3343,13 @@ describe('Agent Pulse helper API', () => {
       },
       turnId: 'turn-7'
     };
+    const pendingApprovals: PendingApprovalRequest[] = [pendingApproval];
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(),
       sendMessage: vi.fn(),
       getPendingApprovalRequests: (threadId: string) =>
-        threadId === 'thread-approval' ? [pendingApproval] : [],
+        threadId === 'thread-approval' ? pendingApprovals : [],
       respondToApproval: vi.fn(async () => undefined)
     };
     const mirror = {
@@ -3189,6 +3416,45 @@ describe('Agent Pulse helper API', () => {
       );
       expect(mirror.respondToApproval).not.toHaveBeenCalled();
       expect(opener.openThread).not.toHaveBeenCalled();
+
+      const browserApproval = {
+        id: 'browser-use-approval-1',
+        method: 'mcpServer/elicitation/request',
+        params: {
+          threadId: 'thread-approval',
+          turnId: 'turn-8',
+          serverName: 'browser-use',
+          message: 'Allow Browser Use to open a page?'
+        },
+        turnId: 'turn-8'
+      };
+      pendingApprovals.splice(0, pendingApprovals.length, browserApproval);
+      appServer.respondToApproval.mockClear();
+      mirror.respondToApproval.mockClear();
+
+      const browserResponse = await fetch(
+        `${server.url}/threads/thread-approval/approvals/browser-use-approval-1`,
+        {
+          method: 'POST',
+          headers: {
+            ...authHeaders(token, deviceId),
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            method: 'mcpServer/elicitation/request',
+            decision: { action: 'accept', content: {}, _meta: null }
+          })
+        }
+      );
+
+      expect(browserResponse.status).toBe(200);
+      expect(appServer.respondToApproval).toHaveBeenCalledWith(
+        'thread-approval',
+        'browser-use-approval-1',
+        'mcpServer/elicitation/request',
+        { action: 'accept', content: {}, _meta: null }
+      );
+      expect(mirror.respondToApproval).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -5211,6 +5477,24 @@ describe('Agent Pulse helper API', () => {
         model: 'gpt-5.6',
         reasoningEffort: 'high'
       });
+
+      appServer.startThread.mockClear();
+      const permissionResponse = await fetch(`${server.url}/threads/new`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          projectId: 'project-codexpulse',
+          permissionMode: 'autoReview'
+        })
+      });
+
+      expect(permissionResponse.status).toBe(200);
+      expect(appServer.startThread).toHaveBeenCalledWith(projectPath, {
+        permissionMode: 'autoReview'
+      });
     } finally {
       await server.stop();
     }
@@ -5694,6 +5978,297 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('stores watch push registration metadata for later delivery', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/devices/watch-push`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          pushToken: 'push-token-12345678',
+          bundleId: 'com.agentpulse.watch',
+          environment: 'sandbox'
+        })
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ ok: true });
+      await expect(registry.listDevicesWithWatchPush()).resolves.toEqual([
+        expect.objectContaining({
+          deviceId,
+          watchPushToken: 'push-token-12345678',
+          watchPushBundleId: 'com.agentpulse.watch',
+          watchPushEnvironment: 'sandbox'
+        })
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('delivers a watch notification when a running thread finishes', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const thread: Thread = {
+      threadId: 'thread-finished-watch-push',
+      provider: 'codex',
+      title: 'Finished thread',
+      workspace: 'CodexPulse',
+      workspacePath: '/Users/test/Projects/CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-05-04T12:00:00Z',
+      lastTurnSummary: 'Ready to review'
+    };
+    const watchPushDelivery = {
+      send: vi.fn(async () => undefined)
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      watchPushDelivery,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const registerResponse = await fetch(`${server.url}/devices/watch-push`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(token, deviceId),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          pushToken: 'push-token-12345678',
+          bundleId: 'com.agentpulse.watch',
+          environment: 'sandbox'
+        })
+      });
+      expect(registerResponse.status).toBe(200);
+
+      server.hub.broadcast({
+        type: 'thread/status/changed',
+        payload: { threadId: thread.threadId, status: 'running' }
+      } as LiveEvent);
+      server.hub.broadcast({
+        type: 'thread/status/changed',
+        payload: { threadId: thread.threadId, status: 'idle' }
+      } as LiveEvent);
+
+      await waitForAssertion(() => {
+        expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+      });
+      expect(watchPushDelivery.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          deviceId,
+          watchPushToken: 'push-token-12345678',
+          watchPushBundleId: 'com.agentpulse.watch',
+          watchPushEnvironment: 'sandbox'
+        }),
+        expect.objectContaining({
+          threadId: thread.threadId,
+          kind: 'finished',
+          title: 'Codex finished',
+          body: 'CodexPulse: Ready to review'
+        })
+      );
+
+      server.hub.broadcast({
+        type: 'thread/status/changed',
+        payload: { threadId: thread.threadId, status: 'idle' }
+      } as LiveEvent);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('delivers an actionable watch approval notification with the approval type', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const thread: Thread = {
+      threadId: 'thread-approval-watch-push',
+      provider: 'codex',
+      title: 'Approval thread',
+      workspace: 'chat',
+      status: 'running',
+      lastActivityAt: '2026-05-04T12:00:00Z',
+      lastTurnSummary: 'Needs approval'
+    };
+    const pendingApproval = {
+      id: 'request-command-1',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        command: ['pnpm', 'test'],
+        cwd: '/tmp/project',
+        reason: 'Run the test suite'
+      },
+      turnId: 'turn-1'
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === thread.threadId ? [pendingApproval] : []
+    };
+    const watchPushDelivery = {
+      send: vi.fn(async () => undefined)
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      mirror,
+      watchPushDelivery,
+      version: '0.1.0'
+    });
+
+    try {
+      const device = await registry.createDevice('Watch', 'watch-fingerprint');
+      await registry.setWatchPushToken(device.deviceId, 'push-token-12345678', {
+        bundleId: 'com.agentpulse.watch',
+        environment: 'sandbox'
+      });
+
+      server.hub.broadcast({
+        type: 'thread/status/changed',
+        payload: { threadId: thread.threadId, status: 'waiting_approval' }
+      } as LiveEvent);
+
+      await waitForAssertion(() => {
+        expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+      });
+      expect(watchPushDelivery.send).toHaveBeenCalledWith(
+        expect.objectContaining({ deviceId: device.deviceId }),
+        expect.objectContaining({
+          threadId: thread.threadId,
+          kind: 'attention',
+          title: 'Command approval',
+          body: expect.stringContaining('Run the test suite'),
+          category: 'AGENT_PULSE_THREAD_APPROVAL',
+          approvalType: 'Command approval'
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it.each([
+    ['Codex', 'thread-streaming-finished-watch-push', 'codex' as const],
+    ['Claude Code', 'claude-code:thread-streaming-finished-watch-push', 'claude-code' as const],
+    ['Copilot', 'copilot:thread-streaming-finished-watch-push', 'copilot' as const]
+  ])('delivers a watch notification when %s streaming stops', async (_label, threadId, provider) => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: 0,
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const thread: Thread = {
+      threadId,
+      provider,
+      title: 'Streaming finished thread',
+      workspace: 'chat',
+      status: 'idle',
+      lastActivityAt: '2026-05-04T12:00:00Z',
+      lastTurnSummary: 'Ready to review'
+    };
+    const watchPushDelivery = {
+      send: vi.fn(async () => undefined)
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      watchPushDelivery,
+      version: '0.1.0'
+    });
+
+    try {
+      const device = await registry.createDevice(`${_label} Watch`, `${_label} fingerprint`);
+      await registry.setWatchPushToken(device.deviceId, 'push-token-12345678', {
+        bundleId: 'com.agentpulse.watch',
+        environment: 'sandbox'
+      });
+
+      server.hub.broadcast({
+        type: 'thread/streaming-changed',
+        payload: { threadId: thread.threadId, isStreaming: true }
+      } as LiveEvent);
+      server.hub.broadcast({
+        type: 'thread/streaming-changed',
+        payload: { threadId: thread.threadId, isStreaming: false }
+      } as LiveEvent);
+
+      await waitForAssertion(() => {
+        expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+      });
+      expect(watchPushDelivery.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          deviceId: device.deviceId,
+          watchPushToken: 'push-token-12345678'
+        }),
+        expect.objectContaining({
+          threadId: thread.threadId,
+          kind: 'finished',
+          title: expect.stringMatching(/^(Codex|Claude Code|GitHub Copilot) finished$/)
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('backfills Codex projectless registration for existing shared chats', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -5868,6 +6443,21 @@ function waitForLiveEvent(
     }, 1_000);
     websocket.on('message', onMessage);
   });
+}
+
+async function waitForAssertion(assertion: () => void, timeoutMs = 1_000): Promise<void> {
+  const startedAt = Date.now();
+  let lastError: unknown;
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Timed out waiting for assertion.');
 }
 
 function remoteAccessSettings(overrides: Partial<RemoteAccessSettings> = {}): RemoteAccessSettings {

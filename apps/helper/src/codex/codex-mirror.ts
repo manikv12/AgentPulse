@@ -2,6 +2,7 @@ import type {
   ChatAttachment,
   ChatMessage,
   PendingApprovalRequest,
+  SelectableCodexPermissionModeId,
   ThreadFileChangeSummary,
   ThreadMessageResponse,
   ThreadSendState,
@@ -55,6 +56,8 @@ export type CodexMirrorSendOptions = {
   // omit them when collaborationMode is undefined.
   model?: string;
   effort?: string;
+  permissionMode?: SelectableCodexPermissionModeId;
+  cwd?: string;
   attachments?: ChatAttachment[];
 };
 
@@ -559,6 +562,9 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
         turnStartParams: {
           threadId,
           input: userTextInput(text, sendOptions?.attachments),
+          ...(sendOptions?.permissionMode
+            ? turnStartPermissionOverridesForMode(sendOptions.permissionMode, sendOptions.cwd)
+            : {}),
           ...(collaborationModePayload ? { collaborationMode: collaborationModePayload } : {})
         }
       }
@@ -1546,6 +1552,45 @@ function pendingApprovalFromItem(
   };
 }
 
+function turnStartPermissionOverridesForMode(
+  mode: SelectableCodexPermissionModeId,
+  cwd?: string
+): Record<string, unknown> {
+  switch (mode) {
+    case 'fullAccess':
+      return {
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        sandboxPolicy: { type: 'dangerFullAccess' }
+      };
+    case 'autoReview':
+      return {
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'auto_review',
+        sandboxPolicy: {
+          type: 'workspaceWrite',
+          writableRoots: cwd ? [cwd] : [],
+          networkAccess: false,
+          excludeTmpdirEnvVar: false,
+          excludeSlashTmp: false
+        }
+      };
+    case 'default':
+    default:
+      return {
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandboxPolicy: {
+          type: 'workspaceWrite',
+          writableRoots: cwd ? [cwd] : [],
+          networkAccess: false,
+          excludeTmpdirEnvVar: false,
+          excludeSlashTmp: false
+        }
+      };
+  }
+}
+
 function approvalRequestId(value: unknown): string | null {
   if (typeof value === 'string' && value.length > 0) {
     return value;
@@ -1701,7 +1746,7 @@ function userTextInput(text: string, attachments: ChatAttachment[] = []) {
       continue;
     }
     input.push({
-      type: 'input_image',
+      type: 'image',
       image_url: {
         url: attachment.url
       }

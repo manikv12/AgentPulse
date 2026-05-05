@@ -238,7 +238,10 @@ export const ThreadCreateRequestSchema = z
     projectId: z.string().trim().min(1).optional(),
     cwd: z.string().trim().min(1).optional(),
     modelSlug: z.string().trim().min(1).optional(),
-    reasoningEffort: z.string().trim().min(1).optional()
+    reasoningEffort: z.string().trim().min(1).optional(),
+    permissionMode: z
+      .enum(['default', 'autoReview', 'fullAccess'])
+      .optional()
   })
   .refine((value) => {
     const targetCount = [value.location === 'chat', Boolean(value.projectId), Boolean(value.cwd)]
@@ -346,6 +349,54 @@ export const ThreadUsageSchema = z.object({
 
 export type ThreadUsage = z.infer<typeof ThreadUsageSchema>;
 
+export const THREAD_GOAL_STATUSES = ['active', 'paused', 'budgetLimited', 'complete'] as const;
+
+export const ThreadGoalStatusSchema = z.enum(THREAD_GOAL_STATUSES);
+export type ThreadGoalStatus = z.infer<typeof ThreadGoalStatusSchema>;
+
+export const ThreadGoalSchema = z.object({
+  threadId: z.string().min(1),
+  objective: z.string().min(1),
+  status: ThreadGoalStatusSchema,
+  tokenBudget: z.number().int().positive().nullable(),
+  tokensUsed: z.number().int().nonnegative(),
+  timeUsedSeconds: z.number().int().nonnegative(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int()
+});
+
+export type ThreadGoal = z.infer<typeof ThreadGoalSchema>;
+
+export const CODEX_PERMISSION_MODES = [
+  'default',
+  'autoReview',
+  'sandbox',
+  'fullAccess',
+  'custom'
+] as const;
+export const SELECTABLE_CODEX_PERMISSION_MODES = [
+  'default',
+  'autoReview',
+  'fullAccess'
+] as const;
+
+export const CodexPermissionModeIdSchema = z.enum(CODEX_PERMISSION_MODES);
+export const SelectableCodexPermissionModeIdSchema = z.enum(SELECTABLE_CODEX_PERMISSION_MODES);
+
+export type CodexPermissionModeId = z.infer<typeof CodexPermissionModeIdSchema>;
+export type SelectableCodexPermissionModeId = z.infer<typeof SelectableCodexPermissionModeIdSchema>;
+
+export const CodexPermissionModeSchema = z.object({
+  mode: CodexPermissionModeIdSchema,
+  label: z.string().min(1),
+  approvalPolicy: z.unknown().optional(),
+  approvalsReviewer: z.unknown().optional(),
+  sandboxMode: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  sandboxPolicy: z.record(z.string(), z.unknown()).optional()
+});
+
+export type CodexPermissionMode = z.infer<typeof CodexPermissionModeSchema>;
+
 export const ThreadTranscriptSchema = z.object({
   threadId: z.string().min(1),
   provider: AgentProviderSchema.default('codex'),
@@ -354,11 +405,13 @@ export const ThreadTranscriptSchema = z.object({
   sendState: ThreadSendStateSchema,
   messages: z.array(ChatMessageSchema),
   usage: ThreadUsageSchema.optional(),
+  goal: ThreadGoalSchema.nullable().optional(),
   // Current model + reasoning effort recorded for this conversation. Sourced from the
   // thread/resume response so the tablet stays in sync with whatever the desktop changed
   // without us needing to listen for the snapshot broadcast.
   model: z.string().min(1).optional(),
   reasoningEffort: z.string().min(1).optional(),
+  permissionMode: CodexPermissionModeSchema.optional(),
   fileChanges: z.array(ThreadFileChangeSummarySchema).optional()
 });
 
@@ -383,6 +436,7 @@ export const ThreadMessageRequestSchema = z
   .object({
     text: z.string().trim().max(4000).optional().default(''),
     collaborationMode: z.enum(COLLABORATION_MODES).optional(),
+    permissionMode: SelectableCodexPermissionModeIdSchema.optional(),
     attachments: z.array(ChatAttachmentSchema).max(6).optional()
   })
   .superRefine((payload, context) => {
@@ -404,6 +458,40 @@ export const ThreadMessageResponseSchema = z.object({
 });
 
 export type ThreadMessageResponse = z.input<typeof ThreadMessageResponseSchema>;
+
+export const ThreadGoalUpdateRequestSchema = z
+  .object({
+    objective: z.string().trim().min(1).max(4000).optional(),
+    status: ThreadGoalStatusSchema.optional(),
+    tokenBudget: z.number().int().positive().nullable().optional()
+  })
+  .superRefine((payload, context) => {
+    if (
+      payload.objective ||
+      payload.status ||
+      Object.prototype.hasOwnProperty.call(payload, 'tokenBudget')
+    ) {
+      return;
+    }
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Goal objective, status, or token budget is required.'
+    });
+  });
+
+export type ThreadGoalUpdateRequest = z.infer<typeof ThreadGoalUpdateRequestSchema>;
+
+export const ThreadGoalResponseSchema = z.object({
+  goal: ThreadGoalSchema.nullable()
+});
+
+export type ThreadGoalResponse = z.infer<typeof ThreadGoalResponseSchema>;
+
+export const ThreadGoalClearResponseSchema = z.object({
+  cleared: z.boolean()
+});
+
+export type ThreadGoalClearResponse = z.infer<typeof ThreadGoalClearResponseSchema>;
 
 export const ThreadStopResponseSchema = z.object({
   ok: z.literal(true)
@@ -431,7 +519,8 @@ export type ThreadListGroup = z.infer<typeof ThreadListGroupSchema>;
 
 export const ThreadListResponseSchema = z.object({
   threads: z.array(ThreadSchema),
-  groups: z.array(ThreadListGroupSchema).optional()
+  groups: z.array(ThreadListGroupSchema).optional(),
+  hasMore: z.boolean().optional()
 });
 
 export const ProjectListResponseSchema = z.object({
@@ -801,6 +890,13 @@ export const LiveEventSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('thread/transcript/changed'),
     payload: ThreadTranscriptSchema
+  }),
+  z.object({
+    type: z.literal('thread/goal/changed'),
+    payload: z.object({
+      threadId: z.string().min(1),
+      goal: ThreadGoalSchema.nullable()
+    })
   }),
   z.object({
     type: z.literal('thread/status/changed'),
