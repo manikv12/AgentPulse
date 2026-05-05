@@ -155,6 +155,8 @@ type WatchPushNotification = {
   kind: 'finished' | 'errored' | 'attention';
   title: string;
   body: string;
+  category?: 'AGENT_PULSE_THREAD' | 'AGENT_PULSE_THREAD_APPROVAL';
+  approvalType?: string;
 };
 
 export type WatchPushDelivery = {
@@ -604,12 +606,13 @@ async function sendWatchApnsNotification(
         body: notification.body
       },
       sound: 'default',
-      category: 'AGENT_PULSE_THREAD',
+      category: notification.category ?? 'AGENT_PULSE_THREAD',
       'thread-id': notification.threadId
     },
     threadId: notification.threadId,
     deviceId: device.deviceId,
-    kind: notification.kind
+    kind: notification.kind,
+    ...(notification.approvalType ? { approvalType: notification.approvalType } : {})
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -782,6 +785,8 @@ function createApp(
     kind: 'finished' | 'errored' | 'attention';
     title: string;
     body: string;
+    category?: 'AGENT_PULSE_THREAD' | 'AGENT_PULSE_THREAD_APPROVAL';
+    approvalType?: string;
   }): void => {
     void options.registry
       .listDevicesWithWatchPush()
@@ -824,8 +829,8 @@ function createApp(
       notifyWatchDevices({
         threadId,
         kind: 'finished',
-        title: 'Agent finished',
-        body: 'Open Agent Pulse to review the result.'
+        title: 'Agent stopped',
+        body: 'The agent stopped working. Review the result on your watch.'
       });
       return;
     }
@@ -839,11 +844,14 @@ function createApp(
       return;
     }
     if (nextStatus === 'waiting_approval') {
+      const approvalSummary = watchApprovalNotificationSummary(pendingRequestsForThread(threadId));
       notifyWatchDevices({
         threadId,
         kind: 'attention',
-        title: 'Agent needs you',
-        body: 'A pending approval is waiting.'
+        title: approvalSummary.title,
+        body: approvalSummary.body,
+        category: 'AGENT_PULSE_THREAD_APPROVAL',
+        approvalType: approvalSummary.approvalType
       });
     }
   };
@@ -5079,6 +5087,30 @@ function buildApprovalInbox(
     return riskRank[a.riskLevel] - riskRank[b.riskLevel] || b.ageMs - a.ageMs;
   });
   return { items: sorted, total: sorted.length };
+}
+
+function watchApprovalNotificationSummary(requests: PendingApprovalRequest[]): {
+  title: string;
+  body: string;
+  approvalType: string;
+} {
+  const request = requests[0];
+  if (!request) {
+    return {
+      title: 'Agent needs approval',
+      body: 'A pending approval is waiting.',
+      approvalType: 'Approval'
+    };
+  }
+  const approvalType = approvalTypeLabel(request.method);
+  const reason = approvalShortReason(request);
+  const target = approvalCommandOrFileSummary(request);
+  const bodyParts = [reason, target].filter((part, index, values) => part && values.indexOf(part) === index);
+  return {
+    title: approvalType,
+    body: truncateForSummary(bodyParts.join(' - ') || 'Tap Approve or open the thread to review it.', 160),
+    approvalType
+  };
 }
 
 function mergePendingApprovalRequests(

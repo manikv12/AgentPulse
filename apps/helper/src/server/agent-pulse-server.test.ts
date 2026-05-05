@@ -6099,8 +6099,8 @@ describe('Agent Pulse helper API', () => {
         expect.objectContaining({
           threadId: thread.threadId,
           kind: 'finished',
-          title: 'Agent finished',
-          body: 'Open Agent Pulse to review the result.'
+          title: 'Agent stopped',
+          body: 'The agent stopped working. Review the result on your watch.'
         })
       );
 
@@ -6110,6 +6110,87 @@ describe('Agent Pulse helper API', () => {
       } as LiveEvent);
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('delivers an actionable watch approval notification with the approval type', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const thread: Thread = {
+      threadId: 'thread-approval-watch-push',
+      provider: 'codex',
+      title: 'Approval thread',
+      workspace: 'chat',
+      status: 'running',
+      lastActivityAt: '2026-05-04T12:00:00Z',
+      lastTurnSummary: 'Needs approval'
+    };
+    const pendingApproval = {
+      id: 'request-command-1',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        command: ['pnpm', 'test'],
+        cwd: '/tmp/project',
+        reason: 'Run the test suite'
+      },
+      turnId: 'turn-1'
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === thread.threadId ? [pendingApproval] : []
+    };
+    const watchPushDelivery = {
+      send: vi.fn(async () => undefined)
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      mirror,
+      watchPushDelivery,
+      version: '0.1.0'
+    });
+
+    try {
+      const device = await registry.createDevice('Watch', 'watch-fingerprint');
+      await registry.setWatchPushToken(device.deviceId, 'push-token-12345678', {
+        bundleId: 'com.agentpulse.watch',
+        environment: 'sandbox'
+      });
+
+      server.hub.broadcast({
+        type: 'thread/status/changed',
+        payload: { threadId: thread.threadId, status: 'waiting_approval' }
+      } as LiveEvent);
+
+      await waitForAssertion(() => {
+        expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+      });
+      expect(watchPushDelivery.send).toHaveBeenCalledWith(
+        expect.objectContaining({ deviceId: device.deviceId }),
+        expect.objectContaining({
+          threadId: thread.threadId,
+          kind: 'attention',
+          title: 'Command approval',
+          body: expect.stringContaining('Run the test suite'),
+          category: 'AGENT_PULSE_THREAD_APPROVAL',
+          approvalType: 'Command approval'
+        })
+      );
     } finally {
       await server.stop();
     }
@@ -6179,7 +6260,7 @@ describe('Agent Pulse helper API', () => {
         expect.objectContaining({
           threadId: thread.threadId,
           kind: 'finished',
-          title: 'Agent finished'
+          title: 'Agent stopped'
         })
       );
     } finally {
