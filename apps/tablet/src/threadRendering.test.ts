@@ -50,7 +50,7 @@ describe('thread rendering helpers', () => {
       type: 'activityGroup',
       group: {
         status: 'completed',
-        title: 'Explored the workspace, ran 1 search'
+        title: 'Worked for 38s'
       }
     });
     expect(entries[2]).toMatchObject({
@@ -88,6 +88,7 @@ describe('thread rendering helpers', () => {
       type: 'activityGroup',
       group: {
         status: 'running',
+        title: 'Working for 10s',
         hasFinalResponse: false
       }
     });
@@ -136,6 +137,7 @@ describe('thread rendering helpers', () => {
       type: 'activityGroup',
       group: {
         status: 'running',
+        title: 'Working for 10s',
         hasFinalResponse: false
       }
     });
@@ -182,6 +184,7 @@ describe('thread rendering helpers', () => {
       throw new Error('Expected an activity group');
     }
     expect(entries[1].group.items).toHaveLength(1);
+    expect(entries[1].group.title).toBe('Worked for 20s');
     expect(entries[1].group.items[0]).toMatchObject({
       id: 'assistant-commentary',
       kind: 'reasoning',
@@ -263,7 +266,7 @@ describe('thread rendering helpers', () => {
       throw new Error('Expected an activity group');
     }
     expect(entries[1].group).toMatchObject({
-      title: 'Thinking',
+      title: 'Working for 1s',
       status: 'running'
     });
     expect(entries[1].group.items[0]).toMatchObject({
@@ -272,7 +275,7 @@ describe('thread rendering helpers', () => {
     });
   });
 
-  it('labels context compaction activity clearly', () => {
+  it('renders context compaction outside the activity group', () => {
     const entries = buildRenderableEntries([
       message({
         id: 'user-1',
@@ -289,19 +292,113 @@ describe('thread rendering helpers', () => {
         text: 'Automatically compacting context',
         createdAt: '2026-04-25T16:14:31Z'
       })
+    ], { isLive: true, isCompacting: true });
+
+    expect(entries.map((entry) => entry.type)).toEqual(['message', 'contextCompaction']);
+    if (entries[1].type !== 'contextCompaction') {
+      throw new Error('Expected a context compaction marker');
+    }
+    expect(entries[1]).toMatchObject({
+      status: 'running',
+      message: {
+        id: 'compact-1',
+        text: 'Automatically compacting context'
+      }
+    });
+  });
+
+  it('treats compaction as finished when normal live work appears after it', () => {
+    const entries = buildRenderableEntries([
+      message({
+        id: 'user-1',
+        role: 'user',
+        kind: 'message',
+        text: 'Continue.',
+        createdAt: '2026-04-25T16:14:30Z'
+      }),
+      message({
+        id: 'tool-before-compact',
+        role: 'activity',
+        kind: 'command',
+        text: 'rg -n compact apps',
+        createdAt: '2026-04-25T16:14:32Z'
+      }),
+      message({
+        id: 'compact-1',
+        role: 'activity',
+        kind: 'status',
+        phase: 'context_compaction',
+        text: 'Automatically compacting context',
+        createdAt: '2026-04-25T16:14:40Z'
+      }),
+      message({
+        id: 'assistant-after-compact',
+        role: 'assistant',
+        kind: 'message',
+        phase: 'commentary',
+        text: 'I found the next issue.',
+        createdAt: '2026-04-25T16:14:45Z'
+      }),
+      message({
+        id: 'tool-after-compact',
+        role: 'activity',
+        kind: 'command',
+        text: 'pnpm vitest run apps/tablet/src/threadRendering.test.ts',
+        createdAt: '2026-04-25T16:14:50Z'
+      })
+    ], { isLive: true, isCompacting: false });
+
+    expect(entries.map((entry) => entry.type)).toEqual([
+      'message',
+      'activityGroup',
+      'contextCompaction',
+      'activityGroup'
+    ]);
+    expect(entries[1]).toMatchObject({
+      type: 'activityGroup',
+      group: { status: 'completed', title: 'Worked for 2s' }
+    });
+    expect(entries[2]).toMatchObject({
+      type: 'contextCompaction',
+      status: 'completed'
+    });
+    expect(entries[3]).toMatchObject({
+      type: 'activityGroup',
+      group: { status: 'running', title: 'Working for 5s' }
+    });
+  });
+
+  it('hides context compaction once the final answer is visible', () => {
+    const entries = buildRenderableEntries([
+      message({
+        id: 'user-1',
+        role: 'user',
+        kind: 'message',
+        text: 'Continue.',
+        createdAt: '2026-04-25T16:14:30Z'
+      }),
+      message({
+        id: 'compact-1',
+        role: 'activity',
+        kind: 'status',
+        phase: 'context_compaction',
+        text: 'Automatically compacting context',
+        createdAt: '2026-04-25T16:14:31Z'
+      }),
+      message({
+        id: 'assistant-1',
+        role: 'assistant',
+        kind: 'message',
+        phase: 'final_answer',
+        text: 'Done.',
+        createdAt: '2026-04-25T16:14:35Z'
+      })
     ]);
 
-    expect(entries.map((entry) => entry.type)).toEqual(['message', 'activityGroup']);
-    if (entries[1].type !== 'activityGroup') {
-      throw new Error('Expected an activity group');
-    }
-    expect(entries[1].group).toMatchObject({
-      title: 'Compacting context',
-      status: 'running'
-    });
-    expect(entries[1].group.items[0]).toMatchObject({
-      title: 'Compacting context',
-      detail: 'Automatically compacting context'
+    expect(entries.map((entry) => entry.type)).toEqual(['message', 'message']);
+    expect(entries[1]).toMatchObject({
+      type: 'message',
+      message: { id: 'assistant-1' }
     });
   });
 

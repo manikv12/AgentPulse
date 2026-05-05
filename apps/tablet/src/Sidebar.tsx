@@ -88,6 +88,7 @@ export type SidebarProps = {
   projects?: Project[];
   activeThreadId?: string;
   seenThreadActivity?: Record<string, number>;
+  reviewStateReady?: boolean;
   workingThreadIds?: Set<string>;
   onSelectThread: (thread: Thread) => void;
   onNewThread?: (projectId?: string) => void;
@@ -272,6 +273,7 @@ export function Sidebar({
   projects = [],
   activeThreadId,
   seenThreadActivity = {},
+  reviewStateReady = true,
   workingThreadIds,
   onSelectThread,
   onNewThread,
@@ -359,13 +361,13 @@ export function Sidebar({
     const isLive = isWorking || thread.status === 'compacting';
     const isWaitingApproval = thread.status === 'waiting_approval';
     const isCompacting = thread.status === 'compacting';
-    const needsReview = threadNeedsReview(thread, seenThreadActivity);
+    const needsReview = reviewStateReady && threadNeedsReview(thread, seenThreadActivity);
     const dotTone = isLive ? 'blue' : needsReview ? 'yellow' : statusTone[thread.status];
     const showDot =
       isLive ||
       needsReview ||
       isWaitingApproval ||
-      (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
+      (reviewStateReady && isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity));
 
     return (
       <li key={thread.threadId}>
@@ -461,8 +463,8 @@ export function Sidebar({
     const attentionCount = threads.reduce(
       (acc, thread) =>
         acc +
-        (threadNeedsReview(thread, seenThreadActivity) ||
-        (isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity))
+        ((reviewStateReady && threadNeedsReview(thread, seenThreadActivity)) ||
+        (reviewStateReady && isAttentionStatus(thread.status) && hasUnseenActivity(thread, seenThreadActivity))
           ? 1
           : 0),
       0

@@ -2,20 +2,27 @@ import type {
   CatalogModel,
   ChatAttachment,
   ChatMessage,
+  CodexPermissionMode,
   CollaborationModeKind,
   LiveEvent,
   PendingApprovalRequest,
+  SelectableCodexPermissionModeId,
   Thread,
+  ThreadGoal,
   ThreadMessageResponse,
   ThreadSendState,
-  ThreadTranscript
+  ThreadTranscript,
+  ThreadUsage
 } from '@agent-pulse/shared';
 import {
   ChatMessageSchema,
   CatalogModelSchema,
+  CodexPermissionModeSchema,
+  ThreadGoalSchema,
   ThreadMessageResponseSchema,
   ThreadSchema,
-  ThreadTranscriptSchema
+  ThreadTranscriptSchema,
+  ThreadUsageSchema
 } from '@agent-pulse/shared';
 import { workspaceNameFromCwd } from './thread-reader';
 import {
@@ -53,12 +60,14 @@ export type ThreadStartOptions = {
   /** Override the reasoning effort (e.g. 'low' | 'medium' | 'high' | 'xhigh').
    *  Sent as `model_reasoning_effort` inside the thread/start `config` blob. */
   reasoningEffort?: string;
+  permissionMode?: SelectableCodexPermissionModeId;
 };
 
 type TurnStartOptions = {
   model?: string;
   effort?: string;
   collaborationMode?: CollaborationModeKind;
+  permissionMode?: SelectableCodexPermissionModeId;
   attachments?: ChatAttachment[];
 };
 
@@ -83,6 +92,29 @@ type AppServerThreadResponse = {
   permissionProfile?: unknown;
   sandbox?: unknown;
   serviceTier?: unknown;
+};
+
+type AppServerThreadGoalStatus = 'active' | 'paused' | 'budgetLimited' | 'complete';
+
+type AppServerThreadGoal = {
+  threadId?: string;
+  thread_id?: string;
+  objective?: string;
+  status?: AppServerThreadGoalStatus | 'budget_limited';
+  tokenBudget?: number | null;
+  token_budget?: number | null;
+  tokensUsed?: number;
+  tokens_used?: number;
+  timeUsedSeconds?: number;
+  time_used_seconds?: number;
+  createdAt?: number;
+  created_at?: number;
+  updatedAt?: number;
+  updated_at?: number;
+};
+
+type AppServerThreadGoalResponse = {
+  goal?: AppServerThreadGoal | null;
 };
 
 type AppServerThreadTurnsListResponse = {
@@ -248,6 +280,10 @@ type AppServerLiveThreadState = {
   isCompacting: boolean;
   pendingRequests: Map<string, PendingApprovalRequest>;
   liveMessages: Map<string, ChatMessage>;
+  goal?: ThreadGoal | null;
+  usage?: ThreadUsage;
+  tokenUsageTotal?: number;
+  goalTokenBaseline?: number;
   lastStreaming: boolean;
 };
 
@@ -256,6 +292,7 @@ type AppServerThreadExecutionSettings = {
   approvalsReviewer?: unknown;
   permissionProfile?: unknown;
   sandboxPolicy?: unknown;
+  cwd?: string;
   serviceTier?: unknown;
 };
 
@@ -344,6 +381,7 @@ export class CodexAppServerChat {
   private readonly liveStateListeners = new Set<(threadId: string) => void>();
   private readonly connectionListeners = new Set<(connected: boolean) => void>();
   private readonly turnCompletedListeners = new Set<(event: AppServerTurnCompletedEvent) => void>();
+  private goalsFeatureEnablementTried = false;
 
   constructor(private readonly transport: CodexAppServerTransport) {
     this.transport.onNotification?.((notification) => this.handleNotification(notification));
@@ -538,6 +576,7 @@ export class CodexAppServerChat {
       input: userTextInput(trimmed, options.attachments),
       ...turnStartOverrides(options, thread)
     });
+    this.rememberPermissionModeOverride(threadId, options.permissionMode, thread.cwd);
     this.markLiveTurnStarted(threadId, response.turn.id, trimmed);
     const updatedTranscript = await this.readTranscriptAfterAcceptedSend(threadId).catch((error) => {
       if (isUnmaterializedDraftError(error)) {
@@ -598,6 +637,88 @@ export class CodexAppServerChat {
     this.emitThreadStateChanged(threadId);
   }
 
+  async readGoal(threadId: string): Promise<ThreadGoal | null> {
+    const response = await this.transport.request<AppServerThreadGoalResponse>('thread/goal/get', {
+      threadId
+    });
+    const goal = normalizeAppServerGoal(response.goal);
+    this.stateForThread(threadId).goal = goal;
+    this.resetGoalTokenBaseline(threadId, goal);
+    this.emitLiveStateChange(threadId);
+    return goal;
+  }
+
+  async setGoal(
+    threadId: string,
+    input: { objective?: string; status?: ThreadGoal['status']; tokenBudget?: number | null }
+  ): Promise<ThreadGoal> {
+    const params: Record<string, unknown> = { threadId };
+    if (input.objective !== undefined) {
+      params.objective = input.objective;
+    }
+    if (input.status !== undefined) {
+      params.status = goalStatusToAppServer(input.status);
+    }
+    if (input.tokenBudget !== undefined) {
+      params.tokenBudget = input.tokenBudget;
+    }
+    const response = await this.requestGoalSet(params);
+    const goal = normalizeAppServerGoal(response.goal);
+    if (!goal) {
+      throw new Error('Codex did not return the updated goal.');
+    }
+    this.stateForThread(threadId).goal = goal;
+    this.resetGoalTokenBaseline(threadId, goal);
+    this.emitLiveStateChange(threadId);
+    return goal;
+  }
+
+  async clearGoal(threadId: string): Promise<boolean> {
+    const response = await this.requestGoalClear({
+      threadId
+    });
+    this.stateForThread(threadId).goal = null;
+    this.stateForThread(threadId).goalTokenBaseline = undefined;
+    this.emitLiveStateChange(threadId);
+    return response.cleared === true;
+  }
+
+  private async requestGoalSet(
+    params: Record<string, unknown>
+  ): Promise<AppServerThreadGoalResponse> {
+    try {
+      return await this.transport.request<AppServerThreadGoalResponse>('thread/goal/set', params);
+    } catch (error) {
+      if (!isGoalFeatureDisabledError(error)) {
+        throw error;
+      }
+      await this.enableGoalsFeature();
+      return this.transport.request<AppServerThreadGoalResponse>('thread/goal/set', params);
+    }
+  }
+
+  private async requestGoalClear(params: { threadId: string }): Promise<{ cleared?: boolean }> {
+    try {
+      return await this.transport.request<{ cleared?: boolean }>('thread/goal/clear', params);
+    } catch (error) {
+      if (!isGoalFeatureDisabledError(error)) {
+        throw error;
+      }
+      await this.enableGoalsFeature();
+      return this.transport.request<{ cleared?: boolean }>('thread/goal/clear', params);
+    }
+  }
+
+  private async enableGoalsFeature(): Promise<void> {
+    if (this.goalsFeatureEnablementTried) {
+      return;
+    }
+    this.goalsFeatureEnablementTried = true;
+    await this.transport.request('experimentalFeature/enablement/set', {
+      enablement: { goals: true }
+    });
+  }
+
   async archiveThread(threadId: string): Promise<void> {
     await this.transport.request('thread/archive', { threadId });
     this.liveThreads.delete(threadId);
@@ -639,17 +760,20 @@ export class CodexAppServerChat {
       return transcript;
     }
 
+    const transcriptWithProgress = transcriptWithLiveProgress(transcript, state);
     const syntheticTurnId = state.activeTurnId ?? appServerLiveTurnId(threadId);
-    const existingMessageIds = new Set(transcript.messages.map((message) => message.id));
+    const existingMessageIds = new Set(transcriptWithProgress.messages.map((message) => message.id));
     const liveMessages = [...state.liveMessages.values()].filter(
-      (message) => !existingMessageIds.has(message.id) && !transcriptConfirmsLiveMessage(message, transcript.messages)
+      (message) =>
+        !existingMessageIds.has(message.id) &&
+        !transcriptConfirmsLiveMessage(message, transcriptWithProgress.messages)
     );
-    const messages = [...transcript.messages, ...liveMessages];
+    const messages = [...transcriptWithProgress.messages, ...liveMessages];
 
     if (state.pendingRequests.size > 0) {
       return ThreadTranscriptSchema.parse({
-        ...transcript,
-        activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
+        ...transcriptWithProgress,
+        activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
         sendState: {
           canSend: false,
           reason: 'waiting_on_approval',
@@ -661,8 +785,8 @@ export class CodexAppServerChat {
 
     if (state.isCompacting) {
       return ThreadTranscriptSchema.parse({
-        ...transcript,
-        activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
+        ...transcriptWithProgress,
+        activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
         sendState: {
           canSend: false,
           reason: 'compacting_context',
@@ -674,10 +798,10 @@ export class CodexAppServerChat {
 
     if (state.isStreaming) {
       return ThreadTranscriptSchema.parse({
-        ...transcript,
-        activeTurnId: transcript.activeTurnId ?? syntheticTurnId,
-        sendState: transcript.activeTurnId
-          ? transcript.sendState
+        ...transcriptWithProgress,
+        activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
+        sendState: transcriptWithProgress.activeTurnId
+          ? transcriptWithProgress.sendState
           : {
               canSend: false,
               reason: 'thread_changed',
@@ -687,14 +811,14 @@ export class CodexAppServerChat {
       });
     }
 
-    if (messages.length !== transcript.messages.length) {
+    if (messages.length !== transcriptWithProgress.messages.length) {
       return ThreadTranscriptSchema.parse({
-        ...transcript,
+        ...transcriptWithProgress,
         messages
       });
     }
 
-    return transcript;
+    return transcriptWithProgress;
   }
 
   async respondToApproval(
@@ -817,7 +941,7 @@ export class CodexAppServerChat {
     options: ThreadStartOptions = {}
   ): Promise<AppServerThreadStartParams> {
     const config = await this.readCodexConfig(cwd);
-    const sandbox = sandboxFromConfig(config);
+    const sandbox = sandboxFromPermissionMode(options.permissionMode) ?? sandboxFromConfig(config);
     const developerInstructions = stringField(config, 'developer_instructions');
     const serviceTier =
       stringField(config, 'service_tier') ?? stringField(config, 'model_service_tier');
@@ -830,8 +954,12 @@ export class CodexAppServerChat {
       cwd,
       model,
       modelProvider: stringField(config, 'model_provider') ?? null,
-      approvalsReviewer: 'user',
-      approvalPolicy: approvalPolicyFromConfig(config, sandbox),
+      approvalsReviewer:
+        approvalsReviewerFromPermissionMode(options.permissionMode) ??
+        approvalsReviewerFromConfig(config),
+      approvalPolicy:
+        approvalPolicyFromPermissionMode(options.permissionMode) ??
+        approvalPolicyFromConfig(config, sandbox),
       sandbox,
       config: threadConfig,
       personality: stringField(config, 'personality') ?? null,
@@ -893,7 +1021,7 @@ export class CodexAppServerChat {
     options: TurnStartOptions,
     thread: AppServerThread
   ): Promise<ThreadMessageResponse> {
-    const overrides = turnStartOverrides(options, thread);
+    const overrides = turnStartOverrides({ ...options, permissionMode: undefined }, thread);
     const response = await this.transport.request<{ turnId: string }>('turn/steer', {
       threadId,
       input: userTextInput(text, options.attachments),
@@ -921,6 +1049,11 @@ export class CodexAppServerChat {
       input: userTextInput(text, options.attachments),
       ...turnStartOverrides(options, undefined, this.threadExecutionSettings.get(threadId))
     });
+    this.rememberPermissionModeOverride(
+      threadId,
+      options.permissionMode,
+      this.threadExecutionSettings.get(threadId)?.cwd
+    );
     this.markLiveTurnStarted(threadId, response.turn.id, text);
     const transcript = await this.readTranscriptAfterAcceptedSend(threadId).catch((error) => {
       if (isUnmaterializedDraftError(error)) {
@@ -1004,6 +1137,28 @@ export class CodexAppServerChat {
     }
   }
 
+  private rememberPermissionModeOverride(
+    threadId: string,
+    mode: SelectableCodexPermissionModeId | undefined,
+    cwd?: string
+  ): void {
+    if (!mode) {
+      return;
+    }
+    this.threadExecutionSettings.set(threadId, {
+      ...this.threadExecutionSettings.get(threadId),
+      ...executionSettingsForPermissionMode(mode, cwd)
+    });
+  }
+
+  private resetGoalTokenBaseline(threadId: string, goal: ThreadGoal | null): void {
+    const state = this.stateForThread(threadId);
+    state.goalTokenBaseline =
+      goal && state.tokenUsageTotal !== undefined
+        ? Math.max(0, state.tokenUsageTotal - goal.tokensUsed)
+        : undefined;
+  }
+
   private async loadRecentTurns(threadId: string): Promise<AppServerTurn[]> {
     const response = await this.transport.request<AppServerThreadTurnsListResponse>('thread/turns/list', {
       threadId,
@@ -1081,6 +1236,55 @@ export class CodexAppServerChat {
           status: mapAppServerStatus({ type: visibleType, activeFlags } as AppServerThreadStatus)
         }
       });
+      this.emitThreadStateChanged(threadId);
+      return;
+    }
+
+    if (notification.method === 'thread/goal/updated') {
+      const goal = normalizeAppServerGoal(recordFromUnknown(params.goal));
+      state.goal = goal;
+      this.resetGoalTokenBaseline(threadId, goal);
+      this.emitLiveEvent({
+        type: 'thread/goal/changed',
+        payload: { threadId, goal }
+      });
+      this.emitThreadStateChanged(threadId);
+      return;
+    }
+
+    if (notification.method === 'thread/goal/cleared') {
+      state.goal = null;
+      state.goalTokenBaseline = undefined;
+      this.emitLiveEvent({
+        type: 'thread/goal/changed',
+        payload: { threadId, goal: null }
+      });
+      this.emitThreadStateChanged(threadId);
+      return;
+    }
+
+    if (notification.method === 'thread/tokenUsage/updated') {
+      const tokenUsage = normalizeAppServerTokenUsage(
+        params.tokenUsage ?? params.token_usage
+      );
+      if (!tokenUsage) {
+        return;
+      }
+      state.usage = tokenUsage.usage;
+      if (tokenUsage.tokensUsed !== undefined) {
+        state.tokenUsageTotal = tokenUsage.tokensUsed;
+      }
+      if (state.goal && tokenUsage.tokensUsed !== undefined) {
+        const goalTokensUsed = goalTokensUsedFromTotal(state, tokenUsage.tokensUsed);
+        const nextGoal = goalWithTokensUsed(state.goal, goalTokensUsed);
+        if (nextGoal !== state.goal) {
+          state.goal = nextGoal;
+          this.emitLiveEvent({
+            type: 'thread/goal/changed',
+            payload: { threadId, goal: nextGoal }
+          });
+        }
+      }
       this.emitThreadStateChanged(threadId);
       return;
     }
@@ -1511,7 +1715,7 @@ function userTextInput(text: string, attachments: ChatAttachment[] = []) {
       continue;
     }
     input.push({
-      type: 'input_image',
+      type: 'image',
       image_url: {
         url: attachment.url
       }
@@ -1535,7 +1739,11 @@ function turnStartOverrides(
 ): Record<string, unknown> {
   const model = options.model?.trim() || stringFieldFromMaybe(thread?.model) || 'gpt-5.5';
   const effort = options.effort?.trim() || stringFieldFromMaybe(thread?.reasoningEffort) || null;
-  const settings = thread ? executionSettingsFromThread(thread) : fallbackSettings;
+  const settings = options.permissionMode
+    ? executionSettingsForPermissionMode(options.permissionMode, thread?.cwd ?? fallbackSettings.cwd)
+    : thread
+      ? executionSettingsFromThread(thread)
+      : fallbackSettings;
   return {
     ...(options.model ? { model: options.model } : {}),
     ...(options.effort ? { effort: options.effort } : {}),
@@ -1552,6 +1760,7 @@ function executionSettingsFromThread(thread: AppServerThread): AppServerThreadEx
     approvalsReviewer: thread.approvalsReviewer,
     permissionProfile: thread.permissionProfile,
     sandboxPolicy: thread.sandboxPolicy,
+    cwd: thread.cwd,
     serviceTier: thread.serviceTier
   };
 }
@@ -1569,7 +1778,8 @@ function executionSettingsFromThreadResponse(
     ...(valueIsPresent(response.permissionProfile)
       ? { permissionProfile: response.permissionProfile }
       : {}),
-    ...(valueIsPresent(response.permissionProfile) ? {} : sandboxPolicyOverride(response.sandbox)),
+    ...sandboxPolicyOverride(response.sandbox),
+    ...(typeof response.thread?.cwd === 'string' ? { cwd: response.thread.cwd } : {}),
     ...(valueIsPresent(response.serviceTier) ? { serviceTier: response.serviceTier } : {})
   };
 }
@@ -1621,6 +1831,79 @@ function sandboxPolicyFromUnknown(sandbox: unknown): unknown {
       return { type: 'workspaceWrite' };
     default:
       return undefined;
+  }
+}
+
+function sandboxFromPermissionMode(
+  mode: SelectableCodexPermissionModeId | undefined
+): AppServerThreadStartParams['sandbox'] | undefined {
+  switch (mode) {
+    case 'fullAccess':
+      return 'danger-full-access';
+    case 'autoReview':
+      return 'workspace-write';
+    case 'default':
+    default:
+      return undefined;
+  }
+}
+
+function approvalPolicyFromPermissionMode(
+  mode: SelectableCodexPermissionModeId | undefined
+): unknown {
+  switch (mode) {
+    case 'fullAccess':
+      return 'never';
+    case 'autoReview':
+      return 'on-request';
+    case 'default':
+    default:
+      return undefined;
+  }
+}
+
+function approvalsReviewerFromPermissionMode(
+  mode: SelectableCodexPermissionModeId | undefined
+): AppServerThreadStartParams['approvalsReviewer'] | undefined {
+  switch (mode) {
+    case 'autoReview':
+      return 'auto_review';
+    case 'fullAccess':
+      return 'user';
+    case 'default':
+    default:
+      return undefined;
+  }
+}
+
+function executionSettingsForPermissionMode(
+  mode: SelectableCodexPermissionModeId,
+  cwd?: string
+): AppServerThreadExecutionSettings {
+  return {
+    approvalPolicy: mode === 'default' ? 'on-request' : approvalPolicyFromPermissionMode(mode),
+    approvalsReviewer: mode === 'default' ? 'user' : approvalsReviewerFromPermissionMode(mode),
+    sandboxPolicy: sandboxPolicyForPermissionMode(mode, cwd),
+    ...(cwd ? { cwd } : {})
+  };
+}
+
+function sandboxPolicyForPermissionMode(
+  mode: SelectableCodexPermissionModeId,
+  cwd?: string
+): unknown {
+  switch (mode) {
+    case 'fullAccess':
+      return { type: 'dangerFullAccess' };
+    case 'default':
+    case 'autoReview':
+      return {
+        type: 'workspaceWrite',
+        writableRoots: cwd ? [cwd] : [],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false
+      };
   }
 }
 
@@ -1713,6 +1996,20 @@ function approvalPolicyFromConfig(
   return sandbox === 'danger-full-access' ? 'never' : 'on-request';
 }
 
+function approvalsReviewerFromConfig(
+  config: Record<string, unknown>
+): AppServerThreadStartParams['approvalsReviewer'] {
+  const raw = stringField(config, 'approvals_reviewer');
+  switch (raw) {
+    case 'auto_review':
+    case 'guardian_subagent':
+      return raw;
+    case 'user':
+    default:
+      return 'user';
+  }
+}
+
 function threadStartConfigFromCodexConfig(config: Record<string, unknown>): Record<string, unknown> {
   const threadConfig: Record<string, unknown> = {};
   const reasoningEffort = stringField(config, 'model_reasoning_effort');
@@ -1757,6 +2054,7 @@ function mapThreadToTranscript(
     typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim()
       ? thread.reasoningEffort.trim()
       : undefined;
+  const permissionMode = permissionModeFromExecutionSettings(executionSettingsFromThread(thread));
 
   return ThreadTranscriptSchema.parse({
     threadId: thread.id,
@@ -1766,8 +2064,101 @@ function mapThreadToTranscript(
     sendState,
     messages,
     ...(model ? { model } : {}),
-    ...(reasoningEffort ? { reasoningEffort } : {})
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(permissionMode ? { permissionMode } : {})
   });
+}
+
+function permissionModeFromExecutionSettings(
+  settings: AppServerThreadExecutionSettings
+): CodexPermissionMode | undefined {
+  if (
+    !valueIsPresent(settings.approvalPolicy) &&
+    !valueIsPresent(settings.approvalsReviewer) &&
+    !valueIsPresent(settings.sandboxPolicy) &&
+    !valueIsPresent(settings.permissionProfile)
+  ) {
+    return undefined;
+  }
+  const approvalPolicy =
+    typeof settings.approvalPolicy === 'string' ? settings.approvalPolicy : undefined;
+  const sandboxMode = sandboxModeFromSettings(settings);
+  const mode =
+    sandboxMode === 'danger-full-access' && approvalPolicy === 'never'
+      ? 'fullAccess'
+      : settings.approvalsReviewer === 'auto_review'
+        ? 'autoReview'
+        : sandboxMode === 'read-only' && approvalPolicy !== 'never'
+          ? 'sandbox'
+          : sandboxMode === 'workspace-write' && approvalPolicy !== 'never'
+            ? 'default'
+            : 'custom';
+  return CodexPermissionModeSchema.parse({
+    mode,
+    label: codexPermissionModeLabel(mode),
+    ...(valueIsPresent(settings.approvalPolicy)
+      ? { approvalPolicy: settings.approvalPolicy }
+      : {}),
+    ...(valueIsPresent(settings.approvalsReviewer)
+      ? { approvalsReviewer: settings.approvalsReviewer }
+      : {}),
+    ...(sandboxMode ? { sandboxMode } : {}),
+    ...(recordFromUnknown(settings.sandboxPolicy)
+      ? { sandboxPolicy: recordFromUnknown(settings.sandboxPolicy) }
+      : {})
+  });
+}
+
+function sandboxModeFromSettings(
+  settings: AppServerThreadExecutionSettings
+): 'read-only' | 'workspace-write' | 'danger-full-access' | undefined {
+  const profile = recordFromUnknown(settings.permissionProfile);
+  if (stringField(profile ?? {}, 'type') === 'disabled') {
+    return 'danger-full-access';
+  }
+  return sandboxModeFromPolicy(settings.sandboxPolicy);
+}
+
+function sandboxModeFromPolicy(
+  sandboxPolicy: unknown
+): 'read-only' | 'workspace-write' | 'danger-full-access' | undefined {
+  if (typeof sandboxPolicy === 'string') {
+    return sandboxFromConfig({ sandbox_mode: sandboxPolicy });
+  }
+  const policy = recordFromUnknown(sandboxPolicy);
+  if (!policy) {
+    return undefined;
+  }
+  switch (stringField(policy, 'type')) {
+    case 'dangerFullAccess':
+    case 'danger-full-access':
+      return 'danger-full-access';
+    case 'readOnly':
+    case 'read-only':
+      return 'read-only';
+    case 'workspaceWrite':
+    case 'workspace-write':
+      return 'workspace-write';
+    default:
+      return undefined;
+  }
+}
+
+function codexPermissionModeLabel(mode: CodexPermissionMode['mode']): string {
+  switch (mode) {
+    case 'fullAccess':
+      return 'Full access';
+    case 'autoReview':
+      return 'Auto-review';
+    case 'default':
+      return 'Default permission';
+    case 'sandbox':
+      return 'Read-only';
+    case 'custom':
+      return 'Custom';
+    default:
+      return 'Custom';
+  }
 }
 
 function sendStateForThread(thread: AppServerThread, activeTurn: AppServerTurn | null): ThreadSendState {
@@ -2249,6 +2640,154 @@ function recordFromUnknown(value: unknown): Record<string, unknown> {
 function stringField(record: Record<string, unknown>, field: string): string | undefined {
   const value = record[field];
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function numberField(record: Record<string, unknown> | undefined, field: string): number | undefined {
+  if (!record) {
+    return undefined;
+  }
+  const value = record[field];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function transcriptWithLiveProgress(
+  transcript: ThreadTranscript,
+  state: AppServerLiveThreadState
+): ThreadTranscript {
+  if (state.goal === undefined && !state.usage) {
+    return transcript;
+  }
+
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    ...(state.goal !== undefined ? { goal: state.goal } : {}),
+    ...(state.usage ? { usage: state.usage } : {})
+  });
+}
+
+function normalizeAppServerGoal(goal: AppServerThreadGoal | null | undefined): ThreadGoal | null {
+  if (!goal || typeof goal !== 'object') {
+    return null;
+  }
+
+  const rawStatus = String(goal.status ?? '').trim();
+  const status =
+    rawStatus === 'budget_limited'
+      ? 'budgetLimited'
+      : rawStatus === 'active' ||
+          rawStatus === 'paused' ||
+          rawStatus === 'budgetLimited' ||
+          rawStatus === 'complete'
+        ? rawStatus
+        : 'active';
+  const threadId = goal.threadId ?? goal.thread_id;
+  const objective = goal.objective?.trim();
+  if (!threadId || !objective) {
+    return null;
+  }
+
+  return ThreadGoalSchema.parse({
+    threadId,
+    objective,
+    status,
+    tokenBudget: goal.tokenBudget ?? goal.token_budget ?? null,
+    tokensUsed: goal.tokensUsed ?? goal.tokens_used ?? 0,
+    timeUsedSeconds: goal.timeUsedSeconds ?? goal.time_used_seconds ?? 0,
+    createdAt: goal.createdAt ?? goal.created_at ?? 0,
+    updatedAt: goal.updatedAt ?? goal.updated_at ?? 0
+  });
+}
+
+type NormalizedAppServerTokenUsage = {
+  usage: ThreadUsage;
+  tokensUsed?: number;
+};
+
+function normalizeAppServerTokenUsage(raw: unknown): NormalizedAppServerTokenUsage | undefined {
+  const tokenUsage = recordFromUnknown(raw);
+  if (!Object.keys(tokenUsage).length) {
+    return undefined;
+  }
+
+  const total = recordField(tokenUsage, 'total') ?? recordField(tokenUsage, 'total_token_usage');
+  const last = recordField(tokenUsage, 'last') ?? recordField(tokenUsage, 'last_token_usage');
+  const tokensUsed = tokenCountFromBreakdown(total);
+  const contextTokens = tokenCountFromBreakdown(last) ?? tokensUsed;
+  const contextWindow =
+    numberField(tokenUsage, 'modelContextWindow') ?? numberField(tokenUsage, 'model_context_window');
+  const contextUsedPercent =
+    contextTokens !== undefined && contextWindow !== undefined && contextWindow > 0
+      ? Math.min(100, Math.round((contextTokens / contextWindow) * 100))
+      : undefined;
+
+  if (tokensUsed === undefined && contextTokens === undefined && contextWindow === undefined) {
+    return undefined;
+  }
+
+  return {
+    usage: ThreadUsageSchema.parse({
+      ...(contextTokens !== undefined ? { contextTokens } : {}),
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(contextUsedPercent !== undefined ? { contextUsedPercent } : {})
+    }),
+    ...(tokensUsed !== undefined ? { tokensUsed } : {})
+  };
+}
+
+function tokenCountFromBreakdown(record: Record<string, unknown> | undefined): number | undefined {
+  const explicit = numberField(record, 'totalTokens') ?? numberField(record, 'total_tokens');
+  if (explicit !== undefined) {
+    return Math.max(0, Math.round(explicit));
+  }
+  if (!record) {
+    return undefined;
+  }
+
+  const pieces = [
+    numberField(record, 'inputTokens') ?? numberField(record, 'input_tokens'),
+    numberField(record, 'cachedInputTokens') ?? numberField(record, 'cached_input_tokens'),
+    numberField(record, 'outputTokens') ?? numberField(record, 'output_tokens'),
+    numberField(record, 'reasoningOutputTokens') ?? numberField(record, 'reasoning_output_tokens')
+  ].filter((value): value is number => value !== undefined);
+
+  if (!pieces.length) {
+    return undefined;
+  }
+  return Math.max(0, Math.round(pieces.reduce((sum, value) => sum + value, 0)));
+}
+
+function goalWithTokensUsed(goal: ThreadGoal, tokensUsed: number): ThreadGoal {
+  const nextTokensUsed = Math.max(goal.tokensUsed, Math.max(0, Math.round(tokensUsed)));
+  if (nextTokensUsed === goal.tokensUsed) {
+    return goal;
+  }
+  return ThreadGoalSchema.parse({
+    ...goal,
+    tokensUsed: nextTokensUsed
+  });
+}
+
+function goalTokensUsedFromTotal(state: AppServerLiveThreadState, totalTokensUsed: number): number {
+  if (state.goalTokenBaseline === undefined) {
+    state.goalTokenBaseline = Math.max(0, totalTokensUsed - (state.goal?.tokensUsed ?? 0));
+  }
+  return Math.max(0, Math.round(totalTokensUsed - state.goalTokenBaseline));
+}
+
+function goalStatusToAppServer(status: ThreadGoal['status']): string {
+  return status;
+}
+
+function isGoalFeatureDisabledError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /goals feature is disabled|method not found|unknown method/i.test(message);
 }
 
 function arrayField(record: Record<string, unknown>, field: string): unknown[] {

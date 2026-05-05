@@ -48,6 +48,12 @@ export type ActivityGroup = {
 
 export type RenderableEntry =
   | { type: 'message'; message: ChatMessage }
+  | {
+      type: 'contextCompaction';
+      id: string;
+      message: ChatMessage;
+      status: Extract<ActivityStatus, 'completed' | 'running'>;
+    }
   | { type: 'activityGroup'; group: ActivityGroup }
   | { type: 'fileChanges'; id: string; turnId?: string; summaries: ThreadFileChangeSummary[] };
 
@@ -55,6 +61,7 @@ export function buildRenderableEntries(
   messages: ChatMessage[],
   options: {
     isLive?: boolean;
+    isCompacting?: boolean;
     preserveInputOrder?: boolean;
     fileChanges?: ThreadFileChangeSummary[];
   } = {}
@@ -93,19 +100,54 @@ export function buildRenderableEntries(
     if (turnBuffer.length > 0) {
       const finalIndex = findFinalResponseIndex(turnBuffer, options);
       const finalMessage = finalIndex >= 0 ? turnBuffer[finalIndex]! : null;
-      const activityMessages = finalMessage
+      const rawActivityMessages = finalMessage
         ? turnBuffer.filter((_, index) => index !== finalIndex)
         : turnBuffer.slice();
 
-      if (activityMessages.length > 0) {
-        result.push({
-          type: 'activityGroup',
-          group: buildActivityGroup(activityMessages, finalMessage)
-        });
-      }
-
       if (finalMessage) {
+        const activityMessages = rawActivityMessages.filter(
+          (message) => !isContextCompactionMessage(message)
+        );
+        if (activityMessages.length > 0) {
+          result.push({
+            type: 'activityGroup',
+            group: buildActivityGroup(activityMessages, finalMessage, currentUserMessage?.createdAt)
+          });
+        }
         result.push({ type: 'message', message: finalMessage });
+      } else {
+        let activityMessages: ChatMessage[] = [];
+        let segmentStartedAt = currentUserMessage?.createdAt;
+        const flushActivityMessages = (
+          status?: Extract<ActivityStatus, 'completed' | 'running'>
+        ) => {
+          if (activityMessages.length === 0) {
+            return;
+          }
+          result.push({
+            type: 'activityGroup',
+            group: buildActivityGroup(activityMessages, null, segmentStartedAt, status)
+          });
+          activityMessages = [];
+          segmentStartedAt = undefined;
+        };
+
+        rawActivityMessages.forEach((message, index) => {
+          if (!isContextCompactionMessage(message)) {
+            activityMessages.push(message);
+            return;
+          }
+
+          flushActivityMessages('completed');
+          result.push({
+            type: 'contextCompaction',
+            id: `context-compaction:${message.id}`,
+            message,
+            status: contextCompactionStatus(rawActivityMessages, index, options)
+          });
+        });
+
+        flushActivityMessages(options.isLive ? 'running' : undefined);
       }
     }
 
@@ -152,6 +194,21 @@ export function buildRenderableEntries(
     flushTurn();
   }
   return result;
+}
+
+function contextCompactionStatus(
+  messages: ChatMessage[],
+  compactionIndex: number,
+  options: { isCompacting?: boolean }
+): Extract<ActivityStatus, 'completed' | 'running'> {
+  const hasLaterNormalActivity = messages
+    .slice(compactionIndex + 1)
+    .some((message) => !isContextCompactionMessage(message));
+  return options.isCompacting && !hasLaterNormalActivity ? 'running' : 'completed';
+}
+
+function isContextCompactionMessage(message: ChatMessage): boolean {
+  return message.role === 'activity' && message.phase === 'context_compaction';
 }
 
 function fileChangesForTurn(
@@ -251,8 +308,22 @@ function sortMessagesByCreatedAt(messages: ChatMessage[]): ChatMessage[] {
 export function formatWorkLabel(
   messages: ChatMessage[],
   startedAt?: string,
-  endedAt?: string
+  endedAt?: string,
+  status: Extract<ActivityStatus, 'completed' | 'running'> = 'completed'
 ): string {
+  const duration = formatActivityDuration(messages, startedAt, endedAt, status);
+  if (duration) {
+    return duration;
+  }
+
+  if (messages.some((message) => message.phase === 'pending_send')) {
+    return 'Thinking';
+  }
+
+  if (status === 'running') {
+    return 'Working';
+  }
+
   const counts = messages.reduce<Record<WorkSummaryKind, number>>(
     (acc, message) => {
       const kind = classifyWorkMessage(message);
@@ -298,12 +369,6 @@ export function formatWorkLabel(
     return joined.charAt(0).toUpperCase() + joined.slice(1);
   }
 
-  if (messages.some((message) => message.phase === 'context_compaction')) {
-    return 'Compacting context';
-  }
-  if (messages.some((message) => message.phase === 'pending_send')) {
-    return 'Thinking';
-  }
   if (counts.reasoning > 0) {
     return 'Thought through the task';
   }
@@ -320,7 +385,8 @@ export function formatWorkLabel(
 export function formatActivityDuration(
   messages: ChatMessage[],
   startedAt?: string,
-  endedAt?: string
+  endedAt?: string,
+  status: Extract<ActivityStatus, 'completed' | 'running'> = 'completed'
 ): string | undefined {
   const first = Date.parse(startedAt ?? messages[0]?.createdAt ?? '');
   const last = Date.parse(endedAt ?? messages[messages.length - 1]?.createdAt ?? '');
@@ -331,10 +397,11 @@ export function formatActivityDuration(
   const seconds = Math.round((last - first) / 1000);
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
+  const verb = status === 'running' ? 'Working' : 'Worked';
   if (minutes > 0) {
-    return `Worked for ${minutes}m ${remainingSeconds}s`;
+    return `${verb} for ${minutes}m ${remainingSeconds}s`;
   }
-  return `Worked for ${seconds}s`;
+  return `${verb} for ${seconds}s`;
 }
 
 export function classifyWorkMessage(message: ChatMessage): WorkSummaryKind {
@@ -383,12 +450,14 @@ export function classifyWorkMessage(message: ChatMessage): WorkSummaryKind {
 
 function buildActivityGroup(
   messages: ChatMessage[],
-  finalMessage: ChatMessage | null
+  finalMessage: ChatMessage | null,
+  turnStartedAt?: string,
+  statusOverride?: Extract<ActivityStatus, 'completed' | 'running'>
 ): ActivityGroup {
-  const startedAt = messages[0]?.createdAt;
+  const startedAt = turnStartedAt ?? messages[0]?.createdAt;
   const endedAt = finalMessage?.createdAt ?? messages[messages.length - 1]?.createdAt;
   const hasFinalResponse = Boolean(finalMessage);
-  const status = hasFinalResponse ? 'completed' : 'running';
+  const status = statusOverride ?? (hasFinalResponse ? 'completed' : 'running');
   const latestIndex = messages.length - 1;
   const items = messages.map((message, index) =>
     buildActivityGroupItem(
@@ -402,15 +471,14 @@ function buildActivityGroup(
     messages,
     items,
     status,
-    title: formatWorkLabel(messages, startedAt, endedAt),
-    durationLabel: formatActivityDuration(messages, startedAt, endedAt),
+    title: formatWorkLabel(messages, startedAt, endedAt, status),
+    durationLabel: formatActivityDuration(messages, startedAt, endedAt, status),
     startedAt,
     endedAt,
     imageCount: messages.reduce((count, message) => count + (message.attachments?.length ?? 0), 0),
     hasFinalResponse
   };
 }
-
 function buildActivityGroupItem(
   message: ChatMessage,
   status: ActivityStatus

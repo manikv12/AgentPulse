@@ -313,6 +313,214 @@ describe('Agent Pulse tablet UI', () => {
     );
   });
 
+  it('clears the waiting approval banner after the user allows an approval', async () => {
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+    const thread = {
+      threadId: 'thread-approval',
+      provider: 'codex',
+      title: 'Approval cleanup',
+      workspace: 'CodexPulse',
+      status: 'waiting_approval',
+      lastActivityAt: '2026-05-05T14:00:00Z',
+      lastTurnSummary: 'Needs approval'
+    } as const;
+    const waitingTranscript: ThreadTranscript = {
+      threadId: 'thread-approval',
+      provider: 'codex',
+      activeTurnId: 'turn-approval',
+      sendState: {
+        canSend: false,
+        reason: 'waiting_on_approval',
+        label: 'Codex is waiting for approval'
+      },
+      messages: []
+    };
+    const pendingApproval = {
+      id: 'request-1',
+      method: 'mcpServer/elicitation/request',
+      params: {
+        threadId: 'thread-approval',
+        turnId: 'turn-approval',
+        serverName: 'browser-use',
+        message: 'Allow Browser Use to inspect the page?'
+      },
+      turnId: 'turn-approval'
+    };
+
+    localStorage.setItem('agent-pulse-session', JSON.stringify(session));
+    localStorage.setItem(`agent-pulse:threads-cache:${session.deviceId}`, JSON.stringify([thread]));
+    localStorage.setItem(
+      `agent-pulse:transcripts-cache:${session.deviceId}`,
+      JSON.stringify({ 'thread-approval': waitingTranscript })
+    );
+    sessionStorage.setItem('agent-pulse:active-thread', 'thread-approval');
+    window.location.hash = '#/threads/thread-approval';
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {}
+
+      close(): void {}
+    }
+
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/health/get') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            codexAppServer: 'connected',
+            version: '0.1.0',
+            uptimeSec: 60
+          })
+        };
+      }
+
+      if (url === '/threads/list') {
+        return { ok: true, json: async () => ({ threads: [thread], groups: [] }) };
+      }
+
+      if (url === '/threads/seen-activity') {
+        return { ok: true, json: async () => ({ entries: {} }) };
+      }
+
+      if (url === '/projects/list') {
+        return { ok: true, json: async () => ({ projects: [] }) };
+      }
+
+      if (url === '/handoffs') {
+        return { ok: true, json: async () => ({ handoffs: [] }) };
+      }
+
+      if (url === '/approvals/inbox') {
+        return { ok: true, json: async () => ({ items: [], total: 0 }) };
+      }
+
+      if (url === '/commands/touch-sheet' || url === '/commands/touch-sheet?threadId=thread-approval') {
+        return { ok: true, json: async () => ({ commands: [] }) };
+      }
+
+      if (url === '/catalog/plugins') {
+        return { ok: true, json: async () => ({ plugins: [] }) };
+      }
+
+      if (url === '/catalog/skills') {
+        return { ok: true, json: async () => ({ skills: [] }) };
+      }
+
+      if (url === '/catalog/commands') {
+        return { ok: true, json: async () => ({ commands: [] }) };
+      }
+
+      if (url === '/catalog/models') {
+        return { ok: true, json: async () => ({ models: [] }) };
+      }
+
+      if (url === '/threads/thread-approval/transcript?limit=16' || url === '/threads/thread-approval/transcript') {
+        return { ok: true, json: async () => waitingTranscript };
+      }
+
+      if (url === '/threads/thread-approval/pending-approvals') {
+        return {
+          ok: true,
+          json: async () => ({
+            threadId: 'thread-approval',
+            requests: [pendingApproval]
+          })
+        };
+      }
+
+      if (url === '/threads/thread-approval/approvals/request-1' && init?.method === 'POST') {
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText('Allow Browser Use to inspect the page?')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Allow' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/threads/thread-approval/approvals/request-1',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    await waitFor(() =>
+      expect(screen.queryByText('Codex is waiting for approval')).not.toBeInTheDocument()
+    );
+  });
+
+  it('lets the user choose a Codex permission mode before sending', async () => {
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-permissions',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      permissionMode: {
+        mode: 'default',
+        label: 'Default permission',
+        approvalPolicy: 'on-request',
+        sandboxMode: 'workspace-write'
+      },
+      messages: []
+    };
+    const sendMessage = vi.fn(async (
+      _threadId: string,
+      _text: string,
+      _options?: { permissionMode?: string }
+    ): Promise<ThreadMessageResponse> => ({
+      ok: true,
+      mode: 'start',
+      turnId: 'turn-1',
+      transcript
+    }));
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-permissions',
+          title: 'Permission mode',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-05-05T14:00:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Codex permission mode:/ }));
+    expect(screen.queryByRole('menuitemradio', { name: 'Sandbox' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /Auto-review/i }));
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Check safely.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenCalledWith(
+        'thread-permissions',
+        'Check safely.',
+        { permissionMode: 'autoReview' }
+      )
+    );
+  });
+
   it('confirms before deleting a thread from the thread header', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-live',
@@ -347,6 +555,328 @@ describe('Agent Pulse tablet UI', () => {
 
     await waitFor(() => expect(deleteThread).toHaveBeenCalledWith('thread-live'));
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/delete this thread/i));
+  });
+
+  it('lets a Codex thread save a goal from the goal panel', async () => {
+    const onUpdateGoal = vi.fn(async () => ({
+      threadId: 'thread-goal',
+      objective: 'Ship goal mode.',
+      status: 'active' as const,
+      tokenBudget: 200000,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1777900000,
+      updatedAt: 1777900000
+    }));
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-goal',
+          title: 'Slash goal',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-05-04T12:00:00Z',
+          lastTurnSummary: 'Ready'
+        }}
+        liveTranscript={{
+          threadId: 'thread-goal',
+          activeTurnId: null,
+          sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+          messages: [],
+          goal: null
+        }}
+        sendMessage={vi.fn()}
+        onUpdateGoal={onUpdateGoal}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open composer options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Set goal/ }));
+    fireEvent.change(screen.getByPlaceholderText('Example: Finish the slash goal integration and verify tests.'), {
+      target: { value: 'Ship goal mode.' }
+    });
+    fireEvent.change(screen.getByPlaceholderText('Token budget'), {
+      target: { value: '200000' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Save goal/ }));
+
+    await waitFor(() =>
+      expect(onUpdateGoal).toHaveBeenCalledWith({
+        objective: 'Ship goal mode.',
+        status: 'active',
+        tokenBudget: 200000
+      })
+    );
+  });
+
+  it('sends a real start message after saving a Codex goal from the app', async () => {
+    const session = {
+      token: 'token-1234567890',
+      deviceId: 'device-1',
+      fingerprint: 'browser-fingerprint',
+      deviceName: 'Desk tablet'
+    };
+    const thread = {
+      threadId: 'thread-goal-app',
+      provider: 'codex',
+      title: 'Goal mode app',
+      workspace: 'CodexPulse',
+      status: 'idle',
+      lastActivityAt: '2026-05-05T14:00:00Z',
+      lastTurnSummary: 'Ready'
+    } as const;
+    const savedGoal = {
+      threadId: 'thread-goal-app',
+      objective: 'Ship goal mode.',
+      status: 'active' as const,
+      tokenBudget: null,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1777900000,
+      updatedAt: 1777900000
+    };
+    const baseTranscript: ThreadTranscript = {
+      threadId: 'thread-goal-app',
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [],
+      goal: null
+    };
+    const sentMessages: Array<Record<string, unknown>> = [];
+
+    localStorage.setItem('agent-pulse-session', JSON.stringify(session));
+    localStorage.setItem(`agent-pulse:threads-cache:${session.deviceId}`, JSON.stringify([thread]));
+    localStorage.setItem(
+      `agent-pulse:transcripts-cache:${session.deviceId}`,
+      JSON.stringify({ 'thread-goal-app': baseTranscript })
+    );
+    sessionStorage.setItem('agent-pulse:active-thread', 'thread-goal-app');
+    window.location.hash = '#/threads/thread-goal-app';
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {}
+
+      close(): void {}
+    }
+
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === '/health/get') {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'ok',
+              codexAppServer: 'connected',
+              version: '0.1.0',
+              uptimeSec: 60
+            })
+          };
+        }
+
+        if (url === '/threads/list') {
+          return { ok: true, json: async () => ({ threads: [thread], groups: [] }) };
+        }
+
+        if (url === '/threads/seen-activity') {
+          return { ok: true, json: async () => ({ entries: {} }) };
+        }
+
+        if (url === '/projects/list') {
+          return { ok: true, json: async () => ({ projects: [] }) };
+        }
+
+        if (url === '/handoffs') {
+          return { ok: true, json: async () => ({ handoffs: [] }) };
+        }
+
+        if (url === '/approvals/inbox') {
+          return { ok: true, json: async () => ({ items: [], total: 0 }) };
+        }
+
+        if (url === '/commands/touch-sheet' || url === '/commands/touch-sheet?threadId=thread-goal-app') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/plugins') {
+          return { ok: true, json: async () => ({ plugins: [] }) };
+        }
+
+        if (url === '/catalog/skills') {
+          return { ok: true, json: async () => ({ skills: [] }) };
+        }
+
+        if (url === '/catalog/commands') {
+          return { ok: true, json: async () => ({ commands: [] }) };
+        }
+
+        if (url === '/catalog/models') {
+          return { ok: true, json: async () => ({ models: [] }) };
+        }
+
+        if (url === '/threads/thread-goal-app/transcript?limit=16') {
+          return { ok: true, json: async () => baseTranscript };
+        }
+
+        if (url === '/threads/thread-goal-app/goal' && init?.method === 'PUT') {
+          expect(JSON.parse(String(init.body))).toEqual({
+            objective: 'Ship goal mode.',
+            status: 'active'
+          });
+          return { ok: true, json: async () => ({ goal: savedGoal }) };
+        }
+
+        if (url === '/threads/thread-goal-app/messages' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          sentMessages.push(body);
+          return {
+            ok: true,
+            json: async () => ({
+              ok: true,
+              mode: 'start',
+              turnId: 'turn-goal-start',
+              transcript: {
+                ...baseTranscript,
+                activeTurnId: 'turn-goal-start',
+                sendState: {
+                  canSend: false,
+                  reason: 'missing_active_turn',
+                  label: 'Codex is working'
+                },
+                goal: savedGoal,
+                messages: [
+                  {
+                    id: 'user:turn-goal-start',
+                    role: 'user',
+                    kind: 'message',
+                    text: 'Please start working on the goal.',
+                    turnId: 'turn-goal-start',
+                    createdAt: '2026-05-05T14:01:00Z'
+                  }
+                ]
+              }
+            })
+          };
+        }
+
+        throw new Error(`Unexpected URL ${url}`);
+      })
+    );
+
+    render(<App />);
+
+    expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open composer options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Set goal/ }));
+    fireEvent.change(screen.getByPlaceholderText('Example: Finish the slash goal integration and verify tests.'), {
+      target: { value: 'Ship goal mode.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Save goal/ }));
+
+    await waitFor(() =>
+      expect(sentMessages).toEqual([
+        expect.objectContaining({
+          text: 'Please start working on the goal.'
+        })
+      ])
+    );
+    expect(await screen.findByText('Please start working on the goal.')).toBeInTheDocument();
+  });
+
+  it('lets a Codex thread close or clear an existing goal from the editor', async () => {
+    const onUpdateGoal = vi.fn();
+    const onClearGoal = vi.fn(async () => undefined);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-goal',
+          title: 'Slash goal',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-05-04T12:00:00Z',
+          lastTurnSummary: 'Ready'
+        }}
+        liveTranscript={{
+          threadId: 'thread-goal',
+          activeTurnId: null,
+          sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+          messages: [],
+          goal: {
+            threadId: 'thread-goal',
+            objective: 'Keep working until the feature is verified.',
+            status: 'active',
+            tokenBudget: null,
+            tokensUsed: 1200,
+            timeUsedSeconds: 90,
+            createdAt: 1777900000,
+            updatedAt: nowSeconds
+          }
+        }}
+        sendMessage={vi.fn()}
+        onUpdateGoal={onUpdateGoal}
+        onClearGoal={onClearGoal}
+      />
+    );
+
+    expect(screen.getByText('1m')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: /Goal Active/ }));
+    expect(screen.getByRole('button', { name: 'Clear goal' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Done' })).not.toBeInTheDocument();
+
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('button', { name: 'Clear goal' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Goal Active/ })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Goal Active/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Clear goal' }));
+    await waitFor(() => expect(onClearGoal).toHaveBeenCalledTimes(1));
+  });
+
+  it('shows active goal elapsed time from the latest server snapshot', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(new Date('2026-05-04T12:01:00Z').getTime());
+    const goalUpdatedAt = Math.floor(new Date('2026-05-04T12:00:00Z').getTime() / 1000);
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-goal',
+          title: 'Slash goal',
+          workspace: 'CodexPulse',
+          status: 'running',
+          lastActivityAt: '2026-05-04T12:00:00Z',
+          lastTurnSummary: 'Working'
+        }}
+        liveTranscript={{
+          threadId: 'thread-goal',
+          activeTurnId: 'turn-1',
+          sendState: { canSend: false, reason: 'thread_changed', label: 'Codex is working' },
+          messages: [],
+          goal: {
+            threadId: 'thread-goal',
+            objective: 'Show live progress.',
+            status: 'active',
+            tokenBudget: null,
+            tokensUsed: 0,
+            timeUsedSeconds: 0,
+            createdAt: goalUpdatedAt,
+            updatedAt: goalUpdatedAt
+          }
+        }}
+        sendMessage={vi.fn()}
+        onUpdateGoal={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: /Time 1m/ })).toBeInTheDocument();
   });
 
   it('turns off auto-capitalization for admin and pairing inputs', async () => {
@@ -1270,7 +1800,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/running-1/transcript?limit=40') {
+        if (url === '/threads/running-1/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -1386,7 +1916,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -1526,7 +2056,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -1672,7 +2202,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -1841,7 +2371,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -1993,7 +2523,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -2164,7 +2694,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -2358,7 +2888,7 @@ describe('Agent Pulse tablet UI', () => {
           };
         }
 
-        if (url === '/threads/thread-model/transcript?limit=40') {
+        if (url === '/threads/thread-model/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -2510,7 +3040,7 @@ describe('Agent Pulse tablet UI', () => {
           };
         }
 
-        if (url === '/threads/claude-code%3Athread-model/transcript?limit=40') {
+        if (url === '/threads/claude-code%3Athread-model/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -2670,7 +3200,7 @@ describe('Agent Pulse tablet UI', () => {
           };
         }
 
-        if (url === '/threads/copilot%3Athread-model/transcript?limit=40') {
+        if (url === '/threads/copilot%3Athread-model/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -2790,7 +3320,7 @@ describe('Agent Pulse tablet UI', () => {
         return { ok: true, json: async () => ({ models: [] }) };
       }
 
-      if (url === '/threads/thread-live/transcript?limit=40') {
+      if (url === '/threads/thread-live/transcript?limit=16') {
         return {
           ok: true,
           json: async () => ({
@@ -2928,7 +3458,7 @@ describe('Agent Pulse tablet UI', () => {
         return { ok: true, json: async () => ({ models: [] }) };
       }
 
-      if (url === '/threads/thread-live/transcript?limit=40') {
+      if (url === '/threads/thread-live/transcript?limit=16') {
         return {
           ok: true,
           json: async () => ({
@@ -3066,7 +3596,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -3171,7 +3701,7 @@ describe('Agent Pulse tablet UI', () => {
           return { ok: true, json: async () => ({ models: [] }) };
         }
 
-        if (url === '/threads/thread-live/transcript?limit=40') {
+        if (url === '/threads/thread-live/transcript?limit=16') {
           return {
             ok: true,
             json: async () => ({
@@ -3529,6 +4059,142 @@ describe('Agent Pulse tablet UI', () => {
     expect(tile.getAttribute('aria-label')).toMatch(/Review/);
   });
 
+  it('does not flash cached idle threads as review before helper seen state loads', async () => {
+    localStorage.setItem(
+      'agent-pulse-session',
+      JSON.stringify({
+        token: 'token-1234567890',
+        deviceId: 'device-1',
+        fingerprint: 'browser-fingerprint',
+        deviceName: 'Desk tablet'
+      })
+    );
+
+    const threads = [
+      {
+        threadId: 'reviewed-1',
+        title: 'Usually reviewed',
+        workspace: 'CodexPulse',
+        status: 'idle',
+        lastActivityAt: '2026-05-03T19:55:00.000Z',
+        lastTurnSummary: ''
+      },
+      {
+        threadId: 'review-needed-1',
+        title: 'Needs a real review',
+        workspace: 'CodexPulse',
+        status: 'idle',
+        lastActivityAt: '2026-05-03T20:05:00.000Z',
+        lastTurnSummary: ''
+      }
+    ];
+    localStorage.setItem('agent-pulse:threads-cache:device-1', JSON.stringify(threads));
+
+    let resolveSeenActivity: ((response: Response) => void) | undefined;
+    const seenActivityResponse = new Promise<Response>((resolve) => {
+      resolveSeenActivity = resolve;
+    });
+
+    class MockWebSocket {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+
+      constructor(readonly url: string | URL) {}
+
+      close(): void {}
+    }
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/health/get') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            codexAppServer: 'connected',
+            version: '0.1.0',
+            uptimeSec: 60
+          })
+        };
+      }
+
+      if (url === '/threads/list') {
+        return { ok: true, json: async () => ({ threads }) };
+      }
+
+      if (url === '/threads/seen-activity') {
+        return seenActivityResponse;
+      }
+
+      if (url === '/projects/list') {
+        return { ok: true, json: async () => ({ projects: [] }) };
+      }
+
+      if (url === '/handoffs') {
+        return { ok: true, json: async () => ({ handoffs: [] }) };
+      }
+
+      if (url === '/approvals/inbox') {
+        return { ok: true, json: async () => ({ items: [] }) };
+      }
+
+      if (url === '/commands/touch-sheet') {
+        return { ok: true, json: async () => ({ commands: [] }) };
+      }
+
+      if (url === '/catalog/plugins') {
+        return { ok: true, json: async () => ({ plugins: [] }) };
+      }
+
+      if (url === '/catalog/skills') {
+        return { ok: true, json: async () => ({ skills: [] }) };
+      }
+
+      if (url === '/catalog/commands') {
+        return { ok: true, json: async () => ({ commands: [] }) };
+      }
+
+      if (url === '/catalog/models') {
+        return { ok: true, json: async () => ({ models: [] }) };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole('button', { name: 'Open Codex chat Usually reviewed' })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Needs review' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /Review .*Usually reviewed/i })
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveSeenActivity?.(
+        new Response(
+          JSON.stringify({
+            entries: {
+              'reviewed-1': Date.parse('2026-05-03T20:00:00.000Z')
+            }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      );
+    });
+
+    expect(
+      await screen.findByRole('button', { name: /Review .*Needs a real review/i })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /Review .*Usually reviewed/i })
+    ).not.toBeInTheDocument();
+  });
+
   it('marks review threads with the current time and syncs helper when helper state is older', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-05-03T20:00:00.000Z'));
@@ -3683,7 +4349,7 @@ describe('Agent Pulse tablet UI', () => {
           return threadsPromise as Promise<Response>;
         }
 
-        if (url === '/threads/running-1/transcript?limit=40') {
+        if (url === '/threads/running-1/transcript?limit=16') {
           return transcriptPromise as Promise<Response>;
         }
 
@@ -4143,7 +4809,7 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Implement mobile chat/ }));
 
     const drawer = await screen.findByTestId('thread-chat-drawer');
-    expect(fetchTranscript).toHaveBeenNthCalledWith(1, 'running-1', { messageLimit: 40 });
+    expect(fetchTranscript).toHaveBeenNthCalledWith(1, 'running-1', { messageLimit: 16 });
     expect(within(drawer).queryByRole('button', { name: 'Close' })).not.toBeInTheDocument();
     fireEvent.click(within(drawer).getByRole('button', { name: 'Open thread actions' }));
     fireEvent.click(within(drawer).getByRole('menuitem', { name: 'Open in Codex' }));
@@ -4157,7 +4823,7 @@ describe('Agent Pulse tablet UI', () => {
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Implement mobile chat/ }));
 
     await screen.findByText('Ready');
-    expect(fetchTranscript).toHaveBeenNthCalledWith(2, 'running-1', { messageLimit: 40 });
+    expect(fetchTranscript).toHaveBeenNthCalledWith(2, 'running-1', { messageLimit: 16 });
     fireEvent.change(screen.getByLabelText('Message Codex'), {
       target: { value: 'Hello from phone.' }
     });
@@ -4353,6 +5019,35 @@ describe('Agent Pulse tablet UI', () => {
     );
     expect(transcribeVoiceAudio).toHaveBeenCalledWith(expect.any(Blob));
     await waitFor(() => expect(screen.getByLabelText('Message Codex')).toHaveFocus());
+  });
+
+  it('stops voice recording as soon as the stop button is pressed', async () => {
+    installVoiceRecordingMocks();
+    const transcribeVoiceAudio = vi.fn(async () => 'Stopped from the full button.');
+
+    render(
+      <ThreadView
+        thread={voiceThread}
+        liveTranscript={readyVoiceTranscript}
+        sendMessage={vi.fn()}
+        transcribeVoiceAudio={transcribeVoiceAudio}
+        voiceTranscriptionAvailable
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Record voice message' }));
+
+    expect(await screen.findByText('Listening')).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Stop and transcribe voice' }), {
+      button: 0,
+      pointerId: 12
+    });
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Message Codex')).toHaveValue('Stopped from the full button.')
+    );
+    expect(transcribeVoiceAudio).toHaveBeenCalledTimes(1);
   });
 
   it('allows voice transcription while Codex is already working', async () => {
@@ -4593,7 +5288,7 @@ describe('Agent Pulse tablet UI', () => {
       expect(sendMessage).toHaveBeenCalledWith('running-1', 'Please check the slow send.')
     );
     expect(await screen.findByText('Please check the slow send.')).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: /Thinking/ })).toHaveLength(2);
+    expect(screen.getByRole('button', { name: /Working/ })).toBeInTheDocument();
     expect(screen.getByText(/Codex is thinking/i)).toBeInTheDocument();
     expect(screen.queryByText('Beginning of conversation.')).not.toBeInTheDocument();
     expect(screen.queryByText('No visible chat messages yet.')).not.toBeInTheDocument();
@@ -4877,6 +5572,86 @@ describe('Agent Pulse tablet UI', () => {
     );
   });
 
+  it('lets the user choose a photo from the composer menu and send it', async () => {
+    class MockFileReader {
+      result: string | ArrayBuffer | null = null;
+      onload: ((event: ProgressEvent<FileReader>) => void) | null = null;
+      onerror: (() => void) | null = null;
+
+      readAsDataURL() {
+        this.result = 'data:image/jpeg;base64,/9j/4AAQSkZJRg=';
+        this.onload?.({ target: this } as unknown as ProgressEvent<FileReader>);
+      }
+    }
+    vi.stubGlobal('FileReader', MockFileReader);
+    const transcript: ThreadTranscript = {
+      threadId: 'running-1',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const sendMessage = vi.fn().mockResolvedValue({
+      ok: true,
+      mode: 'start',
+      turnId: 'turn-1',
+      transcript
+    });
+
+    const { container } = render(
+      <ThreadView
+        thread={{
+          threadId: 'running-1',
+          title: 'Phone image',
+          workspace: 'Agent Pulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:18:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={transcript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open composer options' }));
+    expect(screen.getByRole('menuitem', { name: /Add image/ })).toBeEnabled();
+
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    const file = new File([new Uint8Array([4, 5, 6])], 'phone-photo.jpg', {
+      type: 'image/jpeg'
+    });
+    fireEvent.change(input!, {
+      target: { files: [file] }
+    });
+
+    expect(await screen.findByAltText('Pasted image 1')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'Please look at this photo.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenCalledWith(
+        'running-1',
+        'Please look at this photo.',
+        expect.objectContaining({
+          attachments: [
+            expect.objectContaining({
+              kind: 'image',
+              url: 'data:image/jpeg;base64,/9j/4AAQSkZJRg=',
+              alt: 'Pasted image 1',
+              mimeType: 'image/jpeg'
+            })
+          ]
+        })
+      )
+    );
+  });
+
   it('lets the user start implementation from a plan request card', async () => {
     const transcript: ThreadTranscript = {
       threadId: 'running-1',
@@ -5028,10 +5803,10 @@ describe('Agent Pulse tablet UI', () => {
     );
 
     expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
-    expect(fetchTranscript).toHaveBeenCalledWith('running-1', { messageLimit: 40 });
+    expect(fetchTranscript).toHaveBeenCalledWith('running-1', { messageLimit: 16 });
   });
 
-  it('keeps the latest two messages as the live tail and auto-loads more history near the top', async () => {
+  it('keeps the latest two messages as the live tail and waits for a manual older-message load', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-1',
       activeTurnId: null,
@@ -5098,11 +5873,12 @@ describe('Agent Pulse tablet UI', () => {
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
 
-    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
-    expect(fetchTranscript).toHaveBeenCalledWith('thread-1', { messageLimit: 40 });
+    expect(fetchOlderMessages).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Load 10 earlier messages' })).toBeInTheDocument();
+    expect(fetchTranscript).toHaveBeenCalledWith('thread-1', { messageLimit: 16 });
   });
 
-  it('preserves the visible message position when older pages are prepended', async () => {
+  it('loads a manually requested older message page', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-1',
       activeTurnId: null,
@@ -5217,9 +5993,12 @@ describe('Agent Pulse tablet UI', () => {
 
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load 10 earlier messages' }));
+    });
 
     expect(await screen.findByText('Older assistant message')).toBeInTheDocument();
-    await waitFor(() => expect(scroller.scrollTop).toBe(180));
+    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-3', 10));
   });
 
   it('keeps the visible message steady while the older-message loader appears', async () => {
@@ -5343,6 +6122,7 @@ describe('Agent Pulse tablet UI', () => {
 
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
+    fireEvent.click(screen.getByRole('button', { name: 'Load 10 earlier messages' }));
 
     expect(await screen.findByText('Loading older messages…')).toBeInTheDocument();
     await waitFor(() => expect(scroller.scrollTop).toBe(30));
@@ -5374,7 +6154,7 @@ describe('Agent Pulse tablet UI', () => {
     await waitFor(() => expect(scroller.scrollTop).toBe(180));
   });
 
-  it('auto-loads older messages when the latest messages do not fill the viewport', async () => {
+  it('does not auto-load older messages when the latest messages do not fill the viewport', async () => {
     const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
       threadId: 'thread-1',
       activeTurnId: null,
@@ -5426,8 +6206,71 @@ describe('Agent Pulse tablet UI', () => {
     scroller.scrollTop = 0;
     fireEvent.scroll(scroller);
 
-    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-3', 40));
-    expect(await screen.findByText('Beginning of conversation.')).toBeInTheDocument();
+    expect(fetchOlderMessages).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Load 10 earlier messages' })).toBeInTheDocument();
+  });
+
+  it('auto-loads older messages when the visible tail has no user prompt', async () => {
+    const fetchTranscript = vi.fn(async (): Promise<ThreadTranscript> => ({
+      threadId: 'thread-1',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'activity-1',
+          role: 'activity',
+          kind: 'command',
+          text: 'rg -n "logs" apps/helper/src/server/agent-pulse-server.ts',
+          createdAt: '2026-04-25T16:16:20Z'
+        },
+        {
+          id: 'activity-2',
+          role: 'activity',
+          kind: 'file',
+          text: 'File change completed',
+          createdAt: '2026-04-25T16:16:40Z'
+        },
+        {
+          id: 'message-4',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Removed the noisy logs.',
+          createdAt: '2026-04-25T16:17:00Z'
+        }
+      ]
+    }));
+    const fetchOlderMessages = vi.fn(async () => ({
+      threadId: 'thread-1',
+      messages: [
+        {
+          id: 'message-3',
+          role: 'user' as const,
+          kind: 'message' as const,
+          text: 'Remove noisy helper logs.',
+          createdAt: '2026-04-25T16:16:00Z'
+        }
+      ],
+      hasMore: false
+    }));
+
+    render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-1',
+          title: 'Thread',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:17:00Z',
+          lastTurnSummary: ''
+        }}
+        fetchTranscript={fetchTranscript}
+        fetchOlderMessages={fetchOlderMessages}
+      />
+    );
+
+    expect(await screen.findByText('Removed the noisy logs.')).toBeInTheDocument();
+    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('activity-1', 10));
+    expect(await screen.findByText('Remove noisy helper logs.')).toBeInTheDocument();
   });
 
   it('keeps the manual older-message control as a fallback', async () => {
@@ -5488,9 +6331,9 @@ describe('Agent Pulse tablet UI', () => {
     });
     scroller.scrollTop = 240;
 
-    fireEvent.click(screen.getByRole('button', { name: 'Load earlier messages' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load 10 earlier messages' }));
 
-    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 40));
+    await waitFor(() => expect(fetchOlderMessages).toHaveBeenCalledWith('message-1', 10));
   });
 
   it('clears the attention dot after the user opens and leaves a thread', async () => {
@@ -6036,7 +6879,90 @@ describe('Agent Pulse tablet UI', () => {
     );
 
     await waitFor(() => expect(screen.getByText('New pending message')).toBeInTheDocument());
+    expect(screen.queryByText('Old question')).not.toBeInTheDocument();
+    expect(screen.queryByText('Old answer')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /browser.screenshot completed from old turn/ })).not.toBeInTheDocument();
+  });
+
+  it('does not place a late previous assistant answer under a new pending message', async () => {
+    const baseTranscript: ThreadTranscript = {
+      threadId: 'thread-late-answer',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'old-user',
+          role: 'user',
+          kind: 'message',
+          text: 'Old question',
+          createdAt: '2026-04-25T16:14:00Z'
+        }
+      ]
+    };
+    const latePreviousTranscript: ThreadTranscript = {
+      ...baseTranscript,
+      messages: [
+        ...baseTranscript.messages,
+        {
+          id: 'late-old-answer',
+          role: 'assistant',
+          kind: 'message',
+          phase: 'final_answer',
+          text: 'Late answer from the previous turn',
+          createdAt: new Date(Date.now() - 1_000).toISOString()
+        }
+      ]
+    };
+    const sendMessage = vi.fn(
+      () =>
+        new Promise<{
+          ok: true;
+          mode: 'start';
+          turnId: string;
+          transcript: ThreadTranscript;
+        }>(() => undefined)
+    );
+
+    const { rerender } = render(
+      <ThreadView
+        thread={{
+          threadId: 'thread-late-answer',
+          title: 'Late answer',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={baseTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText('Message Codex'), {
+      target: { value: 'New pending message' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByText('New pending message')).toBeInTheDocument();
+
+    rerender(
+      <ThreadView
+        thread={{
+          threadId: 'thread-late-answer',
+          title: 'Late answer',
+          workspace: 'CodexPulse',
+          status: 'idle',
+          lastActivityAt: '2026-04-25T16:15:00Z',
+          lastTurnSummary: ''
+        }}
+        liveTranscript={latePreviousTranscript}
+        sendMessage={sendMessage}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText('New pending message')).toBeInTheDocument());
+    expect(screen.queryByText('Old question')).not.toBeInTheDocument();
+    expect(screen.queryByText('Late answer from the previous turn')).not.toBeInTheDocument();
+    expect(screen.getByText(/Codex is thinking/i)).toBeInTheDocument();
   });
 
   it('groups agent work between chat messages and expands screenshots on demand', async () => {
@@ -7057,7 +7983,8 @@ describe('Agent Pulse tablet UI', () => {
     await waitFor(() =>
       expect(onNewThread).toHaveBeenCalledWith({
         location: 'chat',
-        provider: 'codex'
+        provider: 'codex',
+        permissionMode: 'default'
       })
     );
     expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
@@ -7112,7 +8039,8 @@ describe('Agent Pulse tablet UI', () => {
     await waitFor(() =>
       expect(onNewThread).toHaveBeenCalledWith({
         projectId: 'project-codexpulse',
-        provider: 'codex'
+        provider: 'codex',
+        permissionMode: 'default'
       })
     );
     expect(await screen.findByTestId('thread-chat-drawer')).toBeInTheDocument();
@@ -7279,7 +8207,8 @@ describe('Agent Pulse tablet UI', () => {
     await waitFor(() =>
       expect(onNewThread).toHaveBeenCalledWith({
         location: 'chat',
-        provider: 'codex'
+        provider: 'codex',
+        permissionMode: 'default'
       })
     );
   });

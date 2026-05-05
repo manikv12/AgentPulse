@@ -159,7 +159,7 @@ describe('codex mirror', () => {
         threadId: 'thread-1',
         input: [
           { type: 'text', text: 'look at this', text_elements: [] },
-          { type: 'input_image', image_url: { url: imageUrl } }
+          { type: 'image', image_url: { url: imageUrl } }
         ]
       }
     });
@@ -654,6 +654,30 @@ describe('codex mirror', () => {
     mirror.dispose();
   });
 
+  it('passes selected permission mode through the desktop follower start-turn params', async () => {
+    const { ipc, setReady, sendRequest } = createMockIpc();
+    setReady(true);
+    sendRequest.mockResolvedValueOnce({ result: { turn: { id: 'turn-1' } } });
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const mirror = createCodexMirror({ ipc, reader });
+
+    await mirror.sendMessage('thread-abc', 'Run without sandbox prompts.', {
+      permissionMode: 'fullAccess',
+      cwd: '/Users/me/projects/CodexPulse'
+    });
+
+    expect(sendRequest).toHaveBeenCalledWith('thread-follower-start-turn', {
+      conversationId: 'thread-abc',
+      turnStartParams: expect.objectContaining({
+        threadId: 'thread-abc',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        sandboxPolicy: { type: 'dangerFullAccess' }
+      })
+    });
+    mirror.dispose();
+  });
+
   it('exposes pending MCP elicitation approvals from Computer Use', () => {
     const { ipc, setReady, emitBroadcast } = createMockIpc();
     setReady(true);
@@ -713,6 +737,70 @@ describe('codex mirror', () => {
         id: 'mcp-approval-1',
         method: 'mcpServer/elicitation/request',
         turnId: 'turn-7'
+      })
+    ]);
+    mirror.dispose();
+  });
+
+  it('exposes pending MCP elicitation approvals from Browser Use', () => {
+    const { ipc, setReady, emitBroadcast } = createMockIpc();
+    setReady(true);
+    const reader = { readTranscript: vi.fn(async () => transcriptStub) };
+    const onPendingApprovalsChange = vi.fn();
+    const mirror = createCodexMirror({ ipc, reader, onPendingApprovalsChange });
+
+    emitBroadcast('thread-stream-state-changed', {
+      hostId: 'local',
+      conversationId: 'thread-browser-approval',
+      change: {
+        type: 'patches',
+        patches: [
+          {
+            op: 'add',
+            path: ['conversationState', 'requests', 0],
+            value: {
+              id: 'browser-approval-1',
+              method: 'mcpServer/elicitation/request',
+              params: {
+                threadId: 'thread-browser-approval',
+                turnId: 'turn-browser',
+                serverName: 'browser-use',
+                mode: 'form',
+                message: 'Allow Browser Use to open a page?',
+                _meta: {
+                  codex_approval_kind: 'mcp_tool_call',
+                  connector_id: 'browser-use',
+                  connector_name: 'Browser Use',
+                  tool_params: { url: 'https://example.com' },
+                  persist: ['session', 'always']
+                },
+                requestedSchema: {
+                  type: 'object',
+                  properties: {}
+                }
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(mirror.isThreadWaitingForApproval('thread-browser-approval')).toBe(true);
+    expect(onPendingApprovalsChange).toHaveBeenCalledWith({
+      threadId: 'thread-browser-approval',
+      requests: [
+        expect.objectContaining({
+          id: 'browser-approval-1',
+          method: 'mcpServer/elicitation/request',
+          turnId: 'turn-browser'
+        })
+      ]
+    });
+    expect(mirror.getPendingApprovalRequests('thread-browser-approval')).toEqual([
+      expect.objectContaining({
+        id: 'browser-approval-1',
+        method: 'mcpServer/elicitation/request',
+        turnId: 'turn-browser'
       })
     ]);
     mirror.dispose();

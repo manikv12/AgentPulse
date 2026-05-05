@@ -1,10 +1,12 @@
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createPrivateKey, randomUUID, sign as signPayload } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import type { IncomingMessage, Server } from 'node:http';
+import { connect, constants as http2Constants } from 'node:http2';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import type { Duplex } from 'node:stream';
 import { serve } from '@hono/node-server';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import { serveStatic } from '@hono/node-server/serve-static';
@@ -46,6 +48,9 @@ import {
   ThreadDeleteResponseSchema,
   ThreadFileChangeActionRequestSchema,
   ThreadFileChangeActionResponseSchema,
+  ThreadGoalClearResponseSchema,
+  ThreadGoalResponseSchema,
+  ThreadGoalUpdateRequestSchema,
   ThreadMessageRequestSchema,
   ThreadMessageResponseSchema,
   TranscriptCommentDraftRequestSchema,
@@ -68,6 +73,7 @@ import {
   type CollaborationModeKind,
   type AgentProvider,
   type ChatAttachment,
+  type SelectableCodexPermissionModeId,
   type ChatMessage,
   type CatalogModel,
   type HelperHealth,
@@ -82,6 +88,7 @@ import {
   type RemoteAccessMode,
   type RemoteAccessProtocol,
   type Thread,
+  type ThreadGoal,
   type ThreadFileChangeSummary,
   type ThreadListGroup,
   type ThreadMessageResponse,
@@ -90,7 +97,7 @@ import {
 import { Hono, type Context } from 'hono';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AdminAuth } from '../auth/admin';
-import { RateLimiter, type DeviceRegistry, type PairingManager } from '../auth/pairing';
+import { RateLimiter, type DeviceRecord, type DeviceRegistry, type PairingManager } from '../auth/pairing';
 import { isClaudeThreadId } from '../claude/claude-code';
 import { isCopilotThreadId } from '../copilot/copilot';
 import {
@@ -139,11 +146,36 @@ const MAX_VOICE_TRANSCRIPTION_BYTES = 24_000_000;
 const CHATGPT_TRANSCRIPTIONS_URL = 'https://chatgpt.com/backend-api/transcribe';
 const OPENAI_TRANSCRIPTIONS_URL = 'https://api.openai.com/v1/audio/transcriptions';
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
+const WATCH_APNS_JWT_TTL_MS = 50 * 60_000;
+const DEFAULT_WATCH_APNS_TOPIC = 'com.agentpulse.watch';
+const DEFAULT_WATCH_APNS_ENVIRONMENT: WatchApnsEnvironment = 'sandbox';
+
+type WatchPushNotification = {
+  threadId: string;
+  kind: 'finished' | 'errored' | 'attention';
+  title: string;
+  body: string;
+};
+
+export type WatchPushDelivery = {
+  send(device: DeviceRecord, notification: WatchPushNotification): Promise<void>;
+};
+
+type WatchApnsEnvironment = 'sandbox' | 'production';
+
+type WatchApnsConfig = {
+  teamId: string;
+  keyId: string;
+  privateKeyPem: string;
+  topic: string;
+  environment: WatchApnsEnvironment;
+};
 
 type MessageSendOptions = {
   model?: string;
   effort?: string;
   collaborationMode?: CollaborationModeKind;
+  permissionMode?: SelectableCodexPermissionModeId;
   attachments?: ChatAttachment[];
 };
 
@@ -184,10 +216,20 @@ export type AppServerChatBridge = {
   ): Promise<ThreadMessageResponse>;
   startThread?(
     cwd: string,
-    options?: { model?: string; reasoningEffort?: string }
+    options?: {
+      model?: string;
+      reasoningEffort?: string;
+      permissionMode?: SelectableCodexPermissionModeId;
+    }
   ): Promise<Thread>;
   interruptTurn?(threadId: string): Promise<void>;
   compactThread?(threadId: string): Promise<void>;
+  readGoal?(threadId: string): Promise<ThreadGoal | null>;
+  setGoal?(
+    threadId: string,
+    input: { objective?: string; status?: ThreadGoal['status']; tokenBudget?: number | null }
+  ): Promise<ThreadGoal>;
+  clearGoal?(threadId: string): Promise<boolean>;
   archiveThread?(threadId: string): Promise<void>;
   startReview?(threadId: string): Promise<void>;
   respondToApproval?(
@@ -320,6 +362,7 @@ export type AgentPulseServerOptions = {
   onLanModeChange?: (enabled: boolean) => Promise<void>;
   remoteAccess?: RemoteAccessController;
   voiceTranscriptionFetch?: typeof fetch;
+  watchPushDelivery?: WatchPushDelivery;
 };
 
 export type RemoteAccessController = {
@@ -396,6 +439,258 @@ export async function startAgentPulseServer(
   };
 }
 
+function createWatchApnsDelivery(): WatchPushDelivery {
+  let cachedPrivateKeyPem: string | undefined;
+  let privateKeyLoadPromise: Promise<string | undefined> | undefined;
+  let cachedJwt:
+    | {
+        token: string;
+        expiresAt: number;
+        teamId: string;
+        keyId: string;
+        keyFingerprint: string;
+      }
+    | undefined;
+
+  const loadPrivateKeyPem = async (): Promise<string | undefined> => {
+    if (cachedPrivateKeyPem) {
+      return cachedPrivateKeyPem;
+    }
+    if (!privateKeyLoadPromise) {
+      privateKeyLoadPromise = (async () => {
+        const inlineKey = process.env.AGENT_PULSE_WATCH_APNS_PRIVATE_KEY?.trim();
+        if (inlineKey) {
+          cachedPrivateKeyPem = inlineKey.replace(/\\n/g, '\n');
+          return cachedPrivateKeyPem;
+        }
+
+        const privateKeyPath = process.env.AGENT_PULSE_WATCH_APNS_PRIVATE_KEY_PATH?.trim();
+        if (!privateKeyPath) {
+          return undefined;
+        }
+
+        try {
+          cachedPrivateKeyPem = await readFile(privateKeyPath, 'utf8');
+          return cachedPrivateKeyPem;
+        } catch {
+          return undefined;
+        }
+      })();
+    }
+    return privateKeyLoadPromise;
+  };
+
+  const authorizationFor = async (config: WatchApnsConfig): Promise<string> => {
+    const keyFingerprint = createHash('sha256').update(config.privateKeyPem).digest('hex');
+    if (
+      cachedJwt &&
+      cachedJwt.expiresAt > Date.now() &&
+      cachedJwt.teamId === config.teamId &&
+      cachedJwt.keyId === config.keyId &&
+      cachedJwt.keyFingerprint === keyFingerprint
+    ) {
+      return `bearer ${cachedJwt.token}`;
+    }
+
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const encodedHeader = base64urlEncode(JSON.stringify({ alg: 'ES256', kid: config.keyId }));
+    const encodedPayload = base64urlEncode(JSON.stringify({ iss: config.teamId, iat: issuedAt }));
+    const signingInput = `${encodedHeader}.${encodedPayload}`;
+    const signature = signPayload('sha256', Buffer.from(signingInput), {
+      key: createPrivateKey(config.privateKeyPem),
+      dsaEncoding: 'ieee-p1363'
+    });
+    const token = `${signingInput}.${base64urlEncode(signature)}`;
+    cachedJwt = {
+      token,
+      expiresAt: Date.now() + WATCH_APNS_JWT_TTL_MS,
+      teamId: config.teamId,
+      keyId: config.keyId,
+      keyFingerprint
+    };
+    return `bearer ${token}`;
+  };
+
+  return {
+    async send(device, notification) {
+      const config = await resolveWatchApnsConfig(device, loadPrivateKeyPem);
+      if (!config) {
+        // eslint-disable-next-line no-console
+        console.info('[watch-push]', {
+          deviceId: device.deviceId,
+          kind: notification.kind,
+          threadId: notification.threadId,
+          delivered: false,
+          reason: 'apns-not-configured'
+        });
+        return;
+      }
+
+      const authorization = await authorizationFor(config);
+      await sendWatchApnsNotification(config, authorization, device, notification);
+    }
+  };
+}
+
+async function resolveWatchApnsConfig(
+  device: DeviceRecord,
+  loadPrivateKeyPem: () => Promise<string | undefined>
+): Promise<WatchApnsConfig | undefined> {
+  const teamId = process.env.AGENT_PULSE_WATCH_APNS_TEAM_ID?.trim();
+  const keyId = process.env.AGENT_PULSE_WATCH_APNS_KEY_ID?.trim();
+  const topic =
+    process.env.AGENT_PULSE_WATCH_APNS_TOPIC?.trim() ||
+    device.watchPushBundleId?.trim() ||
+    DEFAULT_WATCH_APNS_TOPIC;
+  const environment =
+    normalizeWatchApnsEnvironment(process.env.AGENT_PULSE_WATCH_APNS_ENVIRONMENT) ||
+    device.watchPushEnvironment ||
+    DEFAULT_WATCH_APNS_ENVIRONMENT;
+
+  if (!teamId || !keyId || !topic || !environment) {
+    return undefined;
+  }
+
+  const privateKeyPem = await loadPrivateKeyPem();
+  if (!privateKeyPem) {
+    return undefined;
+  }
+
+  return {
+    teamId,
+    keyId,
+    privateKeyPem,
+    topic,
+    environment
+  };
+}
+
+function normalizeWatchApnsEnvironment(value: string | undefined): WatchApnsEnvironment | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'sandbox' || normalized === 'development') {
+    return 'sandbox';
+  }
+  if (normalized === 'production' || normalized === 'prod') {
+    return 'production';
+  }
+  return undefined;
+}
+
+async function sendWatchApnsNotification(
+  config: WatchApnsConfig,
+  authorization: string,
+  device: DeviceRecord,
+  notification: WatchPushNotification
+): Promise<void> {
+  const token = device.watchPushToken?.trim();
+  if (!token) {
+    return;
+  }
+
+  const authority =
+    config.environment === 'production'
+      ? 'https://api.push.apple.com'
+      : 'https://api.sandbox.push.apple.com';
+  const collapseId = createHash('sha1')
+    .update(`${notification.kind}:${notification.threadId}`)
+    .digest('hex');
+  const payload = JSON.stringify({
+    aps: {
+      alert: {
+        title: notification.title,
+        body: notification.body
+      },
+      sound: 'default',
+      category: 'AGENT_PULSE_THREAD',
+      'thread-id': notification.threadId
+    },
+    threadId: notification.threadId,
+    deviceId: device.deviceId,
+    kind: notification.kind
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const client = connect(authority);
+    let settled = false;
+    let responseBody = '';
+    let statusCode = 0;
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      client.close();
+      callback();
+    };
+
+    client.once('error', (error) => {
+      finish(() => reject(error));
+    });
+
+    const request = client.request({
+      [http2Constants.HTTP2_HEADER_METHOD]: 'POST',
+      [http2Constants.HTTP2_HEADER_PATH]: `/3/device/${token}`,
+      authorization,
+      'apns-topic': config.topic,
+      'apns-push-type': 'alert',
+      'apns-priority': '10',
+      'apns-collapse-id': collapseId,
+      'content-type': 'application/json'
+    });
+
+    request.setEncoding('utf8');
+    request.on('response', (headers) => {
+      statusCode = Number(headers[http2Constants.HTTP2_HEADER_STATUS] ?? 0);
+    });
+    request.on('data', (chunk: string) => {
+      responseBody += chunk;
+    });
+    request.on('error', (error) => {
+      finish(() => reject(error));
+    });
+    request.on('end', () => {
+      finish(() => {
+        if (statusCode >= 200 && statusCode < 300) {
+          resolve();
+          return;
+        }
+
+        const reason = parseWatchApnsFailureReason(responseBody);
+        reject(
+          new Error(
+            reason
+              ? `APNs rejected the notification (${statusCode}: ${reason}).`
+              : `APNs rejected the notification (${statusCode}).`
+          )
+        );
+      });
+    });
+    request.end(payload);
+  });
+}
+
+function parseWatchApnsFailureReason(body: string): string | undefined {
+  const trimmed = body.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as { reason?: string };
+    return parsed.reason ?? trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
+function base64urlEncode(value: string | Buffer): string {
+  return Buffer.from(value).toString('base64url');
+}
+
 type CreatedApp = {
   app: Hono;
   transformTranscript: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript;
@@ -409,6 +704,7 @@ function createApp(
   tabletDevProxy?: TabletDevProxy
 ): CreatedApp {
   const app = new Hono();
+  const watchPushDelivery = options.watchPushDelivery ?? createWatchApnsDelivery();
   const startedAt = Date.now();
   const localAttachments = new Map<string, LocalAttachment>();
   // Tracks the last status we observed per thread so the watch-push hook only
@@ -481,11 +777,6 @@ function createApp(
   const requestIp = (context: Context): string =>
     clientIp(context.req.raw, getConnInfo(context).remote.address, currentSettings);
 
-  // Watch APNs delivery hook. Today this only logs the intended push so the
-  // watch-side wiring (token registration, notification handling, deep-link
-  // routing) can be exercised end-to-end without an APNs key. To enable real
-  // delivery, replace the body with an APNs HTTP/2 client driven by the
-  // helper's settings (team id, key id, .p8 path, bundle id, environment).
   const notifyWatchDevices = (input: {
     threadId: string;
     kind: 'finished' | 'errored' | 'attention';
@@ -497,14 +788,28 @@ function createApp(
       .then((devices) => {
         if (devices.length === 0) return;
         for (const device of devices) {
-          // eslint-disable-next-line no-console
-          console.info('[watch-push]', {
-            deviceId: device.deviceId,
-            kind: input.kind,
-            threadId: input.threadId,
-            title: input.title,
-            body: input.body
-          });
+          void watchPushDelivery
+            .send(device, input)
+            .then(() => {
+              // eslint-disable-next-line no-console
+              console.info('[watch-push]', {
+                deviceId: device.deviceId,
+                kind: input.kind,
+                threadId: input.threadId,
+                title: input.title,
+                body: input.body,
+                delivered: true
+              });
+            })
+            .catch((error) => {
+              // eslint-disable-next-line no-console
+              console.warn('[watch-push]', {
+                deviceId: device.deviceId,
+                kind: input.kind,
+                threadId: input.threadId,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            });
         }
       })
       .catch(() => undefined);
@@ -543,13 +848,24 @@ function createApp(
     }
   };
 
-  // Intercept every status broadcast once so the watch-push hook fires
-  // automatically without sprinkling calls at every emit site. The original
-  // method is kept so non-status events pass through unchanged.
+  const maybeNotifyWatchOfStreamingChange = (threadId: string, isStreaming: boolean): void => {
+    if (isStreaming) {
+      maybeNotifyWatchOfStatusChange(threadId, 'running');
+      return;
+    }
+    maybeNotifyWatchOfStatusChange(threadId, 'idle');
+  };
+
+  // Intercept every status/streaming broadcast once so the watch-push hook fires
+  // automatically without sprinkling calls at every emit site. Some Codex paths
+  // surface completion as "streaming stopped" before a clean status transition.
   const originalBroadcast = hub.broadcast.bind(hub);
   hub.broadcast = (event: LiveEvent): void => {
     if (event.type === 'thread/status/changed') {
       maybeNotifyWatchOfStatusChange(event.payload.threadId, event.payload.status);
+    }
+    if (event.type === 'thread/streaming-changed') {
+      maybeNotifyWatchOfStreamingChange(event.payload.threadId, event.payload.isStreaming);
     }
     originalBroadcast(event);
   };
@@ -840,9 +1156,10 @@ function createApp(
   };
   const workspaceDisplayRoots = new WorkspaceDisplayRootResolver();
   const listAllThreads = async (
-    groupLimits: Map<string, number> = new Map()
+    groupLimits: Map<string, number> = new Map(),
+    defaultLimit = MAX_THREADS_PER_PROJECT
   ): Promise<ThreadListResult> => {
-    const providerListOptions = providerThreadListOptions(groupLimits);
+    const providerListOptions = providerThreadListOptions(groupLimits, defaultLimit);
     const [codexThreads, claudeThreads, copilotThreads] = await Promise.all([
       isProviderEnabled('codex') ? listCodexThreads(providerListOptions) : Promise.resolve([]),
       isProviderEnabled('claude-code')
@@ -867,7 +1184,7 @@ function createApp(
     );
     return limitThreadsPerProject(
       displayThreads,
-      MAX_THREADS_PER_PROJECT,
+      defaultLimit,
       groupLimits
     );
   };
@@ -1203,7 +1520,17 @@ function createApp(
   });
 
   app.post('/device/session/recover', async (context) => {
-    const parsed = DeviceSessionRecoveryRequestSchema.parse(await context.req.json());
+    const body = await readJsonBody(context);
+    if (!body.ok) {
+      return context.json({ error: body.error }, 400);
+    }
+
+    const recoveryRequest = DeviceSessionRecoveryRequestSchema.safeParse(body.value);
+    if (!recoveryRequest.success) {
+      return context.json({ error: 'invalid' }, 401);
+    }
+
+    const parsed = recoveryRequest.data;
     const device = await options.registry.recoverDeviceSession(parsed.deviceId, parsed.fingerprint);
 
     if (!device) {
@@ -1476,10 +1803,24 @@ function createApp(
       return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
     }
 
-    const { threads, groups } = await listAllThreads(parseThreadListGroupLimits(context));
+    const requestedLimit = parseThreadListLimit(context.req.query('limit'));
+    const defaultLimit = requestedLimit
+      ? Math.min(MAX_EXPANDED_THREADS_PER_PROJECT, requestedLimit + 1)
+      : MAX_THREADS_PER_PROJECT;
+    const { threads: listedThreads, groups } = await listAllThreads(
+      parseThreadListGroupLimits(context),
+      defaultLimit
+    );
+    let threads = listedThreads;
+    let hasMore = groups.length > 0;
+    if (requestedLimit && listedThreads.length > requestedLimit) {
+      threads = sortThreadsByActivity(listedThreads).slice(0, requestedLimit);
+      hasMore = true;
+    }
     return context.json(ThreadListResponseSchema.parse({
       threads,
-      ...(groups.length > 0 ? { groups } : {})
+      ...(groups.length > 0 ? { groups } : {}),
+      ...(hasMore ? { hasMore } : {})
     }));
   });
 
@@ -1634,7 +1975,10 @@ function createApp(
             : options.appServer!;
       const rawThread = await starter.startThread!(cwd, {
         ...(parsed.modelSlug ? { model: parsed.modelSlug } : {}),
-        ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {})
+        ...(parsed.reasoningEffort ? { reasoningEffort: parsed.reasoningEffort } : {}),
+        ...(parsed.provider === 'codex' && parsed.permissionMode
+          ? { permissionMode: parsed.permissionMode }
+          : {})
       });
       const thread = isSharedChat
         ? decorateSharedChatThread({ ...rawThread, workspacePath: rawThread.workspacePath ?? cwd }, options.chatRoot)
@@ -1898,7 +2242,8 @@ function createApp(
             limitTranscriptMessages(transcript, messageLimit),
             threadId
           ),
-          transcriptView
+          transcriptView,
+          messageLimit
         );
         return context.json(
           ThreadTranscriptSchema.parse(visibleTranscript)
@@ -1919,7 +2264,8 @@ function createApp(
             limitTranscriptMessages(transcript, messageLimit),
             threadId
           ),
-          transcriptView
+          transcriptView,
+          messageLimit
         );
         return context.json(
           ThreadTranscriptSchema.parse(visibleTranscript)
@@ -1979,7 +2325,8 @@ function createApp(
           limitTranscriptMessages(transcript, messageLimit),
           threadId
         ),
-        transcriptView
+        transcriptView,
+        messageLimit
       );
       return context.json(
         ThreadTranscriptSchema.parse({
@@ -2142,6 +2489,95 @@ function createApp(
     }
   });
 
+  app.get('/threads/:threadId/goal', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const threadId = context.req.param('threadId');
+    if (providerForThreadId(threadId) !== 'codex') {
+      return context.json({ error: 'Goal mode is only available for Codex threads.' }, 400);
+    }
+    if (!options.appServer?.isConnected() || !options.appServer.readGoal) {
+      return context.json({ error: 'Codex app-server goal API is unavailable.' }, 503);
+    }
+
+    try {
+      const goal = await options.appServer.readGoal(threadId);
+      return context.json(ThreadGoalResponseSchema.parse({ goal }));
+    } catch (error) {
+      return context.json({ error: codexGoalErrorMessage(error) }, 503);
+    }
+  });
+
+  app.put('/threads/:threadId/goal', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    if (!currentSettings.mobileSendEnabled) {
+      return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
+    }
+
+    const threadId = context.req.param('threadId');
+    if (providerForThreadId(threadId) !== 'codex') {
+      return context.json({ error: 'Goal mode is only available for Codex threads.' }, 400);
+    }
+    if (!options.appServer?.isConnected() || !options.appServer.setGoal) {
+      return context.json({ error: 'Codex app-server goal API is unavailable.' }, 503);
+    }
+
+    const parsed = ThreadGoalUpdateRequestSchema.parse(await context.req.json());
+    try {
+      const goal = await options.appServer.setGoal(threadId, parsed);
+      hub.broadcast({ type: 'thread/goal/changed', payload: { threadId, goal } });
+      const cached = transcriptCache.get(threadId);
+      if (cached) {
+        const next = ThreadTranscriptSchema.parse({ ...cached, goal });
+        transcriptCache.set(threadId, next);
+        hub.broadcast({ type: 'thread/transcript/changed', payload: next });
+      }
+      return context.json(ThreadGoalResponseSchema.parse({ goal }));
+    } catch (error) {
+      return context.json({ error: codexGoalErrorMessage(error) }, 503);
+    }
+  });
+
+  app.delete('/threads/:threadId/goal', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    if (!currentSettings.mobileSendEnabled) {
+      return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
+    }
+
+    const threadId = context.req.param('threadId');
+    if (providerForThreadId(threadId) !== 'codex') {
+      return context.json({ error: 'Goal mode is only available for Codex threads.' }, 400);
+    }
+    if (!options.appServer?.isConnected() || !options.appServer.clearGoal) {
+      return context.json({ error: 'Codex app-server goal API is unavailable.' }, 503);
+    }
+
+    try {
+      const cleared = await options.appServer.clearGoal(threadId);
+      hub.broadcast({ type: 'thread/goal/changed', payload: { threadId, goal: null } });
+      const cached = transcriptCache.get(threadId);
+      if (cached) {
+        const next = ThreadTranscriptSchema.parse({ ...cached, goal: null });
+        transcriptCache.set(threadId, next);
+        hub.broadcast({ type: 'thread/transcript/changed', payload: next });
+      }
+      return context.json(ThreadGoalClearResponseSchema.parse({ cleared }));
+    } catch (error) {
+      return context.json({ error: codexGoalErrorMessage(error) }, 503);
+    }
+  });
+
   app.post('/threads/:threadId/messages', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -2248,6 +2684,35 @@ function createApp(
       // Slash commands the Codex desktop intercepts client-side. Sending the
       // raw text "/compact" as a turn would just be a literal user message;
       // instead we route to the matching v2 RPC so the actual command runs.
+      const goalSlashObjective =
+        outgoingAttachments.display.length === 0 ? matchGoalSlashCommand(parsed.text) : undefined;
+      if (goalSlashObjective !== undefined) {
+        if (!options.appServer?.setGoal) {
+          throw new SendBlockedError(
+            'thread_unavailable',
+            'Goal mode requires the Codex app-server goal API.'
+          );
+        }
+        if (!goalSlashObjective) {
+          throw new SendBlockedError(
+            'thread_unavailable',
+            'Add the goal after /goal, or use the Goal mode panel.'
+          );
+        }
+        const goal = await options.appServer.setGoal(threadId, {
+          objective: goalSlashObjective,
+          status: 'active'
+        });
+        hub.broadcast({ type: 'thread/goal/changed', payload: { threadId, goal } });
+        const cached = transcriptCache.get(threadId);
+        if (cached) {
+          const next = ThreadTranscriptSchema.parse({ ...cached, goal });
+          transcriptCache.set(threadId, next);
+          hub.broadcast({ type: 'thread/transcript/changed', payload: next });
+        }
+        return context.json(slashCommandAckResponse(threadId, 'goal', textToSend, goal));
+      }
+
       const slashCommand =
         outgoingAttachments.display.length === 0 ? matchBareSlashCommand(parsed.text) : undefined;
       if (slashCommand) {
@@ -2267,12 +2732,21 @@ function createApp(
       // show up in the real Codex window. If that bridge cannot deliver, fall
       // back to the app-server path so tablet/remote sends still work.
       const override = pendingModelOverrides.get(threadId);
+      const cwdForPermissionMode = parsed.permissionMode
+        ? threadCwdByThreadId.get(threadId)
+        : undefined;
       const mirrorSendOptions =
-        override || parsed.collaborationMode || outgoingAttachments.provider.length > 0
+        override ||
+        parsed.collaborationMode ||
+        parsed.permissionMode ||
+        outgoingAttachments.provider.length > 0
           ? {
               ...(override ? { model: override.model } : {}),
               ...(override?.effort ? { effort: override.effort } : {}),
               ...(parsed.collaborationMode ? { collaborationMode: parsed.collaborationMode } : {}),
+              ...(parsed.permissionMode
+                ? { permissionMode: parsed.permissionMode, ...(cwdForPermissionMode ? { cwd: cwdForPermissionMode } : {}) }
+                : {}),
               ...(outgoingAttachments.provider.length
                 ? { attachments: outgoingAttachments.provider }
                 : {})
@@ -2600,12 +3074,9 @@ function createApp(
     return context.json({ ok: true });
   });
 
-  // Watch APNs registration: stores the watch's APNs device token against the
-  // already-paired DeviceRecord. Actual push delivery is performed by
-  // `notifyWatchDevices` below; today that is a stub that logs the intent so
-  // the watch wiring is testable without an APNs key. To enable real delivery,
-  // replace the stub body with an APNs HTTP/2 client (e.g. `apn2`) using
-  // settings sourced from `options`.
+  // Watch APNs registration: stores the watch's APNs device token and routing
+  // metadata against the already-paired DeviceRecord so the helper can deliver
+  // finish / error / attention notifications later.
   app.post('/devices/watch-push', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -2617,7 +3088,10 @@ function createApp(
       return context.json({ error: 'Request body required.' }, 400);
     }
     const parsed = WatchPushRegisterRequestSchema.parse(rawBody);
-    await options.registry.setWatchPushToken(auth.device.deviceId, parsed.pushToken);
+    await options.registry.setWatchPushToken(auth.device.deviceId, parsed.pushToken, {
+      bundleId: parsed.bundleId,
+      environment: parsed.environment
+    });
     return context.json(WatchPushRegisterResponseSchema.parse({ ok: true }));
   });
 
@@ -3753,13 +4227,15 @@ function parseTranscriptView(raw: string | undefined): TranscriptView {
 
 function presentTranscriptForView(
   transcript: ThreadTranscript,
-  view: TranscriptView
+  view: TranscriptView,
+  limit?: number
 ): ThreadTranscript {
   if (view !== 'watch') {
     return transcript;
   }
 
-  const messages = filterTranscriptMessagesForWatch(transcript);
+  const watchMessages = filterTranscriptMessagesForWatch(transcript);
+  const messages = limit ? watchMessages.slice(-limit) : watchMessages;
   if (messages.length === transcript.messages.length) {
     return transcript;
   }
@@ -4239,6 +4715,18 @@ async function requireAuth(request: Request, registry: DeviceRegistry) {
   );
 }
 
+function rejectUpgrade(socket: Duplex, status: 401 | 403 | 404): void {
+  const statusText =
+    status === 401 ? 'Unauthorized' : status === 403 ? 'Forbidden' : 'Not Found';
+  try {
+    socket.write(
+      `HTTP/1.1 ${status} ${statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`
+    );
+  } finally {
+    socket.destroy();
+  }
+}
+
 function attachWebSocketEvents(
   server: Server,
   hub: LiveEventHub,
@@ -4265,22 +4753,12 @@ function attachWebSocketEvents(
             tabletDevProxy.proxyUpgrade(request, socket, head);
             return;
           }
-          console.warn('[ws-upgrade] rejected: unknown path', {
-            path: url.pathname,
-            remoteAddress,
-            origin
-          });
-          socket.destroy();
+          rejectUpgrade(socket, 404);
           return;
         }
 
         if (!isAllowedOriginHeaders(nodeHeaderGetter(request), currentSettings())) {
-          console.warn('[ws-upgrade] rejected: origin not allowed', {
-            origin,
-            host: request.headers.host ?? '(none)',
-            remoteAddress
-          });
-          socket.destroy();
+          rejectUpgrade(socket, 403);
           return;
         }
 
@@ -4292,15 +4770,7 @@ function attachWebSocketEvents(
         );
 
         if (!auth.ok) {
-          console.warn('[ws-upgrade] rejected: auth failed', {
-            reason: auth.reason,
-            deviceId: deviceId ?? '(none)',
-            hasToken: url.searchParams.has('token'),
-            hasFingerprint: url.searchParams.has('fingerprint'),
-            remoteAddress,
-            origin
-          });
-          socket.destroy();
+          rejectUpgrade(socket, auth.reason === 'revoked' ? 403 : 401);
           return;
         }
 
@@ -5091,10 +5561,33 @@ function updateDraftThreadFromTranscript(draftThread: Thread, transcript: Thread
 // adds text after the command name we treat it as a normal message so anything
 // like "/compact please" still falls through as plain text.
 const BARE_SLASH_PATTERN = /^\s*\/([a-zA-Z][a-zA-Z0-9_-]*)\s*$/;
+const GOAL_SLASH_PATTERN = /^\s*\/goal(?:\s+([\s\S]+?))?\s*$/i;
 
 function matchBareSlashCommand(text: string): string | null {
   const match = BARE_SLASH_PATTERN.exec(text);
   return match ? match[1]!.toLowerCase() : null;
+}
+
+function matchGoalSlashCommand(text: string): string | undefined {
+  const match = GOAL_SLASH_PATTERN.exec(text);
+  if (!match) {
+    return undefined;
+  }
+  return match[1]?.trim() ?? '';
+}
+
+function codexGoalErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/goals feature is disabled/i.test(message)) {
+    return 'Codex goal mode is disabled in this Codex build or config.';
+  }
+  if (/thread not found|ephemeral thread/i.test(message)) {
+    return 'Goal mode needs a saved Codex thread.';
+  }
+  if (/invalid|budget/i.test(message)) {
+    return message;
+  }
+  return 'Could not update the Codex goal.';
 }
 
 // Returns a ThreadMessageResponse if the slash command was handled here, or
@@ -5136,6 +5629,13 @@ async function handleSlashCommand(
 
   // Commands we recognize but don't have a dedicated RPC path for — better to
   // tell the user than to silently send the literal text as a message.
+  if (command === 'goal') {
+    throw new SendBlockedError(
+      'thread_unavailable',
+      'Use the Goal mode panel in Agent Pulse to set or clear a Codex goal.'
+    );
+  }
+
   if (command === 'clear' || command === 'new' || command === 'help' || command === 'feedback' || command === 'model') {
     throw new SendBlockedError(
       'thread_unavailable',
@@ -5146,7 +5646,12 @@ async function handleSlashCommand(
   return null;
 }
 
-function slashCommandAckResponse(threadId: string, command: string, originalText: string): ThreadMessageResponse {
+function slashCommandAckResponse(
+  threadId: string,
+  command: string,
+  originalText: string,
+  goal?: ThreadGoal | null
+): ThreadMessageResponse {
   // Codex doesn't return a transcript for fire-and-forget commands. We include
   // a synthetic user message matching the slash text so the tablet's pending
   // bubble is confirmed (pendingMessageIsConfirmed checks for a user message
@@ -5167,7 +5672,8 @@ function slashCommandAckResponse(threadId: string, command: string, originalText
       threadId,
       activeTurnId: null,
       sendState: { canSend: true, reason: 'ready', label: 'Ready' },
-      messages: [syntheticMessage]
+      messages: [syntheticMessage],
+      ...(goal !== undefined ? { goal } : {})
     }
   });
 }
@@ -5465,7 +5971,21 @@ function parseThreadListGroupLimits(context: Context): Map<string, number> {
   return limits;
 }
 
-function providerThreadListOptions(groupLimits: Map<string, number>): ThreadListProviderOptions {
+function parseThreadListLimit(rawLimit: string | undefined): number | undefined {
+  if (!rawLimit) {
+    return undefined;
+  }
+  const limit = Number.parseInt(rawLimit, 10);
+  if (!Number.isFinite(limit)) {
+    return undefined;
+  }
+  return Math.min(MAX_EXPANDED_THREADS_PER_PROJECT, Math.max(1, Math.floor(limit)));
+}
+
+function providerThreadListOptions(
+  groupLimits: Map<string, number>,
+  defaultLimit: number = MAX_THREADS_PER_PROJECT
+): ThreadListProviderOptions {
   const providerGroupLimits = new Map<string, number>();
   for (const [groupKey, limit] of groupLimits.entries()) {
     providerGroupLimits.set(
@@ -5475,7 +5995,7 @@ function providerThreadListOptions(groupLimits: Map<string, number>): ThreadList
   }
 
   return {
-    defaultLimit: MAX_THREADS_PER_PROJECT + 1,
+    defaultLimit: Math.min(MAX_EXPANDED_THREADS_PER_PROJECT, defaultLimit + 1),
     groupLimits: providerGroupLimits
   };
 }

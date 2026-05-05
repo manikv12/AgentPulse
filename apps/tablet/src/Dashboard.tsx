@@ -5,6 +5,7 @@ import type {
   CatalogSkill,
   ChatAttachment,
   CollaborationModeKind,
+  SelectableCodexPermissionModeId,
   AgentProvider,
   HelperHealth,
   ApprovalInboxItem,
@@ -14,6 +15,7 @@ import type {
   Project,
   Thread,
   ThreadFileChangeSummary,
+  ThreadGoal,
   ThreadListGroup,
   ThreadMessageResponse,
   ThreadTranscript,
@@ -81,7 +83,11 @@ export type DashboardProps = {
   sendMessage?: (
     threadId: string,
     text: string,
-    options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
+    options?: {
+      collaborationMode?: CollaborationModeKind;
+      permissionMode?: SelectableCodexPermissionModeId;
+      attachments?: ChatAttachment[];
+    }
   ) => Promise<ThreadMessageResponse>;
   transcribeVoiceAudio?: (audio: Blob) => Promise<string>;
   voiceTranscriptionAvailable?: boolean;
@@ -110,6 +116,7 @@ export type DashboardProps = {
   // synced via the helper. Dashboard falls back to its localStorage-backed
   // copy when undefined (offline / unauthenticated paths).
   seenThreadActivityOverride?: Record<string, number>;
+  reviewStateReady?: boolean;
   onMarkThreadSeen?: (threadId: string, seenAt: number) => void;
   plugins?: CatalogPlugin[];
   skills?: CatalogSkill[];
@@ -124,6 +131,12 @@ export type DashboardProps = {
     modelSlug: string,
     reasoningEffort?: string
   ) => Promise<void>;
+  onFetchThreadGoal?: (threadId: string) => Promise<ThreadGoal | null>;
+  onUpdateThreadGoal?: (
+    threadId: string,
+    input: { objective?: string; status?: ThreadGoal['status']; tokenBudget?: number | null }
+  ) => Promise<ThreadGoal>;
+  onClearThreadGoal?: (threadId: string) => Promise<void>;
   onApprovalDecision?: (
     threadId: string,
     requestId: string,
@@ -152,9 +165,9 @@ export type PendingRequest = {
 };
 
 export type NewThreadTarget =
-  | { location: 'chat'; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
-  | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string }
-  | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string };
+  | { location: 'chat'; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string; permissionMode?: SelectableCodexPermissionModeId }
+  | { projectId: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string; permissionMode?: SelectableCodexPermissionModeId }
+  | { cwd: string; provider?: AgentProvider; modelSlug?: string; reasoningEffort?: string; permissionMode?: SelectableCodexPermissionModeId };
 
 export function Dashboard({
   health,
@@ -198,8 +211,12 @@ export function Dashboard({
   models = [],
   fetchProjectFiles,
   onChangeThreadModel,
+  onFetchThreadGoal,
+  onUpdateThreadGoal,
+  onClearThreadGoal,
   onApprovalDecision,
   seenThreadActivityOverride,
+  reviewStateReady = true,
   onMarkThreadSeen
 }: DashboardProps) {
   const [internalActiveThreadId, setInternalActiveThreadId] = useState<string | undefined>(() => readActiveThreadId());
@@ -365,6 +382,10 @@ export function Dashboard({
   };
 
   const handleMarkAllReviewed = () => {
+    if (!reviewStateReady) {
+      return;
+    }
+
     const reviewThreads = visibleThreads.filter((thread) =>
       threadNeedsReview(thread, seenThreadActivity)
     );
@@ -440,6 +461,7 @@ export function Dashboard({
         projects={projects}
         activeThreadId={activeThreadId}
         seenThreadActivity={seenThreadActivity}
+        reviewStateReady={reviewStateReady}
         workingThreadIds={workingThreadIds}
         onSelectThread={handleSelectThread}
         onNewThread={handleNewThread}
@@ -521,6 +543,17 @@ export function Dashboard({
                     onChangeThreadModel(activeThread.threadId, modelSlug, reasoningEffort)
                 : undefined
             }
+            onFetchGoal={
+              onFetchThreadGoal ? () => onFetchThreadGoal(activeThread.threadId) : undefined
+            }
+            onUpdateGoal={
+              onUpdateThreadGoal
+                ? (input) => onUpdateThreadGoal(activeThread.threadId, input)
+                : undefined
+            }
+            onClearGoal={
+              onClearThreadGoal ? () => onClearThreadGoal(activeThread.threadId) : undefined
+            }
             onApprovalDecision={
               onApprovalDecision
                 ? (requestId, method, decision) =>
@@ -540,6 +573,7 @@ export function Dashboard({
             onOpenSidebar={() => setSidebarOpen(true)}
             isLoading={!threadsLoaded}
             seenThreadActivity={seenThreadActivity}
+            reviewStateReady={reviewStateReady}
             onMarkAllReviewed={handleMarkAllReviewed}
             workingThreadIds={workingThreadIds}
             approvalItems={approvalInboxItems}
@@ -596,6 +630,32 @@ function targetKeyForNewThread(target: NewThreadTarget): string {
   }
   return 'projectId' in target ? target.projectId : target.cwd;
 }
+
+const CODEX_PERMISSION_CHOICES: Array<{
+  mode: SelectableCodexPermissionModeId;
+  label: string;
+  shortLabel: string;
+  description: string;
+}> = [
+  {
+    mode: 'default',
+    label: 'Default permission',
+    shortLabel: 'manual review',
+    description: 'Codex uses normal workspace permissions and asks you before risky actions.'
+  },
+  {
+    mode: 'autoReview',
+    label: 'Auto-review',
+    shortLabel: 'AI reviews',
+    description: 'Codex uses normal permissions, but approval requests can be reviewed automatically.'
+  },
+  {
+    mode: 'fullAccess',
+    label: 'Full access',
+    shortLabel: 'no prompts',
+    description: 'Codex runs without permission prompts. Use only for trusted work.'
+  }
+];
 
 function readSeenThreadActivity(): Record<string, number> {
   if (typeof window === 'undefined') {
@@ -752,6 +812,8 @@ function NewThreadDialog({
       : projects[0]?.projectId ?? ''
   );
   const [selectedProvider, setSelectedProvider] = useState<AgentProvider>('codex');
+  const [selectedPermissionMode, setSelectedPermissionMode] =
+    useState<SelectableCodexPermissionModeId>('default');
   // Empty `selectedModelSlug` means "use the project's default model from
   // ~/.codex/config.toml". The user can override here for one-off threads.
   const [selectedModelSlug, setSelectedModelSlug] = useState<string>('');
@@ -854,7 +916,8 @@ function NewThreadDialog({
                 : { projectId: selectedProjectId }),
               provider: selectedProvider,
               ...(selectedModelSlug ? { modelSlug: selectedModelSlug } : {}),
-              ...(selectedEffort ? { reasoningEffort: selectedEffort } : {})
+              ...(selectedEffort ? { reasoningEffort: selectedEffort } : {}),
+              ...(selectedProvider === 'codex' ? { permissionMode: selectedPermissionMode } : {})
             };
             onCreate(target);
           }}
@@ -939,6 +1002,33 @@ function NewThreadDialog({
                   </button>
                 ))}
               </div>
+            </>
+          ) : null}
+
+          {selectedProvider === 'codex' ? (
+            <>
+              <span className="new-thread-label">Permissions</span>
+              <div className="new-thread-permission-row" role="radiogroup" aria-label="Codex permissions">
+                {CODEX_PERMISSION_CHOICES.map((choice) => (
+                  <button
+                    key={choice.mode}
+                    type="button"
+                    role="radio"
+                    aria-checked={selectedPermissionMode === choice.mode}
+                    className={`new-thread-permission-pick ${
+                      selectedPermissionMode === choice.mode ? 'is-selected' : ''
+                    }`}
+                    onClick={() => setSelectedPermissionMode(choice.mode)}
+                    disabled={creating}
+                  >
+                    <span>{choice.label}</span>
+                    <small>{choice.shortLabel}</small>
+                  </button>
+                ))}
+              </div>
+              <p className="new-thread-selected-path">
+                {CODEX_PERMISSION_CHOICES.find((choice) => choice.mode === selectedPermissionMode)?.description}
+              </p>
             </>
           ) : null}
 
@@ -1032,6 +1122,7 @@ function EmptyMain({
   onSelectThread,
   isLoading = false,
   seenThreadActivity = {},
+  reviewStateReady = true,
   onMarkAllReviewed,
   workingThreadIds = new Set(),
   approvalItems = [],
@@ -1042,6 +1133,7 @@ function EmptyMain({
   onSelectThread: (thread: Thread) => void;
   isLoading?: boolean;
   seenThreadActivity?: Record<string, number>;
+  reviewStateReady?: boolean;
   onMarkAllReviewed?: () => void;
   workingThreadIds?: Set<string>;
   approvalItems?: ApprovalInboxItem[];
@@ -1054,26 +1146,36 @@ function EmptyMain({
   const errors = threads.filter(t => t.status === 'error' || t.status === 'connection').length;
 
   const reviewThreads = useMemo(() =>
-    threads
-      .filter(t => threadNeedsReview(t, seenThreadActivity))
-      .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime()),
-    [seenThreadActivity, threads]
+    reviewStateReady
+      ? threads
+          .filter(t => threadNeedsReview(t, seenThreadActivity))
+          .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
+      : [],
+    [reviewStateReady, seenThreadActivity, threads]
   );
 
   const attentionThreads = useMemo(() =>
     threads
-      .filter(t => isAttentionStatus(t.status) && !threadNeedsReview(t, seenThreadActivity))
+      .filter(
+        t =>
+          isAttentionStatus(t.status) &&
+          !(reviewStateReady && threadNeedsReview(t, seenThreadActivity))
+      )
       .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
       .slice(0, 6),
-    [seenThreadActivity, threads]
+    [reviewStateReady, seenThreadActivity, threads]
   );
 
   const recentThreads = useMemo(() =>
     threads
-      .filter(t => !isAttentionStatus(t.status) && !threadNeedsReview(t, seenThreadActivity))
+      .filter(
+        t =>
+          !isAttentionStatus(t.status) &&
+          !(reviewStateReady && threadNeedsReview(t, seenThreadActivity))
+      )
       .sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime())
       .slice(0, 10),
-    [seenThreadActivity, threads]
+    [reviewStateReady, seenThreadActivity, threads]
   );
 
   const isLiveThread = (thread: Thread) =>

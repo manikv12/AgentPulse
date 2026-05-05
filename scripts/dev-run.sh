@@ -6,6 +6,20 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 settings_path="$HOME/Library/Application Support/Agent Pulse/settings.json"
 helper_script="$repo_root/apps/helper/dist/dev-server.js"
 
+load_local_env() {
+  local env_path="$repo_root/.env.local"
+  if [[ ! -f "$env_path" ]]; then
+    return
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_path"
+  set +a
+}
+
+load_local_env
+
 helper_port="$({
   if [[ -f "$settings_path" ]]; then
     node --input-type=module -e "import { readFileSync } from 'node:fs'; const fallback = 55110; try { const raw = readFileSync(process.argv[1], 'utf8').trim(); if (!raw) { console.log(fallback); process.exit(0); } const settings = JSON.parse(raw); const port = Number(settings?.port); console.log(Number.isFinite(port) && port > 0 ? port : fallback); } catch { console.log(fallback); }" "$settings_path"

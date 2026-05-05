@@ -147,6 +147,107 @@ describe('Codex App Server same-thread chat', () => {
     expect(chat.isThreadStreaming('thread-1')).toBe(true);
   });
 
+  it('merges app-server token usage updates into live goal progress', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+    const liveEvents: unknown[] = [];
+    const liveStateChanges: string[] = [];
+    chat.onLiveEvent((event) => liveEvents.push(event));
+    chat.onLiveStateChange((threadId) => liveStateChanges.push(threadId));
+
+    transport.emitNotification({
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        goal: {
+          threadId: 'thread-1',
+          objective: 'Finish goal progress',
+          status: 'active',
+          tokenBudget: 4000,
+          tokensUsed: 0,
+          timeUsedSeconds: 30,
+          createdAt: 1_777_000_000,
+          updatedAt: 1_777_000_030
+        }
+      }
+    });
+    transport.emitNotification({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        tokenUsage: {
+          total: {
+            totalTokens: 1234,
+            inputTokens: 700,
+            cachedInputTokens: 100,
+            outputTokens: 400,
+            reasoningOutputTokens: 34
+          },
+          last: {
+            totalTokens: 800,
+            inputTokens: 500,
+            cachedInputTokens: 50,
+            outputTokens: 200,
+            reasoningOutputTokens: 50
+          },
+          modelContextWindow: 4000
+        }
+      }
+    });
+    transport.emitNotification({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        tokenUsage: {
+          total: {
+            totalTokens: 1434,
+            inputTokens: 800,
+            cachedInputTokens: 100,
+            outputTokens: 500,
+            reasoningOutputTokens: 34
+          },
+          last: {
+            totalTokens: 1000,
+            inputTokens: 600,
+            cachedInputTokens: 50,
+            outputTokens: 300,
+            reasoningOutputTokens: 50
+          },
+          modelContextWindow: 4000
+        }
+      }
+    });
+
+    const visible = chat.applyLiveState(emptyTranscript('thread-1'), 'thread-1');
+
+    expect(visible.goal).toMatchObject({
+      threadId: 'thread-1',
+      objective: 'Finish goal progress',
+      tokensUsed: 200,
+      timeUsedSeconds: 30
+    });
+    expect(visible.usage).toMatchObject({
+      contextTokens: 1000,
+      contextWindow: 4000,
+      contextUsedPercent: 25
+    });
+    expect(liveEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'thread/goal/changed',
+          payload: expect.objectContaining({
+            threadId: 'thread-1',
+            goal: expect.objectContaining({ tokensUsed: 200 })
+          })
+        })
+      ])
+    );
+    expect(liveStateChanges).toContain('thread-1');
+  });
+
   it('keeps a thread working when a stale idle status arrives before turn completion', () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);
@@ -480,7 +581,7 @@ describe('Codex App Server same-thread chat', () => {
       threadId: 'thread-1',
       input: [
         { type: 'text', text: 'Please inspect this.', text_elements: [] },
-        { type: 'input_image', image_url: { url: imageUrl } }
+        { type: 'image', image_url: { url: imageUrl } }
       ]
     });
   });
@@ -796,7 +897,7 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
-  it('uses Codex auto defaults when project config does not pin access settings', async () => {
+  it('uses Codex default permissions when project config does not pin access settings', async () => {
     const cwd = '/Users/me/projects/CodexPulse';
     const transport = fakeTransport([
       {
@@ -837,6 +938,23 @@ describe('Codex App Server same-thread chat', () => {
       approvalPolicy: 'on-request',
       sandbox: 'workspace-write',
       config: {}
+    });
+  });
+
+  it('starts a new project thread with the selected full-access permission mode', async () => {
+    const cwd = '/Users/me/projects/CodexPulse';
+    const transport = fakeTransport([
+      { config: { model: 'gpt-5.5' } },
+      threadResponse('thread-new', 'idle', [], [], cwd)
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    await chat.startThread(cwd, { permissionMode: 'fullAccess' });
+
+    expect(transport.calls.find((call) => call.method === 'thread/start')?.params).toMatchObject({
+      cwd,
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access'
     });
   });
 
@@ -882,6 +1000,33 @@ describe('Codex App Server same-thread chat', () => {
       threadId: 'thread-1',
       expectedTurnId: 'turn-live',
       input: [{ type: 'text', text: 'Use this extra context.', text_elements: [] }]
+    });
+  });
+
+  it('passes the selected auto-review permission mode to a new turn', async () => {
+    const transport = fakeTransport([
+      {
+        ...threadResponse('thread-1', 'idle', [], [], '/Users/me/projects/CodexPulse'),
+        approvalPolicy: 'on-request',
+        sandbox: { type: 'workspaceWrite' }
+      },
+      threadResponse('thread-1', 'active', [turn('turn-new', 'inProgress')])
+    ]);
+    const chat = new CodexAppServerChat(transport);
+
+    await chat.sendMessage('thread-1', 'Inspect safely.', { permissionMode: 'autoReview' });
+
+    expect(transport.calls.find((call) => call.method === 'turn/start')?.params).toMatchObject({
+      threadId: 'thread-1',
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'auto_review',
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: ['/Users/me/projects/CodexPulse'],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false
+      }
     });
   });
 
@@ -1074,7 +1219,7 @@ describe('Codex App Server same-thread chat', () => {
               id: 'user-1',
               content: [
                 { type: 'input_text', text: 'Please inspect this screenshot.', text_elements: [] },
-                { type: 'input_image', image_url: { url: userScreenshot } },
+                { type: 'image', image_url: { url: userScreenshot } },
                 { type: 'localImage', path: localScreenshot }
               ]
             },

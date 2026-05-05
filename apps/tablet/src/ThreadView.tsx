@@ -5,6 +5,7 @@ import type {
   CatalogSkill,
   ChatAttachment,
   ChatMessage,
+  CodexPermissionMode,
   CollaborationModeKind,
   AgentProvider,
   HandoffPackage,
@@ -12,15 +13,18 @@ import type {
   OlderThreadMessagesResponse,
   Thread,
   ThreadFileChangeSummary,
+  ThreadGoal,
   ThreadMessageResponse,
   ThreadTranscript,
   TranscriptCommentDraft,
-  ThreadUsage
+  ThreadUsage,
+  SelectableCodexPermissionModeId
 } from '@agent-pulse/shared';
 import { ThreadFileChangeSummarySchema } from '@agent-pulse/shared';
 import {
   ArrowUp,
   Brain,
+  Check,
   ChevronDown,
   ChevronUp,
   ExternalLink,
@@ -33,9 +37,11 @@ import {
   Mic,
   MoreVertical,
   Plus,
+  ShieldCheck,
   Square,
   Terminal,
   Trash2,
+  Target,
   Wrench,
   X
 } from 'lucide-react';
@@ -47,7 +53,9 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type ClipboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type UIEvent,
 } from 'react';
@@ -73,13 +81,10 @@ import {
   type ActivityGroupItem
 } from './threadRendering';
 
-const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 40;
+const INITIAL_TRANSCRIPT_MESSAGE_LIMIT = 16;
 const VISIBLE_TRANSCRIPT_TAIL_MESSAGE_COUNT = 2;
-const OLDER_MESSAGES_PAGE_SIZE = 40;
+const OLDER_MESSAGES_PAGE_SIZE = 10;
 const MIRROR_STREAMING_TURN_PREFIX = 'mirror-streaming:';
-// Common chat apps load older history automatically when the user reaches near
-// the top. This also covers short conversations that do not fill the viewport.
-const OLDER_MESSAGES_AUTO_LOAD_TOP_PX = 96;
 // Once the user is within this many pixels of the bottom we consider them "pinned" to
 // the latest message and resume auto-scrolling on new updates. Any further than that and
 // we leave their scroll position alone — typically because they've scrolled up to read.
@@ -87,6 +92,53 @@ const NEAR_BOTTOM_PX = 60;
 const MAX_COMPOSER_IMAGE_ATTACHMENTS = 6;
 const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
 const VOICE_WAVE_BARS = [2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 16, 14, 12, 10, 8, 6, 5, 4, 6, 8, 12, 16, 18, 14, 10, 7, 5, 3, 2];
+
+const DEFAULT_CODEX_PERMISSION_MODE: SelectableCodexPermissionModeId = 'default';
+const CODEX_PERMISSION_OPTIONS: Array<{
+  mode: SelectableCodexPermissionModeId;
+  label: string;
+  meta: string;
+  description: string;
+}> = [
+  {
+    mode: 'default',
+    label: 'Default permission',
+    meta: 'Manual review',
+    description: 'Uses normal workspace permissions and asks you before risky actions.'
+  },
+  {
+    mode: 'autoReview',
+    label: 'Auto-review',
+    meta: 'AI reviews',
+    description: 'Uses normal permissions, but approval requests can be reviewed automatically.'
+  },
+  {
+    mode: 'fullAccess',
+    label: 'Full access',
+    meta: 'No prompts',
+    description: 'Runs without permission prompts. Best for trusted work only.'
+  }
+];
+
+function selectablePermissionModeFromTranscript(
+  mode: CodexPermissionMode | undefined
+): SelectableCodexPermissionModeId | undefined {
+  if (
+    mode?.mode === 'default' ||
+    mode?.mode === 'autoReview' ||
+    mode?.mode === 'fullAccess'
+  ) {
+    return mode.mode;
+  }
+  return undefined;
+}
+
+function permissionOptionForMode(mode: SelectableCodexPermissionModeId) {
+  return (
+    CODEX_PERMISSION_OPTIONS.find((option) => option.mode === mode) ??
+    CODEX_PERMISSION_OPTIONS[0]
+  );
+}
 
 export type ThreadPendingRequest = {
   id: string;
@@ -135,7 +187,11 @@ export type ThreadViewProps = {
   sendMessage?: (
     threadId: string,
     text: string,
-    options?: { collaborationMode?: CollaborationModeKind; attachments?: ChatAttachment[] }
+    options?: {
+      collaborationMode?: CollaborationModeKind;
+      permissionMode?: SelectableCodexPermissionModeId;
+      attachments?: ChatAttachment[];
+    }
   ) => Promise<ThreadMessageResponse>;
   transcribeVoiceAudio?: (audio: Blob) => Promise<string>;
   voiceTranscriptionAvailable?: boolean;
@@ -165,6 +221,11 @@ export type ThreadViewProps = {
   models?: CatalogModel[];
   fetchProjectFiles?: (query: string) => Promise<{ path: string; relativePath: string }[]>;
   onChangeModel?: (modelSlug: string, reasoningEffort?: string) => Promise<void>;
+  onFetchGoal?: () => Promise<ThreadGoal | null>;
+  onUpdateGoal?: (
+    input: { objective?: string; status?: ThreadGoal['status']; tokenBudget?: number | null }
+  ) => Promise<ThreadGoal>;
+  onClearGoal?: () => Promise<void>;
   onApprovalDecision?: (
     requestId: string,
     method: ApprovalMethodForUi,
@@ -521,10 +582,8 @@ function splitTranscriptForScrollback(
   }
 
   // When the user just sent a message that the server transcript hasn't confirmed yet,
-  // the latest user message in the transcript is the *previous* turn. Anchoring the
-  // visible tail to it would drag the previous turn's assistant reply back on screen
-  // under the new pending bubble. Push everything to scrollback in that case so the
-  // chat shows only the new pending bubble until the real user message lands.
+  // the latest user message in the transcript is the previous turn. Keep that stale
+  // tail out of the live view until the real user message lands.
   if (options.hasUnconfirmedPendingMessage) {
     return {
       visible: { ...transcript, messages: [] },
@@ -628,6 +687,7 @@ type ComposerDraftState = {
   text: string;
   attachments: ChatAttachment[];
   collaborationMode: CollaborationModeKind;
+  permissionMode: SelectableCodexPermissionModeId;
 };
 
 function hasNewMatchingUserMessage(
@@ -670,17 +730,32 @@ function pendingMessageIsConfirmed(pending: PendingChatMessage, messages: ChatMe
 function messageLooksFreshForPendingTurn(
   pending: PendingChatMessage,
   message: ChatMessage,
-  baselineMessageIds: Set<string>
+  baselineMessageIds: Set<string>,
+  activeTurnId?: string | null
 ): boolean {
   if (baselineMessageIds.has(message.id)) {
     return false;
   }
+  if (message.role === 'user') {
+    return false;
+  }
+  // While the optimistic user message is still unconfirmed, do not attach a
+  // free-floating assistant text message below it. In practice, those are often
+  // late snapshots from the previous turn. Current-turn work still appears as
+  // activity/tool messages, and the final assistant answer appears once the real
+  // user message is confirmed in the transcript.
+  if (message.role === 'assistant' && message.kind === 'message') {
+    return false;
+  }
+  if (activeTurnId && message.turnId) {
+    return message.turnId === activeTurnId;
+  }
   const pendingCreatedAt = Date.parse(pending.createdAt);
   const messageCreatedAt = Date.parse(message.createdAt);
   if (!Number.isFinite(pendingCreatedAt) || !Number.isFinite(messageCreatedAt)) {
-    return true;
+    return false;
   }
-  return messageCreatedAt >= pendingCreatedAt - 10_000;
+  return messageCreatedAt >= pendingCreatedAt;
 }
 
 function attachmentsMatch(
@@ -921,10 +996,7 @@ function ActivityRow({
       </span>
       <span className="codex-activity-copy">
         <span className="codex-activity-title-line">
-          <span className="codex-activity-title">{matchedPlugin?.displayName ?? item.title}</span>
-          {matchedPlugin?.displayName && item.title !== 'Used tool' ? (
-            <span className="codex-activity-target-pill">{item.title}</span>
-          ) : null}
+          <span className="codex-activity-title">{item.title}</span>
         </span>
         {item.detail ? <span className="codex-activity-detail">{item.detail}</span> : null}
       </span>
@@ -965,13 +1037,85 @@ function ActivityRow({
   );
 }
 
+function ActivityProgressMessage({ item }: { item: ActivityGroupItem }) {
+  const text = item.message.text.trim();
+  if (!text) {
+    return null;
+  }
+
+  return (
+    <div className="codex-activity-progress-message">
+      <MessageMarkdown text={text} />
+      <MessageAttachments attachments={item.message.attachments} compact />
+    </div>
+  );
+}
+
+type ActivityChainSegment =
+  | { type: 'progress'; item: ActivityGroupItem }
+  | { type: 'calls'; id: string; items: ActivityGroupItem[] };
+
+function ActivityCallGroup({
+  segment,
+  plugins,
+  isLatestRunningActivity
+}: {
+  segment: Extract<ActivityChainSegment, { type: 'calls' }>;
+  plugins?: CatalogPlugin[];
+  isLatestRunningActivity: (item: ActivityGroupItem) => boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const running = segment.items.some(isLatestRunningActivity);
+  const label = formatActivityCallGroupLabel(segment.items);
+  const detail = formatActivityCallGroupDetail(segment.items);
+
+  return (
+    <div className={`codex-activity-call-group ${expanded ? 'is-expanded' : ''}`}>
+      <button
+        type="button"
+        className={`codex-activity-call-group-toggle ${running ? 'is-running' : ''}`}
+        onClick={() => setExpanded((current) => !current)}
+        aria-expanded={expanded}
+      >
+        <span className="codex-activity-call-group-icon" aria-hidden="true">
+          <Terminal size={14} />
+        </span>
+        <span className="codex-activity-call-group-copy">
+          <span className="codex-activity-call-group-title">{label}</span>
+          {detail ? <span className="codex-activity-call-group-detail">{detail}</span> : null}
+        </span>
+        {running ? <span className="codex-activity-status is-running">Running</span> : null}
+        <ChevronDown
+          size={13}
+          className={`codex-activity-row-chevron ${expanded ? 'is-open' : ''}`}
+          aria-hidden="true"
+        />
+      </button>
+      {expanded ? (
+        <div className="codex-activity-call-group-items">
+          {segment.items.map((item) => (
+            <ActivityRow
+              key={item.id}
+              item={item}
+              plugins={plugins}
+              isLatestRunningActivity={isLatestRunningActivity(item)}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ActivitySummaryRow({
   group,
+  label,
   expanded,
   isLive,
   onToggle
 }: {
   group: ActivityGroup;
+  label: string;
   expanded: boolean;
   isLive: boolean;
   onToggle: () => void;
@@ -988,10 +1132,7 @@ function ActivitySummaryRow({
         className={`codex-activity-summary-chevron ${expanded ? 'is-open' : ''}`}
         aria-hidden="true"
       />
-      <span className="codex-activity-summary-text">{group.title}</span>
-      {group.durationLabel && group.durationLabel !== group.title ? (
-        <span className="codex-activity-summary-meta">{group.durationLabel}</span>
-      ) : null}
+      <span className="codex-activity-summary-text">{label}</span>
       {group.imageCount > 0 ? (
         <span className="codex-activity-summary-meta">
           {group.imageCount} screenshot{group.imageCount === 1 ? '' : 's'}
@@ -1005,17 +1146,30 @@ function ActivityGroupRow({
   group,
   plugins = [],
   providerToneName = 'codex',
-  isLatest = false
+  isLatest = false,
+  onReveal
 }: {
   group: ActivityGroup;
   plugins?: CatalogPlugin[];
   providerToneName?: ProviderTone;
   isLatest?: boolean;
+  onReveal?: (element: HTMLElement) => void;
 }) {
   const isLive = group.status === 'running' && isLatest;
   const [expanded, setExpanded] = useState(isLive);
+  const [now, setNow] = useState(() => Date.now());
+  const sectionRef = useRef<HTMLElement | null>(null);
   const userToggledRef = useRef(false);
   const lastStatusRef = useRef(group.status);
+
+  useEffect(() => {
+    if (!isLive) {
+      return;
+    }
+    setNow(Date.now());
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [isLive, group.startedAt]);
 
   useEffect(() => {
     if (lastStatusRef.current !== group.status) {
@@ -1034,10 +1188,18 @@ function ActivityGroupRow({
   }, [group.id, group.status, isLive]);
 
   const handleToggle = () => {
+    const willExpand = !expanded;
     if (!isLive) {
       userToggledRef.current = true;
     }
     setExpanded((previous) => !previous);
+    if (willExpand && sectionRef.current) {
+      window.setTimeout(() => {
+        if (sectionRef.current) {
+          onReveal?.(sectionRef.current);
+        }
+      }, 0);
+    }
   };
 
   const latestRunningItemId = useMemo(() => {
@@ -1049,32 +1211,130 @@ function ActivityGroupRow({
     }
     return undefined;
   }, [group.items]);
+  const summaryLabel = formatActivitySummaryLabel(group, isLive, now);
+  const segments = useMemo(() => buildActivityChainSegments(group.items), [group.items]);
+  const isLatestRunningActivity = (item: ActivityGroupItem) =>
+    isLive && item.id === latestRunningItemId;
 
   return (
     <section
+      ref={sectionRef}
       className={`codex-activity-group provider-${providerToneName} ${expanded ? 'is-expanded' : ''} ${isLive ? 'is-live' : ''}`}
       data-activity-status={group.status}
       data-scroll-anchor="true"
     >
       <ActivitySummaryRow
         group={group}
+        label={summaryLabel}
         expanded={expanded}
         isLive={isLive}
         onToggle={handleToggle}
       />
-      {expanded ? (
+      <div className="codex-activity-group-items-shell" aria-hidden={!expanded}>
         <div className="codex-activity-group-items">
-          {group.items.map((item) => (
-            <ActivityRow
-              key={item.id}
-              item={item}
-              plugins={plugins}
-              isLatestRunningActivity={isLive && item.id === latestRunningItemId}
-            />
-          ))}
+          {segments.map((segment) =>
+            segment.type === 'progress' ? (
+              <ActivityProgressMessage key={segment.item.id} item={segment.item} />
+            ) : (
+              <ActivityCallGroup
+                key={segment.id}
+                segment={segment}
+                plugins={plugins}
+                isLatestRunningActivity={isLatestRunningActivity}
+              />
+            )
+          )}
         </div>
-      ) : null}
+      </div>
     </section>
+  );
+}
+
+function buildActivityChainSegments(items: ActivityGroupItem[]): ActivityChainSegment[] {
+  const segments: ActivityChainSegment[] = [];
+  let callBuffer: ActivityGroupItem[] = [];
+
+  const flushCalls = () => {
+    if (callBuffer.length === 0) {
+      return;
+    }
+    segments.push({
+      type: 'calls',
+      id: `calls:${callBuffer.map((item) => item.id).join('|')}`,
+      items: callBuffer
+    });
+    callBuffer = [];
+  };
+
+  for (const item of items) {
+    if (isActivityProgressItem(item)) {
+      flushCalls();
+      segments.push({ type: 'progress', item });
+      continue;
+    }
+    callBuffer.push(item);
+  }
+
+  flushCalls();
+  return segments;
+}
+
+function isActivityProgressItem(item: ActivityGroupItem): boolean {
+  const message = item.message;
+  return (
+    (message.role === 'assistant' && message.kind === 'message') ||
+    message.phase === 'pending_send'
+  );
+}
+
+function formatActivitySummaryLabel(group: ActivityGroup, isLive: boolean, now: number): string {
+  const startedAt = Date.parse(group.startedAt ?? '');
+  const endedAt = isLive ? now : Date.parse(group.endedAt ?? '');
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt <= startedAt) {
+    return group.title;
+  }
+  const seconds = Math.max(1, Math.round((endedAt - startedAt) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  const duration = minutes > 0 ? `${minutes}m ${remainingSeconds}s` : `${seconds}s`;
+  return `${isLive ? 'Working' : 'Worked'} for ${duration}`;
+}
+
+function formatActivityCallGroupLabel(items: ActivityGroupItem[]): string {
+  if (items.length === 1) {
+    return items[0]?.title ?? 'Tool call';
+  }
+  return `${items.length} tool calls`;
+}
+
+function formatActivityCallGroupDetail(items: ActivityGroupItem[]): string {
+  const titles = Array.from(new Set(items.map((item) => item.title).filter(Boolean)));
+  return titles.slice(0, 3).join(', ');
+}
+
+function ContextCompactionMarker({
+  status
+}: {
+  status: 'completed' | 'running';
+}) {
+  const isRunning = status === 'running';
+  const label = isRunning ? 'Compacting context' : 'Context automatically compacted';
+
+  return (
+    <div
+      className={`codex-context-compaction-marker ${isRunning ? 'is-running' : ''}`}
+      role="status"
+      aria-live="polite"
+      data-scroll-anchor="true"
+    >
+      <span className="codex-context-compaction-line" aria-hidden="true" />
+      <span className="codex-context-compaction-pill">
+        <Info size={14} aria-hidden="true" />
+        <span>{label}</span>
+        {isRunning ? <span className="codex-context-compaction-dot" aria-hidden="true" /> : null}
+      </span>
+      <span className="codex-context-compaction-line" aria-hidden="true" />
+    </div>
   );
 }
 
@@ -1103,6 +1363,9 @@ export function ThreadView({
   models = [],
   fetchProjectFiles,
   onChangeModel,
+  onFetchGoal,
+  onUpdateGoal,
+  onClearGoal,
   onApprovalDecision,
   sourceHandoffs = [],
   incomingHandoffs = [],
@@ -1173,10 +1436,20 @@ export function ThreadView({
   const [filesLoading, setFilesLoading] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelUpdating, setModelUpdating] = useState(false);
+  const [goalEditorOpen, setGoalEditorOpen] = useState(false);
+  const [goalDraft, setGoalDraft] = useState('');
+  const [goalBudgetDraft, setGoalBudgetDraft] = useState('');
+  const [goalBusy, setGoalBusy] = useState(false);
+  const [goalError, setGoalError] = useState('');
   const [collaborationMode, setCollaborationMode] =
     useState<CollaborationModeKind>('default');
+  const [permissionMode, setPermissionMode] =
+    useState<SelectableCodexPermissionModeId>(DEFAULT_CODEX_PERMISSION_MODE);
+  const [permissionModeTouched, setPermissionModeTouched] = useState(false);
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   const [threadActionsOpen, setThreadActionsOpen] = useState(false);
+  const goal = transcript?.goal ?? null;
+  const [goalNowSeconds, setGoalNowSeconds] = useState(() => currentUnixSeconds());
   const composerMenuRef = useDismissOnOutsidePointer<HTMLDivElement>(
     composerMenuOpen,
     () => setComposerMenuOpen(false)
@@ -1184,6 +1457,20 @@ export function ThreadView({
   const threadActionsMenuRef = useDismissOnOutsidePointer<HTMLDivElement>(
     threadActionsOpen,
     () => setThreadActionsOpen(false)
+  );
+  const closeGoalEditor = () => {
+    setGoalEditorOpen(false);
+    if (goal) {
+      setGoalDraft(goal.objective);
+      setGoalBudgetDraft(goal.tokenBudget ? String(goal.tokenBudget) : '');
+      return;
+    }
+    setGoalDraft('');
+    setGoalBudgetDraft('');
+  };
+  const goalEditorRef = useDismissOnOutsidePointer<HTMLDivElement>(
+    goalEditorOpen,
+    closeGoalEditor
   );
   const [handoffOpen, setHandoffOpen] = useState(false);
   const [handoffTargetProvider, setHandoffTargetProvider] = useState<AgentProvider>('claude-code');
@@ -1212,7 +1499,10 @@ export function ThreadView({
   const [loadingOlderByThread, setLoadingOlderByThread] = useState<Record<string, boolean>>({});
   const [olderErrorByThread, setOlderErrorByThread] = useState<Record<string, string>>({});
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const bottomPanelRef = useRef<HTMLDivElement | null>(null);
+  const [bottomPanelHeight, setBottomPanelHeight] = useState(180);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
   const voiceRecorderRef = useRef<MediaRecorder | null>(null);
   const voicePcmRecorderRef = useRef<PcmVoiceRecorder | null>(null);
   const voiceStreamRef = useRef<MediaStream | null>(null);
@@ -1236,7 +1526,6 @@ export function ThreadView({
   // Thinking placeholder can collapse and leave the viewport at old history.
   const forceScrollToBottomRef = useRef(false);
   const loadingOlderRef = useRef(false);
-  const autoOlderLoadCursorRef = useRef<string | undefined>(undefined);
   // Anchor + scroll-height delta captured right before older messages are prepended.
   // The layout effect below restores scroll position using this snapshot synchronously,
   // before the browser paints, so the user never sees a flash of jumped scroll.
@@ -1267,6 +1556,7 @@ export function ThreadView({
   const sessionBaselineSeededRef = useRef(false);
   const provider = providerForThread(thread.provider);
   const providerName = providerLabel(provider);
+  const canUseGoalMode = provider === 'codex' && Boolean(onUpdateGoal);
   const composerPlugins = provider === 'codex' ? plugins : [];
   const composerSkills = provider === 'codex' ? skills : [];
   const composerCommands = provider === 'codex' ? commands : [];
@@ -1385,13 +1675,20 @@ export function ThreadView({
     threadId: string,
     text: string,
     attachments: ChatAttachment[],
-    mode: CollaborationModeKind
+    mode: CollaborationModeKind,
+    nextPermissionMode = permissionMode
   ) => {
-    if (text || attachments.length > 0 || mode !== 'default') {
+    if (
+      text ||
+      attachments.length > 0 ||
+      mode !== 'default' ||
+      nextPermissionMode !== DEFAULT_CODEX_PERMISSION_MODE
+    ) {
       composerDraftsRef.current.set(threadId, {
         text,
         attachments,
-        collaborationMode: mode
+        collaborationMode: mode,
+        permissionMode: nextPermissionMode
       });
       return;
     }
@@ -1438,6 +1735,22 @@ export function ThreadView({
   }, [handoffTargetProvider, handoffTargetProviders]);
 
   useEffect(() => {
+    if (provider !== 'codex') {
+      return;
+    }
+    const transcriptMode = selectablePermissionModeFromTranscript(transcript?.permissionMode);
+    if (!transcriptMode) {
+      return;
+    }
+    const savedDraft = composerDraftsRef.current.get(thread.threadId);
+    if (savedDraft?.permissionMode) {
+      return;
+    }
+    setPermissionMode(transcriptMode);
+    setPermissionModeTouched(false);
+  }, [provider, thread.threadId, transcript?.permissionMode?.mode]);
+
+  useEffect(() => {
     const previousThreadId = activeDraftThreadIdRef.current;
     if (previousThreadId === thread.threadId) {
       return;
@@ -1448,6 +1761,12 @@ export function ThreadView({
     setDraft(nextDraft?.text ?? '');
     setDraftAttachments(nextDraft?.attachments ?? []);
     setCollaborationMode(nextDraft?.collaborationMode ?? 'default');
+    setPermissionMode(
+      nextDraft?.permissionMode ??
+        selectablePermissionModeFromTranscript(transcript?.permissionMode) ??
+        DEFAULT_CODEX_PERMISSION_MODE
+    );
+    setPermissionModeTouched(Boolean(nextDraft?.permissionMode));
     setMention(undefined);
     setFiles([]);
     setComposerMenuOpen(false);
@@ -1547,6 +1866,72 @@ export function ThreadView({
   );
   const canSend = Boolean(canUseComposer && hasDraftContent);
   const displayedModelName = effectiveModelName ? formatModelName(effectiveModelName) : providerName;
+  const codexPermissionOption = permissionOptionForMode(permissionMode);
+  const currentPermissionMode = transcript?.permissionMode;
+  const permissionChipLabel =
+    provider === 'codex'
+      ? (currentPermissionMode?.mode === 'custom' || currentPermissionMode?.mode === 'sandbox'
+          ? currentPermissionMode.label
+          : permissionOptionForMode(
+              selectablePermissionModeFromTranscript(currentPermissionMode) ?? permissionMode
+            ).label)
+      : '';
+  const permissionChipTitle =
+    provider === 'codex'
+      ? currentPermissionMode?.sandboxMode
+        ? `${permissionChipLabel}: ${currentPermissionMode.sandboxMode}`
+        : codexPermissionOption.description
+      : '';
+  const messagesViewportStyle = useMemo(
+    () =>
+      ({
+        '--codex-bottom-panel-height': `${bottomPanelHeight}px`
+      }) as React.CSSProperties,
+    [bottomPanelHeight]
+  );
+
+  const revealElementAboveComposer = (element: HTMLElement | null) => {
+    if (!element) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const node = messagesRef.current;
+        if (!node || !node.contains(element)) {
+          return;
+        }
+        const nodeRect = node.getBoundingClientRect();
+        const elementRect = element.getBoundingClientRect();
+        const panelHeight =
+          bottomPanelRef.current?.getBoundingClientRect().height ?? bottomPanelHeight;
+        const topLimit = nodeRect.top + 18;
+        const bottomLimit = nodeRect.bottom - panelHeight - 18;
+        const usableHeight = Math.max(120, bottomLimit - topLimit);
+        let delta = 0;
+
+        if (elementRect.height > usableHeight && elementRect.top < topLimit) {
+          delta = elementRect.top - topLimit;
+        } else if (elementRect.bottom > bottomLimit) {
+          delta =
+            elementRect.height > usableHeight
+              ? elementRect.top - topLimit
+              : elementRect.bottom - bottomLimit;
+        } else if (elementRect.top < topLimit) {
+          delta = elementRect.top - topLimit;
+        }
+
+        if (Math.abs(delta) < 1) {
+          return;
+        }
+        node.scrollBy({
+          top: delta,
+          behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            ? 'auto'
+            : 'smooth'
+        });
+      });
+    });
+  };
 
   // Status bar text logic:
   // - When sending: "Sending to {provider}..."
@@ -1611,9 +1996,17 @@ export function ThreadView({
       const latestPending = stillPending[stillPending.length - 1]!;
       const baselineMessageIds = new Set(latestPending.baselineMessageIds);
       const freshServerMessages = withLiveBuffer.filter((message) =>
-        messageLooksFreshForPendingTurn(latestPending, message, baselineMessageIds)
+        messageLooksFreshForPendingTurn(
+          latestPending,
+          message,
+          baselineMessageIds,
+          transcript?.activeTurnId
+        )
       );
-      const visibleAfterPending = [...stillPending, ...freshServerMessages];
+      const visibleAfterPending = [
+        ...stillPending,
+        ...freshServerMessages
+      ];
       const hasAgentActivityAfterPending = freshServerMessages.some((message) => message.role !== 'user');
       if (!hasAgentActivityAfterPending) {
         const pendingCreatedAt = Date.parse(latestPending.createdAt);
@@ -1635,15 +2028,17 @@ export function ThreadView({
       // milliseconds ahead of the helper's.
       return buildRenderableEntries(visibleAfterPending, {
         isLive: true,
+        isCompacting,
         preserveInputOrder: true,
         fileChanges
       });
     }
     return buildRenderableEntries(combined, {
       isLive: isAgentWorking || Boolean(transcript?.activeTurnId),
+      isCompacting,
       fileChanges
     });
-  }, [transcript?.messages, olderMessages, pendingMessages, isAgentWorking, transcript?.activeTurnId, liveAssistantText, fileChanges, providerName]);
+  }, [transcript?.messages, olderMessages, pendingMessages, isAgentWorking, isCompacting, transcript?.activeTurnId, liveAssistantText, fileChanges, providerName]);
   // Identify the latest activity group so live work can stay expanded while older work
   // stays as a compact OpenAssist-style summary.
   const latestActivityGroupId = useMemo(() => {
@@ -1698,7 +2093,6 @@ export function ThreadView({
     setThreadActionsOpen(false);
     setLoadingOlderForThread(thread.threadId, false);
     loadingOlderRef.current = false;
-    autoOlderLoadCursorRef.current = undefined;
     setOlderErrorForThread(thread.threadId, '');
     pinnedToBottomRef.current = true;
     hasPositionedInitialRef.current = false;
@@ -1706,7 +2100,83 @@ export function ThreadView({
     // transcript paint below.
     sessionUserBaselineRef.current = new Set();
     sessionBaselineSeededRef.current = false;
+    setGoalEditorOpen(false);
+    setGoalDraft('');
+    setGoalBudgetDraft('');
+    setGoalError('');
   }, [thread.threadId]);
+
+  useEffect(() => {
+    if (!canUseGoalMode || !onFetchGoal || !transcript || transcript.goal !== undefined) {
+      return;
+    }
+    let cancelled = false;
+    void onFetchGoal()
+      .then((loadedGoal) => {
+        if (cancelled || !loadedGoal) {
+          return;
+        }
+        setGoalDraft(loadedGoal.objective);
+        setGoalBudgetDraft(loadedGoal.tokenBudget ? String(loadedGoal.tokenBudget) : '');
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [canUseGoalMode, onFetchGoal, transcript, transcript?.goal, thread.threadId]);
+
+  useEffect(() => {
+    if (!goal || goalEditorOpen) {
+      return;
+    }
+    setGoalDraft(goal.objective);
+    setGoalBudgetDraft(goal.tokenBudget ? String(goal.tokenBudget) : '');
+  }, [goal, goalEditorOpen]);
+
+  useEffect(() => {
+    if (goal?.status !== 'active' || typeof window === 'undefined') {
+      return;
+    }
+    setGoalNowSeconds(currentUnixSeconds());
+    const interval = window.setInterval(() => {
+      setGoalNowSeconds(currentUnixSeconds());
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [goal?.status, goal?.timeUsedSeconds, goal?.updatedAt]);
+
+  useLayoutEffect(() => {
+    const panel = bottomPanelRef.current;
+    if (!panel) {
+      return;
+    }
+
+    let frame: number | null = null;
+    const measure = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        const nextHeight = Math.ceil(panel.getBoundingClientRect().height);
+        setBottomPanelHeight((current) =>
+          Math.abs(current - nextHeight) > 1 ? nextHeight : current
+        );
+      });
+    };
+
+    measure();
+    const observer =
+      typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : undefined;
+    observer?.observe(panel);
+    window.addEventListener('resize', measure);
+    return () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, []);
 
 
   // Initial-paint positioning + pinned-bottom live scrolling.
@@ -1898,6 +2368,15 @@ export function ThreadView({
     }
     event.preventDefault();
     void addDraftImageFiles(imageFiles);
+  };
+
+  const handleComposerImageInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = '';
+    if (files.length === 0) {
+      return;
+    }
+    void addDraftImageFiles(files);
   };
 
   const insertMention = (item: MentionItem) => {
@@ -2142,7 +2621,17 @@ export function ThreadView({
   };
 
   const handleVoicePointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0 || voiceState !== 'idle') {
+    if (event.button !== 0) {
+      return;
+    }
+    if (voiceState === 'recording') {
+      event.preventDefault();
+      voiceIgnoreNextClickRef.current = true;
+      voicePointerStartAtRef.current = undefined;
+      finishVoiceRecording(true);
+      return;
+    }
+    if (voiceState !== 'idle') {
       return;
     }
     voicePointerStartAtRef.current = Date.now();
@@ -2182,6 +2671,15 @@ export function ThreadView({
         : planSessionThreadIdsRef.current.has(thread.threadId)
           ? 'default'
           : undefined;
+    const currentSelectablePermissionMode = selectablePermissionModeFromTranscript(
+      transcript?.permissionMode
+    );
+    const requestedPermissionMode: SelectableCodexPermissionModeId | undefined =
+      provider === 'codex' &&
+      (permissionModeTouched ||
+        permissionMode !== (currentSelectablePermissionMode ?? DEFAULT_CODEX_PERMISSION_MODE))
+        ? permissionMode
+        : undefined;
     const baselineMessageIds = new Set(
       [...olderMessages, ...(transcript?.messages ?? [])].map((message) => message.id)
     );
@@ -2230,6 +2728,7 @@ export function ThreadView({
     try {
       const sendOptions = {
         ...(requestedCollaborationMode ? { collaborationMode: requestedCollaborationMode } : {}),
+        ...(requestedPermissionMode ? { permissionMode: requestedPermissionMode } : {}),
         ...(attachmentsToSend.length > 0 ? { attachments: attachmentsToSend } : {})
       };
       const result =
@@ -2328,6 +2827,36 @@ export function ThreadView({
     }
   };
 
+  const renderedHasUserMessage = [
+    ...olderMessages,
+    ...(transcript?.messages ?? []),
+    ...pendingMessages
+  ].some((message) => message.role === 'user');
+
+  useEffect(() => {
+    if (
+      loading ||
+      loadingOlder ||
+      !fetchOlderMessages ||
+      !hasMoreOlder ||
+      !oldestMessageId ||
+      !transcript ||
+      transcript.messages.length === 0 ||
+      renderedHasUserMessage
+    ) {
+      return;
+    }
+    void loadOlderMessages();
+  }, [
+    loading,
+    loadingOlder,
+    fetchOlderMessages,
+    hasMoreOlder,
+    oldestMessageId,
+    transcript,
+    renderedHasUserMessage
+  ]);
+
   // Restore scroll position synchronously after loading UI appears/disappears or
   // older messages are prepended. Using useLayoutEffect avoids a visible jump frame.
   useLayoutEffect(() => {
@@ -2348,56 +2877,6 @@ export function ThreadView({
     }
   }, [olderMessages.length, loadingOlder, hasMoreOlder, olderError]);
 
-  const maybeAutoLoadOlderMessages = (node: HTMLDivElement): void => {
-    if (
-      !fetchOlderMessages ||
-      !hasMoreOlder ||
-      !oldestMessageId ||
-      loadingOlderRef.current ||
-      loading ||
-      sending ||
-      pendingMessages.length > 0 ||
-      isAgentWorking ||
-      Boolean(transcript?.activeTurnId)
-    ) {
-      return;
-    }
-
-    const scrollable = node.scrollHeight > node.clientHeight + OLDER_MESSAGES_AUTO_LOAD_TOP_PX;
-    const nearTop = scrollable && node.scrollTop <= OLDER_MESSAGES_AUTO_LOAD_TOP_PX;
-    const underfilled =
-      node.clientHeight > 0 &&
-      node.scrollHeight <= node.clientHeight + OLDER_MESSAGES_AUTO_LOAD_TOP_PX;
-    if (!nearTop && !underfilled) {
-      return;
-    }
-
-    if (autoOlderLoadCursorRef.current === oldestMessageId) {
-      return;
-    }
-    autoOlderLoadCursorRef.current = oldestMessageId;
-    void loadOlderMessages();
-  };
-
-  useLayoutEffect(() => {
-    const node = messagesRef.current;
-    if (!node) {
-      return;
-    }
-    maybeAutoLoadOlderMessages(node);
-  }, [
-    canShowLoadOlderMessages,
-    loading,
-    loadingOlder,
-    oldestMessageId,
-    olderMessages.length,
-    transcript?.messages.length,
-    pendingMessages.length,
-    sending,
-    isAgentWorking,
-    transcript?.activeTurnId
-  ]);
-
   // Coalesce scroll-handler reads into one per animation frame. The handler reads
   // scrollHeight/scrollTop/clientHeight, which forces a layout. On a long transcript
   // doing that 60–120 times per second on a touch device causes scroll jank.
@@ -2412,7 +2891,6 @@ export function ThreadView({
       const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
       const scrollablePastLatest = node.scrollHeight - node.clientHeight > NEAR_BOTTOM_PX;
       pinnedToBottomRef.current = !scrollablePastLatest || distanceFromBottom <= NEAR_BOTTOM_PX;
-      maybeAutoLoadOlderMessages(node);
     });
   };
 
@@ -2647,6 +3125,174 @@ export function ThreadView({
     }
   };
 
+  const parseGoalBudget = (): number | null | undefined => {
+    const trimmed = goalBudgetDraft.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('Goal budget must be a positive number.');
+    }
+    return Math.trunc(parsed);
+  };
+
+  const saveGoal = async () => {
+    if (!onUpdateGoal) {
+      return;
+    }
+    const objective = goalDraft.trim();
+    if (!objective) {
+      setGoalError('Enter a goal first.');
+      return;
+    }
+    setGoalBusy(true);
+    setGoalError('');
+    try {
+      const nextGoal = await onUpdateGoal({
+        objective,
+        status: 'active',
+        tokenBudget: parseGoalBudget()
+      });
+      setGoalDraft(nextGoal.objective);
+      setGoalBudgetDraft(nextGoal.tokenBudget ? String(nextGoal.tokenBudget) : '');
+      setGoalEditorOpen(false);
+    } catch (goalUpdateError) {
+      setGoalError(
+        goalUpdateError instanceof Error ? goalUpdateError.message : 'Could not save goal.'
+      );
+    } finally {
+      setGoalBusy(false);
+    }
+  };
+
+  const updateGoalStatus = async (status: ThreadGoal['status']) => {
+    if (!onUpdateGoal) {
+      return;
+    }
+    setGoalBusy(true);
+    setGoalError('');
+    try {
+      await onUpdateGoal({ status });
+    } catch (goalUpdateError) {
+      setGoalError(
+        goalUpdateError instanceof Error ? goalUpdateError.message : 'Could not update goal.'
+      );
+    } finally {
+      setGoalBusy(false);
+    }
+  };
+
+  const clearGoal = async () => {
+    if (!onClearGoal) {
+      return;
+    }
+    setGoalBusy(true);
+    setGoalError('');
+    try {
+      await onClearGoal();
+      setGoalDraft('');
+      setGoalBudgetDraft('');
+      setGoalEditorOpen(false);
+    } catch (goalClearError) {
+      setGoalError(
+        goalClearError instanceof Error ? goalClearError.message : 'Could not clear goal.'
+      );
+    } finally {
+      setGoalBusy(false);
+    }
+  };
+
+  const renderGoalStatusChip = () => {
+    if (!canUseGoalMode || !goal || goalEditorOpen) {
+      return null;
+    }
+
+    const statusLabel = goalStatusLabel(goal.status);
+    const metrics = formatGoalMetrics(goal);
+    const elapsedTime = formatGoalElapsed(goal, goalNowSeconds);
+    return (
+      <button
+        type="button"
+        className={`codex-goal-status-chip is-${goal.status}`}
+        onClick={() => setGoalEditorOpen(true)}
+        title={goal.objective}
+        aria-label={`Open goal mode. Goal ${statusLabel}${elapsedTime ? `. Time ${elapsedTime}` : ''}`}
+      >
+        <Target size={13} aria-hidden="true" />
+        <span className="codex-goal-label">
+          <span className="codex-goal-label-prefix">Goal </span>
+          {statusLabel}
+        </span>
+        {elapsedTime ? <span className="codex-goal-time">{elapsedTime}</span> : null}
+        {metrics ? <span className="codex-goal-metrics">{metrics}</span> : null}
+      </button>
+    );
+  };
+
+  const renderGoalPanel = () => {
+    if (!canUseGoalMode || !goalEditorOpen) {
+      return null;
+    }
+
+    const statusLabel = goal ? goalStatusLabel(goal.status) : 'New goal';
+
+    return (
+      <div ref={goalEditorRef} className="codex-goal-panel" role="region" aria-label="Codex goal mode">
+        <div className="codex-goal-heading">
+          <span className={`codex-goal-icon ${goal ? `is-${goal.status}` : ''}`}>
+            <Target size={15} aria-hidden="true" />
+          </span>
+          <div>
+            <strong>Goal mode</strong>
+            <span>{statusLabel}</span>
+          </div>
+        </div>
+        <div className="codex-goal-editor">
+          <textarea
+            value={goalDraft}
+            onChange={(event) => setGoalDraft(event.currentTarget.value)}
+            placeholder="Example: Finish the slash goal integration and verify tests."
+            rows={2}
+            disabled={goalBusy}
+          />
+          <input
+            value={goalBudgetDraft}
+            onChange={(event) => setGoalBudgetDraft(event.currentTarget.value)}
+            inputMode="numeric"
+            placeholder="Token budget"
+            disabled={goalBusy}
+          />
+          <div className="codex-goal-actions">
+            <button type="button" onClick={() => void saveGoal()} disabled={goalBusy}>
+              {goalBusy ? <Spinner size={13} /> : <Check size={13} aria-hidden="true" />}
+              <span>Save goal</span>
+            </button>
+            {goal ? (
+              <button
+                type="button"
+                className="is-danger"
+                onClick={() => void clearGoal()}
+                disabled={goalBusy}
+              >
+                Clear goal
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={closeGoalEditor}
+                disabled={goalBusy}
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        </div>
+        {goalError ? <p className="codex-goal-error">{goalError}</p> : null}
+      </div>
+    );
+  };
+
   const renderFileChangeCards = (summaries: ThreadFileChangeSummary[]) => {
     if (summaries.length === 0) {
       return null;
@@ -2793,11 +3439,20 @@ export function ThreadView({
         </div>
       </header>
 
-      {showStatusText ? (
+      {showStatusText || (goal && !goalEditorOpen) || provider === 'codex' ? (
         <div className="codex-thread-status">
-          <span>{statusText}</span>
+          {showStatusText ? <span className="codex-thread-status-text">{statusText}</span> : null}
+          {provider === 'codex' ? (
+            <span className="codex-permission-chip" title={permissionChipTitle}>
+              <ShieldCheck size={13} aria-hidden="true" />
+              <span>{permissionChipLabel || codexPermissionOption.label}</span>
+            </span>
+          ) : null}
+          {renderGoalStatusChip()}
         </div>
       ) : null}
+
+      {renderGoalPanel()}
 
       {sourceHandoffs.length > 0 || incomingHandoffs.length > 0 ? (
         <div className="handoff-card-list" aria-label="Linked handoffs">
@@ -2834,6 +3489,7 @@ export function ThreadView({
       <div
         className="codex-thread-messages"
         ref={messagesRef}
+        style={messagesViewportStyle}
         onScroll={handleMessagesScroll}
         onMouseUp={captureAssistantSelection}
         onTouchEnd={() => window.setTimeout(captureAssistantSelection, 0)}
@@ -2845,7 +3501,7 @@ export function ThreadView({
             onClick={() => void loadOlderMessages()}
           >
             <ChevronUp size={14} aria-hidden="true" />
-            <span>Load earlier messages</span>
+            <span>Load 10 earlier messages</span>
           </button>
         ) : null}
         {loadingOlder ? (
@@ -2887,8 +3543,18 @@ export function ThreadView({
                   plugins={plugins}
                   providerToneName={providerTone(provider)}
                   isLatest={entry.group.id === latestActivityGroupId}
+                  onReveal={revealElementAboveComposer}
                 />
               </Fragment>
+            );
+          }
+
+          if (entry.type === 'contextCompaction') {
+            return (
+              <ContextCompactionMarker
+                key={entry.id}
+                status={entry.status}
+              />
             );
           }
 
@@ -2900,13 +3566,19 @@ export function ThreadView({
             : 0;
           const isLong = estimatedLines > 25;
           const isExpanded = expandedMessages.has(message.id);
-          const toggleExpanded = () =>
+          const toggleExpanded = (event: ReactMouseEvent<HTMLButtonElement>) => {
+            const willExpand = !isExpanded;
+            const messageElement = event.currentTarget.closest<HTMLElement>('.codex-message');
             setExpandedMessages((prev) => {
               const next = new Set(prev);
               if (next.has(message.id)) next.delete(message.id);
               else next.add(message.id);
               return next;
             });
+            if (willExpand) {
+              revealElementAboveComposer(messageElement);
+            }
+          };
 
           if (message.role === 'user') {
             return (
@@ -2923,7 +3595,12 @@ export function ThreadView({
                     {isLong ? (
                       <div className={`codex-message-expand-wrap${!isExpanded ? ' is-faded' : ''}`}>
                         <button className="codex-message-expand" type="button" onClick={toggleExpanded}>
-                          {isExpanded ? 'Show less' : 'Show more'}
+                          <span>{isExpanded ? 'Show less' : 'Show more'}</span>
+                          {isExpanded ? (
+                            <ChevronUp size={14} aria-hidden="true" />
+                          ) : (
+                            <ChevronDown size={14} aria-hidden="true" />
+                          )}
                         </button>
                       </div>
                     ) : null}
@@ -2951,7 +3628,12 @@ export function ThreadView({
                     {isLong ? (
                       <div className={`codex-message-expand-wrap codex-message-expand-wrap--prose${!isExpanded ? ' is-faded' : ''}`}>
                         <button className="codex-message-expand" type="button" onClick={toggleExpanded}>
-                          {isExpanded ? 'Show less' : 'Show more'}
+                          <span>{isExpanded ? 'Show less' : 'Show more'}</span>
+                          {isExpanded ? (
+                            <ChevronUp size={14} aria-hidden="true" />
+                          ) : (
+                            <ChevronDown size={14} aria-hidden="true" />
+                          )}
                         </button>
                       </div>
                     ) : null}
@@ -2963,7 +3645,7 @@ export function ThreadView({
         })}
       </div>
 
-      <div className="codex-thread-bottom-panel">
+      <div className="codex-thread-bottom-panel" ref={bottomPanelRef}>
         {commentSelection ? (
           <div className="transcript-comment-card" role="region" aria-label="Selected transcript text">
             <div>
@@ -3003,12 +3685,22 @@ export function ThreadView({
 
       <form
         className="codex-composer"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void handleSend();
-        }}
-      >
-        <div className="codex-composer-frame">
+      onSubmit={(event) => {
+        event.preventDefault();
+        void handleSend();
+      }}
+    >
+      <div className="codex-composer-frame">
+          <input
+            ref={imageInputRef}
+            className="codex-composer-file-input"
+            type="file"
+            accept="image/*"
+            multiple
+            tabIndex={-1}
+            aria-hidden="true"
+            onChange={handleComposerImageInputChange}
+          />
           {mention ? (
             <MentionPicker
               trigger={mention.trigger}
@@ -3198,16 +3890,37 @@ export function ThreadView({
                         {collaborationMode === 'plan' ? 'On' : 'Off'}
                       </span>
                     </button>
+                    {canUseGoalMode ? (
+                      <button
+                        type="button"
+                        className="codex-composer-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setGoalEditorOpen(true);
+                          setComposerMenuOpen(false);
+                        }}
+                      >
+                        <Target size={14} aria-hidden="true" />
+                        <span>{goal ? 'Edit goal' : 'Set goal'}</span>
+                        <span className="codex-composer-menu-meta">/goal</span>
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="codex-composer-menu-item"
                       role="menuitem"
-                      disabled
-                      title="Paste an image into the message box to attach it"
+                      disabled={!sendMessage || draftAttachments.length >= MAX_COMPOSER_IMAGE_ATTACHMENTS}
+                      title="Choose an image from this device, or paste one into the message box"
+                      onClick={() => {
+                        imageInputRef.current?.click();
+                        setComposerMenuOpen(false);
+                      }}
                     >
                       <ImagePlus size={14} aria-hidden="true" />
-                      <span>Paste image</span>
-                      <span className="codex-composer-menu-meta">Cmd+V</span>
+                      <span>Add image</span>
+                      <span className="codex-composer-menu-meta">
+                        {draftAttachments.length >= MAX_COMPOSER_IMAGE_ATTACHMENTS ? 'Max' : 'Photos'}
+                      </span>
                     </button>
                   </div>
                 ) : null}
@@ -3227,6 +3940,26 @@ export function ThreadView({
                 disabled={modelUpdating || !onChangeModel || !canChangeModel}
                 setUpdating={setModelUpdating}
               />
+              {provider === 'codex' ? (
+                <PermissionModeChip
+                  value={permissionMode}
+                  label={permissionChipLabel}
+                  title={permissionChipTitle}
+                  currentMode={currentPermissionMode}
+                  disabled={!sendMessage || sending}
+                  onChange={(nextMode) => {
+                    setPermissionMode(nextMode);
+                    setPermissionModeTouched(true);
+                    saveComposerDraft(
+                      thread.threadId,
+                      draft,
+                      draftAttachments,
+                      collaborationMode,
+                      nextMode
+                    );
+                  }}
+                />
+              ) : null}
               {collaborationMode === 'plan' ? (
                 <span className="codex-composer-mode-indicator">
                   <ListChecks size={13} aria-hidden="true" />
@@ -3524,6 +4257,73 @@ function HandoffCard({
         ) : null}
       </div>
     </article>
+  );
+}
+
+function PermissionModeChip({
+  value,
+  label,
+  title,
+  currentMode,
+  disabled,
+  onChange
+}: {
+  value: SelectableCodexPermissionModeId;
+  label: string;
+  title: string;
+  currentMode?: CodexPermissionMode;
+  disabled: boolean;
+  onChange: (mode: SelectableCodexPermissionModeId) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useDismissOnOutsidePointer<HTMLDivElement>(open, () => setOpen(false));
+  const currentLabel =
+    currentMode?.mode === 'custom' || currentMode?.mode === 'sandbox'
+      ? currentMode.label
+      : permissionOptionForMode(selectablePermissionModeFromTranscript(currentMode) ?? value)
+          .label;
+
+  return (
+    <div ref={ref} className={`codex-composer-permission-chip ${open ? 'is-open' : ''}`}>
+      <button
+        type="button"
+        className="codex-composer-permission-toggle"
+        onClick={() => setOpen((current) => !current)}
+        disabled={disabled}
+        title={title}
+        aria-label={`Codex permission mode: ${currentLabel}`}
+        aria-expanded={open}
+      >
+        <ShieldCheck size={13} aria-hidden="true" />
+        <span>{label}</span>
+      </button>
+      {open ? (
+        <div className="codex-composer-permission-menu" role="menu">
+          {CODEX_PERMISSION_OPTIONS.map((option) => (
+            <button
+              key={option.mode}
+              type="button"
+              className={`codex-composer-permission-option ${
+                value === option.mode ? 'is-selected' : ''
+              }`}
+              role="menuitemradio"
+              aria-label={option.label}
+              aria-checked={value === option.mode}
+              onClick={() => {
+                onChange(option.mode);
+                setOpen(false);
+              }}
+            >
+              <span className="codex-composer-permission-option-title">{option.label}</span>
+              <span className="codex-composer-permission-option-meta">{option.meta}</span>
+              <span className="codex-composer-permission-option-desc">
+                {option.description}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -4284,6 +5084,74 @@ function UsageBadges({ usage }: { usage: ThreadUsage }) {
       ) : null}
     </div>
   );
+}
+
+function goalStatusLabel(status: ThreadGoal['status']): string {
+  switch (status) {
+    case 'paused':
+      return 'Paused';
+    case 'budgetLimited':
+      return 'Budget limited';
+    case 'complete':
+      return 'Complete';
+    case 'active':
+    default:
+      return 'Active';
+  }
+}
+
+function formatGoalMetrics(goal: ThreadGoal): string {
+  const parts: string[] = [];
+  if (goal.tokensUsed > 0) {
+    parts.push(`${formatCompactNumber(goal.tokensUsed)} tok`);
+  }
+  if (goal.tokenBudget) {
+    parts.push(`${formatCompactNumber(goal.tokenBudget)} budget`);
+  }
+  return parts.slice(0, 2).join(' · ');
+}
+
+function formatGoalTime(seconds: number): string {
+  const totalMinutes = Math.max(0, Math.floor(seconds / 60));
+  if (totalMinutes < 1) {
+    return '<1m';
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0 && minutes > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (hours > 0) {
+    return `${hours}h`;
+  }
+  return `${minutes}m`;
+}
+
+function currentUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function liveGoalElapsedSeconds(goal: ThreadGoal, nowSeconds: number): number {
+  const baseSeconds = Math.max(0, goal.timeUsedSeconds);
+  if (goal.status !== 'active' || goal.updatedAt <= 0) {
+    return baseSeconds;
+  }
+  return baseSeconds + Math.max(0, nowSeconds - goal.updatedAt);
+}
+
+function formatGoalElapsed(goal: ThreadGoal, nowSeconds = currentUnixSeconds()): string {
+  const elapsedSeconds = liveGoalElapsedSeconds(goal, nowSeconds);
+  return elapsedSeconds > 0 ? formatGoalTime(elapsedSeconds) : '';
+}
+
+function formatCompactNumber(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}K`;
+  }
+  return String(value);
 }
 
 function formatUsageResetText(resetsAt: number | undefined, minutes: number): string | undefined {

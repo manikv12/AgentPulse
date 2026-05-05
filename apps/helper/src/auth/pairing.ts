@@ -14,6 +14,8 @@ export type DeviceRecord = {
   revokedAt?: string;
   watchPushToken?: string;
   watchPushTokenUpdatedAt?: string;
+  watchPushBundleId?: string;
+  watchPushEnvironment?: 'sandbox' | 'production';
 };
 
 export type PublicDeviceRecord = Omit<DeviceRecord, 'token'> & {
@@ -126,7 +128,11 @@ export class DeviceRegistry {
     return devices.filter((device) => !device.revokedAt);
   }
 
-  async setWatchPushToken(deviceId: string, watchPushToken: string | undefined): Promise<DeviceRecord | undefined> {
+  async setWatchPushToken(
+    deviceId: string,
+    watchPushToken: string | undefined,
+    options: { bundleId?: string; environment?: 'sandbox' | 'production' } = {}
+  ): Promise<DeviceRecord | undefined> {
     const devices = await this.store.list();
     const device = devices.find((candidate) => candidate.deviceId === deviceId);
 
@@ -138,9 +144,18 @@ export class DeviceRegistry {
     if (watchPushToken && watchPushToken.trim().length > 0) {
       next.watchPushToken = watchPushToken.trim();
       next.watchPushTokenUpdatedAt = this.now().toISOString();
+      const bundleId = options.bundleId?.trim();
+      if (bundleId) {
+        next.watchPushBundleId = bundleId;
+      }
+      if (options.environment) {
+        next.watchPushEnvironment = options.environment;
+      }
     } else {
       delete next.watchPushToken;
       delete next.watchPushTokenUpdatedAt;
+      delete next.watchPushBundleId;
+      delete next.watchPushEnvironment;
     }
 
     await this.store.save(next);

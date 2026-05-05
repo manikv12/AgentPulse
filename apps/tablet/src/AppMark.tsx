@@ -4,7 +4,7 @@ type AppMarkProps = {
 
 export function AppMark({ size = 'md' }: AppMarkProps) {
   return (
-    <span className={`codex-mark codex-mark-${size}`} aria-hidden="true">
+    <span className={`codex-mark app-mark codex-mark-${size}`} aria-hidden="true">
       <img alt="" src="/icon.svg" />
     </span>
   );
