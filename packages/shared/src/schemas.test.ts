@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   ChatMessageSchema,
   AppearanceSettingsUpdateRequestSchema,
+  DeviceRenameRequestSchema,
   HelperHealthSchema,
   ImportedCodexThemeSchema,
   LiveEventSchema,
   PairRequestSchema,
   PairResponseSchema,
+  PairingPinCreateRequestSchema,
   PairingDeviceListResponseSchema,
   RemoteAccessSettingsSchema,
   ThreadCreateRequestSchema,
@@ -364,5 +366,25 @@ describe('shared schemas', () => {
         ]
       }).devices[0]?.deviceName
     ).toBe('Desk tablet');
+
+    expect(
+      PairingPinCreateRequestSchema.parse({
+        deviceName: 'Kitchen display'
+      }).deviceName
+    ).toBe('Kitchen display');
+
+    expect(() =>
+      PairingPinCreateRequestSchema.parse({
+        deviceId: 'device-1',
+        deviceName: 'Kitchen display'
+      })
+    ).toThrow();
+
+    expect(
+      DeviceRenameRequestSchema.parse({
+        deviceId: 'device-1',
+        deviceName: 'Kitchen display'
+      }).deviceName
+    ).toBe('Kitchen display');
   });
 });

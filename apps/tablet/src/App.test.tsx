@@ -1616,6 +1616,101 @@ describe('Agent Pulse tablet UI', () => {
     expect(await screen.findByText('654321')).toBeInTheDocument();
   });
 
+  it('lets admin name a new PIN and rename a paired device', async () => {
+    sessionStorage.setItem('agent-pulse-admin-token', 'admin-token');
+    window.location.hash = '#/settings';
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/health/get') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'ok',
+            codexAppServer: 'connected',
+            version: '0.1.0',
+            uptimeSec: 60
+          })
+        };
+      }
+
+      if (url === '/settings/get') {
+        return {
+          ok: true,
+          json: async () => ({
+            settings: {
+              lanEnabled: false,
+              mobileSendEnabled: false
+            },
+            devices: [
+              {
+                deviceId: 'device-1',
+                deviceName: 'Desk tablet'
+              }
+            ],
+            pairingPins: []
+          })
+        };
+      }
+
+      if (url === '/settings/pairing-pin') {
+        expect(JSON.parse(init?.body as string)).toEqual({ deviceName: 'Kitchen iPad' });
+        return {
+          ok: true,
+          json: async () => ({
+            pin: '111222',
+            expiresAt: '2026-04-27T10:00:00Z',
+            deviceName: 'Kitchen iPad'
+          })
+        };
+      }
+
+      if (url === '/settings/device/rename') {
+        expect(JSON.parse(init?.body as string)).toEqual({
+          deviceId: 'device-1',
+          deviceName: 'Office iPhone'
+        });
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            device: {
+              deviceId: 'device-1',
+              deviceName: 'Office iPhone'
+            }
+          })
+        };
+      }
+
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    const pairPanel = (await screen.findByText('Pair a display')).closest('section');
+    if (!pairPanel) {
+      throw new Error('Pair panel not found.');
+    }
+    fireEvent.change(within(pairPanel).getByLabelText('New device name'), {
+      target: { value: 'Kitchen iPad' }
+    });
+    fireEvent.click(within(pairPanel).getByTitle('Generate PIN'));
+
+    expect(await screen.findByText('111222')).toBeInTheDocument();
+    expect(screen.getByText('For Kitchen iPad.')).toBeInTheDocument();
+
+    const devicePanel = screen.getByText('Paired devices').closest('section');
+    if (!devicePanel) {
+      throw new Error('Device panel not found.');
+    }
+    fireEvent.click(within(devicePanel).getByTitle('Rename'));
+    fireEvent.change(within(devicePanel).getByLabelText('Device name for Desk tablet'), {
+      target: { value: 'Office iPhone' }
+    });
+    fireEvent.click(within(devicePanel).getByTitle('Save name'));
+
+    await waitFor(() => expect(within(devicePanel).getByText('Office iPhone')).toBeInTheDocument());
+  });
+
   it('shows remote access setup state in admin settings', async () => {
     sessionStorage.setItem('agent-pulse-admin-token', 'admin-token');
     window.location.hash = '#/settings';

@@ -22,6 +22,7 @@ import {
   CatalogPluginsResponseSchema,
   CatalogSkillsResponseSchema,
   ChatMessageSchema,
+  DeviceRenameRequestSchema,
   DeviceSessionRecoveryRequestSchema,
   DeviceRevokeRequestSchema,
   HelperHealthSchema,
@@ -35,6 +36,7 @@ import {
   LiveEventSchema,
   PairLookupResponseSchema,
   PairRequestSchema,
+  PairingPinCreateRequestSchema,
   PairingDeviceListResponseSchema,
   PairResponseSchema,
   ProjectFilesResponseSchema,
@@ -71,6 +73,7 @@ import {
   SeenThreadActivityImportRequestSchema,
   SeenThreadActivityMarkRequestSchema,
   SeenThreadActivityResponseSchema,
+  maskToken,
   resolveThreadStatus,
   type CollaborationModeKind,
   type AgentProvider,
@@ -116,6 +119,13 @@ import { registerCodexProjectlessChat } from '../codex/codex-global-state';
 import type { createThreadOpener } from '../codex/thread-opener';
 import type { CodexTranscriptionAuthContext } from '../codex/transcription-auth';
 import { debugLog } from '../debug';
+import {
+  FilePreviewError,
+  decorateTranscriptFileReferences,
+  findThreadFileReference,
+  findThreadFileReferenceCwd,
+  readThreadFilePreview
+} from './file-preview';
 import type { SeenThreadStore } from './seen-thread-store';
 import {
   normalizeProjectsForWorkspaceDisplay,
@@ -140,6 +150,7 @@ const DESKTOP_INTEREST_TTL_MS = 30 * 60_000;
 const MANUAL_OPEN_COOLDOWN_MS = 2_500;
 const AUTO_DESKTOP_REFRESH_SETTLE_MS = 800;
 const AUTO_DESKTOP_REFRESH_COOLDOWN_MS = 10_000;
+const LIST_ENDPOINT_TIMEOUT_MS = 4_000;
 const MAX_THREADS_PER_PROJECT = 6;
 const MAX_EXPANDED_THREADS_PER_PROJECT = 120;
 const MAX_OUTGOING_ATTACHMENTS = 6;
@@ -300,6 +311,9 @@ export type CodexMirrorBridge = {
   // `waiting_approval` (e.g. a resolution notification was missed during a
   // brief disconnect). Returns true when at least one entry was removed.
   clearPendingApprovalsForThread?(threadId: string): boolean;
+  onStreamingChange?(
+    listener: (event: { threadId: string; isStreaming: boolean }) => void
+  ): () => void;
   onPendingApprovalsChange?(
     listener: (event: { threadId: string; requests: PendingApprovalRequest[] }) => void
   ): () => void;
@@ -728,10 +742,14 @@ function createApp(
   // from Codex directly so the mobile app never accepts stale data as current.
   const transcriptCache = new Map<string, ThreadTranscript>();
   const handoffPackages = new Map<string, HandoffPackage>();
+  let lastThreadListResult: ThreadListResult | undefined;
+  let threadListEndpointInFlight: Promise<ThreadListResult> | undefined;
+  let lastProjectList: Project[] | undefined;
+  let projectListEndpointInFlight: Promise<Project[]> | undefined;
   // Maps threadId → workspace path on disk. Populated whenever we list threads or start
   // a new one, then read by `transformTranscript` to resolve agent-emitted relative
-  // image paths (e.g. `![logo](assets/foo.svg)`) to tokenized `/attachments/...` URLs
-  // the browser can actually load.
+  // file and image paths (e.g. `docs/PLAN.md` or `![logo](assets/foo.svg)`) into
+  // previewable mobile/tablet references.
   const threadCwdByThreadId = new Map<string, string>();
   const liveSubscribedThreadIds = new Set<string>();
   // Codex's desktop "New chat" is a draft until the first user message. `thread/start`
@@ -1229,6 +1247,43 @@ function createApp(
       )
     );
   };
+  const listThreadsForEndpoint = async (
+    groupLimits: Map<string, number>,
+    defaultLimit: number
+  ): Promise<ThreadListResult> => {
+    if (!threadListEndpointInFlight) {
+      threadListEndpointInFlight = listAllThreads(groupLimits, defaultLimit)
+        .then((result) => {
+          lastThreadListResult = result;
+          return result;
+        })
+        .finally(() => {
+          threadListEndpointInFlight = undefined;
+        });
+    }
+    const result = await settleWithin(threadListEndpointInFlight, LIST_ENDPOINT_TIMEOUT_MS);
+    if (result.ok) {
+      return result.value;
+    }
+    return lastThreadListResult ?? { threads: [], groups: [] };
+  };
+  const listProjectsForEndpoint = async (): Promise<Project[]> => {
+    if (!projectListEndpointInFlight) {
+      projectListEndpointInFlight = listAllProjects()
+        .then((projects) => {
+          lastProjectList = projects;
+          return projects;
+        })
+        .finally(() => {
+          projectListEndpointInFlight = undefined;
+        });
+    }
+    const result = await settleWithin(projectListEndpointInFlight, LIST_ENDPOINT_TIMEOUT_MS);
+    if (result.ok) {
+      return result.value;
+    }
+    return lastProjectList ?? [];
+  };
   const broadcastFreshTranscript = async (threadId: string): Promise<void> => {
     if (!options.appServer?.readTranscript) {
       return;
@@ -1267,6 +1322,19 @@ function createApp(
     const liveTranscript = await options.appServer?.readTranscript?.(threadId)
       .catch(() => undefined);
     return liveTranscript ?? transcriptCache.get(threadId);
+  };
+  const ensureThreadCwd = async (threadId: string): Promise<string | undefined> => {
+    const existing = threadCwdByThreadId.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    const result = await listAllThreads().catch(() => undefined);
+    const thread = result?.threads.find((candidate) => candidate.threadId === threadId);
+    if (thread?.workspacePath) {
+      threadCwdByThreadId.set(threadId, thread.workspacePath);
+      return thread.workspacePath;
+    }
+    return threadCwdByThreadId.get(threadId);
   };
 
   const startHandoffTargetThread = async (
@@ -1755,10 +1823,14 @@ function createApp(
       return adminForbidden(context);
     }
 
-    const body = (await context.req.json().catch(() => ({}))) as { deviceId?: string };
-    const deviceId = typeof body.deviceId === 'string' ? body.deviceId : undefined;
+    const body = PairingPinCreateRequestSchema.parse(await context.req.json().catch(() => ({})));
 
-    return context.json(options.pairing.createPin({ deviceId }));
+    return context.json(
+      options.pairing.createPin({
+        deviceId: body.deviceId,
+        deviceName: body.deviceName
+      })
+    );
   });
 
   app.post('/settings/lan', async (context) => {
@@ -1862,6 +1934,27 @@ function createApp(
     return context.json({ ok: true });
   });
 
+  app.post('/settings/device/rename', async (context) => {
+    if (!isAdminRequest(context.req.raw, options.adminAuth)) {
+      return adminForbidden(context);
+    }
+
+    const parsed = DeviceRenameRequestSchema.parse(await context.req.json());
+    const device = await options.registry.renameDevice(parsed.deviceId, parsed.deviceName);
+    if (!device) {
+      return context.json({ error: 'Device is not available anymore.' }, 404);
+    }
+
+    const { token, ...publicDevice } = device;
+    return context.json({
+      ok: true,
+      device: {
+        ...publicDevice,
+        tokenPreview: maskToken(token)
+      }
+    });
+  });
+
   app.get('/threads/list', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -1872,7 +1965,7 @@ function createApp(
     const defaultLimit = requestedLimit
       ? Math.min(MAX_EXPANDED_THREADS_PER_PROJECT, requestedLimit + 1)
       : MAX_THREADS_PER_PROJECT;
-    const { threads: listedThreads, groups } = await listAllThreads(
+    const { threads: listedThreads, groups } = await listThreadsForEndpoint(
       parseThreadListGroupLimits(context),
       defaultLimit
     );
@@ -1896,7 +1989,7 @@ function createApp(
     }
 
     return context.json(ProjectListResponseSchema.parse({
-      projects: await listAllProjects()
+      projects: await listProjectsForEndpoint()
     }));
   });
 
@@ -2296,6 +2389,7 @@ function createApp(
     if (!isProviderEnabled(providerForThreadId(threadId))) {
       return disabledProviderResponse(context, providerForThreadId(threadId));
     }
+    await ensureThreadCwd(threadId);
     if (isClaudeThreadId(threadId)) {
       if (!options.claudeCode) {
         return context.json({ error: 'Claude Code connection unavailable.' }, 503);
@@ -2411,6 +2505,7 @@ function createApp(
       if (!isProviderEnabled(providerForThreadId(threadId))) {
         return disabledProviderResponse(context, providerForThreadId(threadId));
       }
+      await ensureThreadCwd(threadId);
       const limit = parseTranscriptMessageLimit(context.req.query('limit')) ?? 40;
       if (isClaudeThreadId(threadId)) {
         if (!options.claudeCode) {
@@ -2522,10 +2617,9 @@ function createApp(
 
       const sliceStart = Math.max(0, beforeIndex - limit);
       const olderSlice = transcript.messages.slice(sliceStart, beforeIndex);
-      const exposed = exposeLocalAttachments(
+      const exposed = transformTranscript(
         ThreadTranscriptSchema.parse({ ...transcript, messages: olderSlice }),
-        threadId,
-        localAttachments
+        threadId
       );
 
       return context.json(
@@ -2537,6 +2631,64 @@ function createApp(
       );
     } catch {
       return context.json({ error: 'Codex connection unavailable.' }, 503);
+    }
+  });
+
+  app.get('/threads/:threadId/files/:fileReferenceId', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const threadId = context.req.param('threadId');
+    const fileReferenceId = context.req.param('fileReferenceId');
+    const provider = providerForThreadId(threadId);
+    if (!isProviderEnabled(provider)) {
+      return disabledProviderResponse(context, provider);
+    }
+
+    const cachedTranscript = transcriptCache.get(threadId);
+    let visibleTranscript = cachedTranscript;
+    let fileReference = visibleTranscript
+      ? findThreadFileReference(visibleTranscript, fileReferenceId)
+      : undefined;
+
+    if (!fileReference) {
+      const transcriptResult = await settleWithin(
+        readTranscriptForHandoff(threadId, provider).catch(() => undefined),
+        1_500
+      );
+      if (transcriptResult.ok && transcriptResult.value) {
+        visibleTranscript = transformTranscript(transcriptResult.value, threadId);
+        fileReference = findThreadFileReference(visibleTranscript, fileReferenceId);
+      }
+    }
+
+    if (!visibleTranscript || !fileReference) {
+      return context.json({ error: 'This file cannot be previewed from the phone.' }, 404);
+    }
+
+    const cwd =
+      threadCwdByThreadId.get(threadId) ??
+      findThreadFileReferenceCwd(visibleTranscript, fileReferenceId) ??
+      (await ensureThreadCwd(threadId));
+    if (!cwd) {
+      return context.json({ error: 'This file cannot be previewed from the phone.' }, 404);
+    }
+
+    try {
+      const preview = await readThreadFilePreview(fileReference, cwd);
+      return context.json(preview);
+    } catch (error) {
+      if (error instanceof FilePreviewError) {
+        const status =
+          error.status === 413 ? 413 :
+          error.status === 415 ? 415 :
+          error.status === 404 ? 404 :
+          400;
+        return context.json({ error: error.message }, status);
+      }
+      return context.json({ error: 'This file cannot be previewed from the phone.' }, 500);
     }
   });
 
@@ -3532,9 +3684,14 @@ function createApp(
       threadId,
       options.mirror
     );
-    transcriptCache.set(threadId, transcriptWithFileChanges);
+    const transcriptWithFileReferences = decorateTranscriptFileReferences(
+      transcriptWithFileChanges,
+      threadId,
+      threadCwdByThreadId.get(threadId)
+    );
+    transcriptCache.set(threadId, transcriptWithFileReferences);
     const exposed = exposeLocalAttachments(
-      applyMobileSendState(transcriptWithFileChanges, currentSettings),
+      applyMobileSendState(transcriptWithFileReferences, currentSettings),
       threadId,
       localAttachments
     );
@@ -3610,6 +3767,16 @@ function createApp(
     liveSubscribedThreadIds.clear();
     hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
   });
+  const detachMirrorStreaming = options.mirror?.onStreamingChange?.((event) => {
+    hub.broadcast({ type: 'thread/streaming-changed', payload: event });
+    const cached = transcriptCache.get(event.threadId);
+    if (cached) {
+      hub.broadcast({ type: 'thread/transcript/changed', payload: transformTranscript(cached, event.threadId) });
+    }
+    if (!event.isStreaming) {
+      void broadcastFreshTranscript(event.threadId);
+    }
+  });
   const detachMirrorPendingApprovals = options.mirror?.onPendingApprovalsChange?.((event) => {
     hub.broadcast({ type: 'thread/pending-approvals/changed', payload: event });
     void listAllThreads()
@@ -3666,6 +3833,7 @@ function createApp(
       detachCopilotLiveState?.();
       detachAppServerTurnCompleted?.();
       detachAppServerConnection?.();
+      detachMirrorStreaming?.();
       detachMirrorPendingApprovals?.();
       detachMirrorFileChanges?.();
     }
@@ -4570,17 +4738,19 @@ function exposeLocalAttachment(
   localAttachments: Map<string, LocalAttachment>
 ): ChatAttachment {
   const { sourcePath, ...publicAttachment } = attachment;
-  if (!sourcePath) {
+  const dataImage = dataImageFromUrl(attachment.url);
+  if (!sourcePath && !dataImage) {
     return publicAttachment;
   }
 
   const token = createHash('sha256')
-    .update(`${threadId}:${attachment.id}:${sourcePath}`)
+    .update(`${threadId}:${attachment.id}:${sourcePath ?? attachment.url}`)
     .digest('hex')
     .slice(0, 32);
   localAttachments.set(token, {
-    sourcePath,
-    contentType: imageContentType(sourcePath),
+    ...(sourcePath ? { sourcePath } : {}),
+    ...(dataImage ? { data: dataImage.data } : {}),
+    contentType: dataImage?.contentType ?? imageContentType(sourcePath ?? ''),
     expiresAt: Date.now() + 2 * 60 * 60 * 1000
   });
   return {

@@ -497,7 +497,7 @@ export class CodexAppServerChat {
     }
 
     try {
-      const lines = await readLastLines(rolloutPath, 2_000, 8 * 1024 * 1024);
+      const lines = await readLastLines(rolloutPath, 2_000, 32 * 1024 * 1024);
       return applyRolloutContextToTranscript(transcript, rolloutTranscriptContextFromLines(lines));
     } catch {
       return transcript;
@@ -2148,13 +2148,24 @@ type RolloutQuestionCall = {
   output?: unknown;
 };
 
+type RolloutImageCall = {
+  callId: string;
+  name?: string;
+  turnId?: string;
+  createdAt: string;
+  attachments: ChatAttachment[];
+};
+
 type RolloutTranscriptContext = {
   collaborationMode?: CollaborationModeKind;
   questionMessages: ChatMessage[];
+  attachmentMessages: ChatMessage[];
 };
 
 function rolloutTranscriptContextFromLines(lines: string[]): RolloutTranscriptContext {
   const calls = new Map<string, RolloutQuestionCall>();
+  const imageCalls = new Map<string, RolloutImageCall>();
+  const toolCalls = new Map<string, { name?: string; turnId?: string; createdAt: string }>();
   let currentTurnId: string | undefined;
   let collaborationMode: CollaborationModeKind | undefined;
 
@@ -2180,32 +2191,85 @@ function rolloutTranscriptContextFromLines(lines: string[]): RolloutTranscriptCo
 
     const payload = recordFromUnknown(event.payload);
     const payloadType = stringField(payload ?? {}, 'type');
-    if (payloadType === 'function_call' && stringField(payload ?? {}, 'name') === 'request_user_input') {
+    if (payloadType === 'function_call') {
+      const name = stringField(payload ?? {}, 'name');
       const callId = stringField(payload ?? {}, 'call_id');
-      const questions = requestUserInputQuestionsFromArguments(stringField(payload ?? {}, 'arguments'));
-      if (callId && questions.length > 0) {
-        calls.set(callId, {
-          callId,
+      if (callId) {
+        toolCalls.set(callId, {
+          ...(name ? { name } : {}),
           ...(currentTurnId ? { turnId: currentTurnId } : {}),
-          createdAt: timestampFromRolloutEvent(event),
-          questions
+          createdAt: timestampFromRolloutEvent(event)
         });
+      }
+      if (name === 'request_user_input') {
+        const questions = requestUserInputQuestionsFromArguments(stringField(payload ?? {}, 'arguments'));
+        if (callId && questions.length > 0) {
+          calls.set(callId, {
+            callId,
+            ...(currentTurnId ? { turnId: currentTurnId } : {}),
+            createdAt: timestampFromRolloutEvent(event),
+            questions
+          });
+        }
+        continue;
+      }
+
+      if (callId) {
+        const attachments = rolloutImageAttachmentsFromCallArguments(
+          name,
+          parseJsonMaybe(stringField(payload ?? {}, 'arguments')),
+          `codex-rollout-image:${callId}:args`
+        );
+        if (attachments.length > 0 || isRolloutImageToolName(name)) {
+          imageCalls.set(callId, {
+            callId,
+            ...(name ? { name } : {}),
+            ...(currentTurnId ? { turnId: currentTurnId } : {}),
+            createdAt: timestampFromRolloutEvent(event),
+            attachments
+          });
+        }
       }
       continue;
     }
 
     if (payloadType === 'function_call_output') {
       const callId = stringField(payload ?? {}, 'call_id');
+      const output = parseJsonMaybe(stringField(payload ?? {}, 'output'));
       const call = callId ? calls.get(callId) : undefined;
       if (call) {
-        call.output = parseJsonMaybe(stringField(payload ?? {}, 'output'));
+        call.output = output;
+      }
+
+      if (callId) {
+        const outputAttachments = imageAttachmentsFromUnknown(
+          output,
+          `codex-rollout-image:${callId}:output`,
+          'Tool screenshot'
+        );
+        if (outputAttachments.length > 0) {
+          const existing = imageCalls.get(callId);
+          const toolCall = toolCalls.get(callId);
+          imageCalls.set(callId, {
+            callId,
+            ...(existing?.name ?? toolCall?.name ? { name: existing?.name ?? toolCall?.name } : {}),
+            ...(existing?.turnId ?? toolCall?.turnId ?? currentTurnId
+              ? { turnId: existing?.turnId ?? toolCall?.turnId ?? currentTurnId }
+              : {}),
+            createdAt: timestampFromRolloutEvent(event),
+            attachments: mergeRolloutAttachments(existing?.attachments ?? [], outputAttachments)
+          });
+        }
       }
     }
   }
 
   return {
     ...(collaborationMode ? { collaborationMode } : {}),
-    questionMessages: [...calls.values()].map(questionCallMessage)
+    questionMessages: [...calls.values()].map(questionCallMessage),
+    attachmentMessages: [...imageCalls.values()]
+      .filter((call) => call.attachments.length > 0)
+      .map(rolloutImageCallMessage)
   };
 }
 
@@ -2213,7 +2277,8 @@ function applyRolloutContextToTranscript(
   transcript: ThreadTranscript,
   context: RolloutTranscriptContext
 ): ThreadTranscript {
-  const withQuestions = mergeQuestionMessagesIntoTranscript(transcript.messages, context.questionMessages);
+  const withImages = mergeRolloutAttachmentMessagesIntoTranscript(transcript.messages, context.attachmentMessages);
+  const withQuestions = mergeQuestionMessagesIntoTranscript(withImages, context.questionMessages);
   return ThreadTranscriptSchema.parse({
     ...transcript,
     ...(context.collaborationMode ? { collaborationMode: context.collaborationMode } : {}),
@@ -2261,6 +2326,57 @@ function mergeQuestionMessagesIntoTranscript(
   return result;
 }
 
+function mergeRolloutAttachmentMessagesIntoTranscript(
+  messages: ChatMessage[],
+  attachmentMessages: ChatMessage[]
+): ChatMessage[] {
+  const existingIds = new Set(messages.map((message) => message.id));
+  const extras = attachmentMessages.filter((message) => !existingIds.has(message.id));
+  if (extras.length === 0) {
+    return messages;
+  }
+
+  const extrasByTurn = new Map<string, ChatMessage[]>();
+  const extrasWithoutTurn: ChatMessage[] = [];
+  for (const extra of extras) {
+    if (extra.turnId) {
+      extrasByTurn.set(extra.turnId, [...(extrasByTurn.get(extra.turnId) ?? []), extra]);
+    } else {
+      extrasWithoutTurn.push(extra);
+    }
+  }
+
+  const result: ChatMessage[] = [];
+  const insertedTurns = new Set<string>();
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    const turnId = message.turnId ?? undefined;
+    const turnExtras = turnId ? extrasByTurn.get(turnId) : undefined;
+    if (turnId && turnExtras && !insertedTurns.has(turnId) && shouldInsertRolloutAttachmentsBefore(message)) {
+      result.push(...turnExtras);
+      insertedTurns.add(turnId);
+    }
+    result.push(message);
+    const nextTurnId = messages[index + 1]?.turnId ?? undefined;
+    if (turnId && turnExtras && !insertedTurns.has(turnId) && nextTurnId !== turnId) {
+      result.push(...turnExtras);
+      insertedTurns.add(turnId);
+    }
+  }
+
+  for (const [turnId, turnExtras] of extrasByTurn.entries()) {
+    if (!insertedTurns.has(turnId)) {
+      result.push(...turnExtras);
+    }
+  }
+  result.push(...extrasWithoutTurn);
+  return result;
+}
+
+function shouldInsertRolloutAttachmentsBefore(message: ChatMessage): boolean {
+  return message.role === 'assistant' && message.kind === 'message' && message.phase !== 'commentary';
+}
+
 function appendUserInputRequestMessages(
   messages: ChatMessage[],
   requests: PendingApprovalRequest[]
@@ -2295,6 +2411,87 @@ function questionCallMessage(call: RolloutQuestionCall): ChatMessage {
     ...(call.turnId ? { turnId: call.turnId } : {}),
     createdAt: call.createdAt
   });
+}
+
+function rolloutImageCallMessage(call: RolloutImageCall): ChatMessage {
+  return ChatMessageSchema.parse({
+    id: `codex-rollout-image:${call.callId}`,
+    role: 'activity',
+    kind: 'tool',
+    phase: 'screenshot',
+    text: rolloutImageCallText(call.name),
+    ...(call.turnId ? { turnId: call.turnId } : {}),
+    createdAt: call.createdAt,
+    attachments: call.attachments
+  });
+}
+
+function rolloutImageCallText(name: string | undefined): string {
+  if (!name) {
+    return 'Tool returned screenshot';
+  }
+  if (name === 'view_image') {
+    return 'Viewed screenshot';
+  }
+  if (name.toLowerCase().includes('screenshot')) {
+    return 'Captured screenshot';
+  }
+  return `${name} returned image`;
+}
+
+function rolloutImageAttachmentsFromCallArguments(
+  name: string | undefined,
+  argumentsValue: unknown,
+  ownerId: string
+): ChatAttachment[] {
+  const attachments = imageAttachmentsFromUnknown(argumentsValue, ownerId, 'Tool screenshot');
+  const argumentRecord = recordFromUnknown(argumentsValue);
+  const sourcePath =
+    stringField(argumentRecord, 'path') ??
+    stringField(argumentRecord, 'filePath') ??
+    stringField(argumentRecord, 'filepath');
+
+  if (sourcePath && (isRolloutImageToolName(name) || looksLikeImagePath(sourcePath))) {
+    return mergeRolloutAttachments(attachments, [
+      {
+        id: `${ownerId}-local-image-1`,
+        kind: 'image',
+        url: `agent-pulse-local-image:${ownerId}-local-image-1`,
+        alt: 'Tool screenshot',
+        sourcePath
+      }
+    ]);
+  }
+
+  return attachments;
+}
+
+function isRolloutImageToolName(name: string | undefined): boolean {
+  const normalized = name?.toLowerCase() ?? '';
+  return (
+    normalized === 'view_image' ||
+    normalized.includes('screenshot') ||
+    normalized.includes('image')
+  );
+}
+
+function looksLikeImagePath(value: string): boolean {
+  return /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i.test(value);
+}
+
+function mergeRolloutAttachments(existing: ChatAttachment[], incoming: ChatAttachment[]): ChatAttachment[] {
+  const merged: ChatAttachment[] = [...existing];
+  for (const attachment of incoming) {
+    const key = attachment.sourcePath ?? attachment.url;
+    if (!key) {
+      continue;
+    }
+    if (merged.some((candidate) => (candidate.sourcePath ?? candidate.url) === key)) {
+      continue;
+    }
+    merged.push(attachment);
+  }
+  return merged;
 }
 
 function questionSummaryText(questions: RolloutQuestion[], output: unknown): string {
@@ -2936,7 +3133,8 @@ function imageAttachmentsFromUnknown(value: unknown, ownerId: string, fallbackAl
 function imageUrlFromRecord(record: Record<string, unknown>): { url?: string; sourcePath?: string } | undefined {
   const type = stringField(record, 'type')?.toLowerCase() ?? '';
   const mime = stringField(record, 'mime_type') ?? stringField(record, 'mimeType') ?? stringField(record, 'media_type');
-  const isImageLike = type.includes('image') || Boolean(mime?.startsWith('image/')) || 'image_url' in record;
+  const normalizedMime = mime?.toLowerCase();
+  const isImageLike = type.includes('image') || Boolean(normalizedMime?.startsWith('image/')) || 'image_url' in record;
 
   if (type === 'localimage') {
     const sourcePath = stringField(record, 'path') ?? stringField(record, 'filePath');
@@ -2973,8 +3171,9 @@ function imageFromString(value: string | undefined, mime?: string): { url: strin
     return { url: value };
   }
 
-  if (mime?.startsWith('image/') && /^[A-Za-z0-9+/=\s]+$/.test(value)) {
-    return { url: `data:${mime};base64,${value.replace(/\s+/g, '')}` };
+  const normalizedMime = mime?.toLowerCase();
+  if (normalizedMime?.startsWith('image/') && /^[A-Za-z0-9+/=\s]+$/.test(value)) {
+    return { url: `data:${normalizedMime};base64,${value.replace(/\s+/g, '')}` };
   }
 
   return undefined;

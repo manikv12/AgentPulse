@@ -603,6 +603,99 @@ describe('Codex App Server same-thread chat', () => {
     }
   });
 
+  it('adds screenshots from old rollout tool outputs before the assistant reply', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'agent-pulse-rollout-image-'));
+    const rolloutPath = path.join(dir, 'rollout.jsonl');
+    const writeLine = (value: unknown) => JSON.stringify(value);
+    await writeFile(
+      rolloutPath,
+      [
+        writeLine({
+          timestamp: '2026-05-07T05:00:00.000Z',
+          type: 'turn_context',
+          payload: {
+            turn_id: 'turn-shot',
+            collaboration_mode: { mode: 'default' }
+          }
+        }),
+        writeLine({
+          timestamp: '2026-05-07T05:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'node_repl.js',
+            call_id: 'call-shot',
+            arguments: JSON.stringify({
+              title: 'Verify setup-first settings'
+            })
+          }
+        }),
+        writeLine({
+          timestamp: '2026-05-07T05:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call-shot',
+            output: JSON.stringify({
+              result: {
+                type: 'success',
+                content: [
+                  {
+                    type: 'image',
+                    data: 'aGVsbG8=',
+                    mimeType: 'image/jpeg'
+                  }
+                ]
+              }
+            })
+          }
+        })
+      ].join('\n')
+    );
+
+    try {
+      const transport = fakeTransport([
+        threadResponse('thread-shot', 'idle', [
+          {
+            ...turn('turn-shot', 'completed'),
+            items: [
+              {
+                type: 'agentMessage',
+                id: 'assistant-1',
+                text: 'The setup screen is better.',
+                phase: 'final_answer'
+              }
+            ]
+          }
+        ])
+      ]);
+      const chat = new CodexAppServerChat(transport, {
+        rolloutLookup: { findRolloutPath: vi.fn(async () => rolloutPath) }
+      });
+
+      const transcript = await chat.readTranscript('thread-shot');
+
+      expect(transcript.messages.map((message) => message.id)).toEqual([
+        'codex-rollout-image:call-shot',
+        'assistant-1'
+      ]);
+      expect(transcript.messages[0]).toMatchObject({
+        role: 'activity',
+        kind: 'tool',
+        phase: 'screenshot',
+        text: 'node_repl.js returned image',
+        attachments: [
+          expect.objectContaining({
+            kind: 'image',
+            url: 'data:image/jpeg;base64,aGVsbG8='
+          })
+        ]
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('stores app-server approval requests and answers the same request id', async () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);

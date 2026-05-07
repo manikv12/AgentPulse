@@ -271,6 +271,13 @@ export const PairingDeviceListResponseSchema = z.object({
   devices: z.array(PairingDeviceOptionSchema)
 });
 
+export const PairingPinCreateRequestSchema = z.object({
+  deviceId: z.string().trim().min(1).optional(),
+  deviceName: z.string().trim().min(1).max(80).optional()
+}).refine((value) => !(value.deviceId && value.deviceName), {
+  message: 'Choose a saved device or enter a new device name, not both.'
+});
+
 export const PairResponseSchema = z.object({
   token: z.string().min(16),
   deviceId: z.string().min(1),
@@ -345,6 +352,42 @@ export const ChatAttachmentSchema = z.object({
 
 export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 
+export const ThreadFileReferenceKindSchema = z.enum(['markdown', 'code', 'text']);
+
+export const ThreadFileReferenceSourceSchema = z.enum([
+  'codex',
+  'copilot',
+  'claude-code',
+  'file-change'
+]);
+
+export const ThreadFileReferenceSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  displayPath: z.string().min(1),
+  kind: ThreadFileReferenceKindSchema,
+  language: z.string().min(1).optional(),
+  messageId: z.string().min(1).optional(),
+  turnId: z.string().min(1).optional(),
+  source: ThreadFileReferenceSourceSchema
+});
+
+export type ThreadFileReference = z.infer<typeof ThreadFileReferenceSchema>;
+
+export const ThreadFilePreviewMetadataSchema = ThreadFileReferenceSchema.extend({
+  sizeBytes: z.number().int().nonnegative().optional(),
+  modifiedAt: isoUtcTimestamp.optional()
+});
+
+export type ThreadFilePreviewMetadata = z.infer<typeof ThreadFilePreviewMetadataSchema>;
+
+export const ThreadFilePreviewResponseSchema = z.object({
+  metadata: ThreadFilePreviewMetadataSchema,
+  content: z.string()
+});
+
+export type ThreadFilePreviewResponse = z.infer<typeof ThreadFilePreviewResponseSchema>;
+
 export const THREAD_SEND_REASONS = [
   'ready',
   'mobile_send_disabled',
@@ -370,6 +413,7 @@ export const ChatMessageSchema = z.object({
   kind: z.enum(CHAT_MESSAGE_KINDS),
   text: z.string(),
   attachments: z.array(ChatAttachmentSchema).optional(),
+  fileReferences: z.array(ThreadFileReferenceSchema).optional(),
   phase: z.string().min(1).optional(),
   planItems: z.array(ThreadPlanItemSchema).optional(),
   turnId: z.string().min(1).optional(),
@@ -381,7 +425,8 @@ export type ChatMessage = z.infer<typeof ChatMessageSchema>;
 export const ThreadFileChangeFileSchema = z.object({
   path: z.string().min(1),
   linesAdded: z.number().int().nonnegative(),
-  linesDeleted: z.number().int().nonnegative()
+  linesDeleted: z.number().int().nonnegative(),
+  reference: ThreadFileReferenceSchema.optional()
 });
 
 export type ThreadFileChangeFile = z.infer<typeof ThreadFileChangeFileSchema>;
@@ -588,6 +633,11 @@ export type ThreadDeleteResponse = z.infer<typeof ThreadDeleteResponseSchema>;
 
 export const DeviceRevokeRequestSchema = z.object({
   deviceId: z.string().min(1)
+});
+
+export const DeviceRenameRequestSchema = z.object({
+  deviceId: z.string().min(1),
+  deviceName: z.string().trim().min(1).max(80)
 });
 
 export const ThreadListGroupSchema = z.object({
