@@ -35,6 +35,77 @@ const isoUtcTimestamp = z
 export const ThreadStatusSchema = z.enum(THREAD_STATUSES);
 export const AgentProviderSchema = z.enum(AGENT_PROVIDERS);
 
+export const ThemePreferenceSchema = z.enum(['system', 'light', 'dark']);
+
+export type ThemePreference = z.infer<typeof ThemePreferenceSchema>;
+
+export const CodexThemeVariantSchema = z.enum(['light', 'dark']);
+
+export type CodexThemeVariant = z.infer<typeof CodexThemeVariantSchema>;
+
+const hexColor = z
+  .string()
+  .trim()
+  .regex(/^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/, {
+    message: 'Color must be a hex value like #3183d8.'
+  })
+  .transform((value) => value.toLowerCase());
+
+export const CodexThemeConfigSchema = z.object({
+  accent: hexColor,
+  contrast: z.number().min(0).max(100).default(50),
+  fonts: z
+    .object({
+      code: z.string().trim().min(1).nullable().optional(),
+      ui: z.string().trim().min(1).nullable().optional()
+    })
+    .default({}),
+  ink: hexColor,
+  opaqueWindows: z.boolean().default(true),
+  semanticColors: z
+    .object({
+      diffAdded: hexColor.optional(),
+      diffRemoved: hexColor.optional(),
+      skill: hexColor.optional()
+    })
+    .default({}),
+  surface: hexColor
+});
+
+export type CodexThemeConfig = z.infer<typeof CodexThemeConfigSchema>;
+
+export const ImportedCodexThemeSchema = z.object({
+  codeThemeId: z.string().trim().min(1).optional(),
+  importedAt: isoUtcTimestamp.optional(),
+  sourceName: z.string().trim().min(1).max(160).optional(),
+  theme: CodexThemeConfigSchema,
+  variant: CodexThemeVariantSchema
+});
+
+export type ImportedCodexTheme = z.infer<typeof ImportedCodexThemeSchema>;
+
+export const CodexThemeSlotsSchema = z.object({
+  light: ImportedCodexThemeSchema.optional(),
+  dark: ImportedCodexThemeSchema.optional()
+});
+
+export const AppearanceSettingsSchema = z.object({
+  codexThemes: CodexThemeSlotsSchema.default({}),
+  themePreference: ThemePreferenceSchema.default('system')
+});
+
+export type AppearanceSettings = z.infer<typeof AppearanceSettingsSchema>;
+
+export const AppearanceSettingsUpdateRequestSchema = z.object({
+  clearVariant: CodexThemeVariantSchema.optional(),
+  codexTheme: ImportedCodexThemeSchema.omit({ importedAt: true }).extend({
+    importedAt: isoUtcTimestamp.optional()
+  }).optional(),
+  themePreference: ThemePreferenceSchema.optional()
+});
+
+export type AppearanceSettingsUpdateRequest = z.infer<typeof AppearanceSettingsUpdateRequestSchema>;
+
 export const ThreadSchema = z.object({
   threadId: z.string().min(1),
   provider: AgentProviderSchema.default('codex'),
@@ -259,6 +330,7 @@ export const CHAT_MESSAGE_KINDS = [
   'command',
   'file',
   'tool',
+  'compacted',
   'status'
 ] as const;
 
@@ -285,6 +357,13 @@ export const THREAD_SEND_REASONS = [
   'thread_changed'
 ] as const;
 
+export const ThreadPlanItemSchema = z.object({
+  step: z.string().min(1),
+  status: z.enum(['pending', 'in_progress', 'completed'])
+});
+
+export type ThreadPlanItem = z.infer<typeof ThreadPlanItemSchema>;
+
 export const ChatMessageSchema = z.object({
   id: z.string().min(1),
   role: z.enum(CHAT_MESSAGE_ROLES),
@@ -292,6 +371,7 @@ export const ChatMessageSchema = z.object({
   text: z.string(),
   attachments: z.array(ChatAttachmentSchema).optional(),
   phase: z.string().min(1).optional(),
+  planItems: z.array(ThreadPlanItemSchema).optional(),
   turnId: z.string().min(1).optional(),
   createdAt: isoUtcTimestamp
 });
@@ -367,6 +447,10 @@ export const ThreadGoalSchema = z.object({
 
 export type ThreadGoal = z.infer<typeof ThreadGoalSchema>;
 
+export const COLLABORATION_MODES = ['default', 'plan'] as const;
+
+export type CollaborationModeKind = (typeof COLLABORATION_MODES)[number];
+
 export const CODEX_PERMISSION_MODES = [
   'default',
   'autoReview',
@@ -406,6 +490,7 @@ export const ThreadTranscriptSchema = z.object({
   messages: z.array(ChatMessageSchema),
   usage: ThreadUsageSchema.optional(),
   goal: ThreadGoalSchema.nullable().optional(),
+  collaborationMode: z.enum(COLLABORATION_MODES).optional(),
   // Current model + reasoning effort recorded for this conversation. Sourced from the
   // thread/resume response so the tablet stays in sync with whatever the desktop changed
   // without us needing to listen for the snapshot broadcast.
@@ -427,10 +512,6 @@ export const OlderThreadMessagesResponseSchema = z.object({
 });
 
 export type OlderThreadMessagesResponse = z.infer<typeof OlderThreadMessagesResponseSchema>;
-
-export const COLLABORATION_MODES = ['default', 'plan'] as const;
-
-export type CollaborationModeKind = (typeof COLLABORATION_MODES)[number];
 
 export const ThreadMessageRequestSchema = z
   .object({

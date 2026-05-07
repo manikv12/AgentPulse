@@ -3894,7 +3894,8 @@ describe('Agent Pulse tablet UI', () => {
         {
           id: 'status-1',
           role: 'activity',
-          kind: 'status',
+          kind: 'compacted',
+          phase: 'context_compaction',
           text: 'Automatically compacting context',
           createdAt: '2026-04-28T15:17:00Z'
         }

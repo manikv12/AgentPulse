@@ -6,7 +6,9 @@ import { createServer } from 'node:net';
 import {
   AGENT_PROVIDERS,
   AgentProviderSchema,
+  AppearanceSettingsSchema,
   type AgentProvider,
+  type AppearanceSettings,
   type RemoteAccessSettings
 } from '@agent-pulse/shared';
 
@@ -15,6 +17,7 @@ export type HelperSettings = {
   lanEnabled: boolean;
   mobileSendEnabled: boolean;
   enabledProviders?: AgentProvider[];
+  appearance?: AppearanceSettings;
   remoteAccess: RemoteAccessSettings;
 };
 
@@ -82,6 +85,7 @@ async function mergeSettings(
   return {
     ...defaults,
     ...stored,
+    appearance: normalizeAppearanceSettings(stored.appearance),
     enabledProviders: normalizeEnabledProviders(stored.enabledProviders),
     remoteAccess: {
       ...defaults.remoteAccess,
@@ -101,6 +105,7 @@ async function defaultSettings(settingsPath: string): Promise<HelperSettings> {
     lanEnabled: false,
     mobileSendEnabled: false,
     enabledProviders: [...AGENT_PROVIDERS],
+    appearance: defaultAppearanceSettings(),
     remoteAccess: {
       enabled: false,
       provider: 'cloudflare',
@@ -140,6 +145,17 @@ export function normalizeEnabledProviders(input: unknown): AgentProvider[] {
   const uniqueProviders = [...new Set(providers)];
 
   return uniqueProviders.length > 0 ? uniqueProviders : [...AGENT_PROVIDERS];
+}
+
+export function defaultAppearanceSettings(): AppearanceSettings {
+  return {
+    codexThemes: {},
+    themePreference: 'system'
+  };
+}
+
+export function normalizeAppearanceSettings(input: unknown): AppearanceSettings {
+  return AppearanceSettingsSchema.catch(defaultAppearanceSettings()).parse(input);
 }
 
 export async function pickFreeHighPort(): Promise<number> {

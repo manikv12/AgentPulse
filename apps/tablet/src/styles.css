@@ -73,12 +73,14 @@
   --popup-border: rgba(15, 23, 42, 0.14);
   --popup-shadow: 0 22px 52px rgba(15, 23, 42, 0.18);
   --popup-blur: 18px;
+  --ui-font-family:
+    "Söhne", "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  --ui-code-font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
   --app-gradient:
     radial-gradient(1100px 700px at 10% -10%, rgba(15, 23, 42, 0.04), transparent 60%),
     radial-gradient(900px 600px at 100% 110%, rgba(15, 23, 42, 0.04), transparent 55%);
-  font-family:
-    "Söhne", "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
+  font-family: var(--ui-font-family);
   background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -651,7 +653,7 @@ h2 {
   margin: 0 0 8px;
   color: var(--text-subtle);
   font-size: 0.8125rem;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
 }
 
 .thread-summary {
@@ -1463,7 +1465,7 @@ dd {
 }
 
 .activity-item-summary.is-mono {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
   font-size: 0.78125rem;
   color: var(--text-muted);
 }
@@ -1486,7 +1488,7 @@ dd {
 
 .activity-item-body-code {
   display: block;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
 }
 
 .plan-card {
@@ -1732,7 +1734,7 @@ dd {
 }
 
 .markdown-body code {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
   font-size: 0.85em;
   padding: 1px 6px;
   border-radius: 6px;
@@ -2352,7 +2354,7 @@ dd {
   border-radius: 12px;
   background: var(--surface-muted);
   color: var(--text);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
   font-size: clamp(2rem, 5vw, 2.65rem);
   font-weight: 650;
   letter-spacing: 0.08em;
@@ -2407,6 +2409,207 @@ dd {
   color: var(--text);
   border-color: var(--border-strong);
   box-shadow: var(--shadow-sm);
+}
+
+.codex-theme-importer {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.codex-theme-slots {
+  display: grid;
+  gap: 12px;
+}
+
+.codex-theme-slot {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-muted) 78%, var(--surface));
+  overflow: hidden;
+}
+
+.codex-theme-slot.has-theme {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+}
+
+.codex-theme-slot-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 13px 14px;
+  background: color-mix(in srgb, var(--surface-muted) 68%, var(--surface));
+}
+
+.codex-theme-slot-header .icon-button {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+}
+
+.codex-theme-slot-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.codex-theme-slot-copy span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.875rem;
+  font-weight: 650;
+}
+
+.codex-theme-slot-copy small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-subtle);
+  font-size: 0.75rem;
+}
+
+.codex-theme-swatch-row {
+  display: inline-flex;
+  align-items: center;
+  padding-right: 2px;
+}
+
+.codex-theme-swatch-row span {
+  width: 20px;
+  height: 20px;
+  margin-left: -6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  box-shadow: 0 0 0 2px var(--surface-muted);
+}
+
+.codex-theme-swatch-row span:first-child {
+  margin-left: 0;
+}
+
+.codex-theme-import-box {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.codex-theme-input {
+  width: 100%;
+  min-width: 0;
+  min-height: 72px;
+  resize: vertical;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-muted) 76%, var(--surface));
+  color: var(--text);
+  font-family: var(--ui-code-font-family);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.codex-theme-input::placeholder {
+  color: var(--text-subtle);
+}
+
+.codex-theme-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.codex-theme-editor {
+  display: grid;
+  min-width: 0;
+  border-top: 1px solid var(--border);
+}
+
+.codex-theme-color-field {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) 40px minmax(112px, 128px);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  min-height: 52px;
+  padding: 8px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.codex-theme-color-field:first-child {
+  border-top: 0;
+}
+
+.codex-theme-color-field span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-subtle);
+  font-size: 0.84rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.codex-theme-color-field input {
+  width: 38px;
+  min-width: 0;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.codex-theme-color-field input::-webkit-color-swatch-wrapper {
+  padding: 3px;
+}
+
+.codex-theme-color-field input::-webkit-color-swatch {
+  border: 0;
+  border-radius: 999px;
+}
+
+.codex-theme-hex {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--ui-code-font-family);
+  font-size: 0.78rem;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .passcode-form {
@@ -2735,6 +2938,19 @@ dd {
 
   .theme-segmented {
     grid-template-columns: 1fr;
+  }
+
+  .codex-theme-color-field {
+    grid-template-columns: minmax(92px, 1fr) 38px minmax(96px, 112px);
+    padding-inline: 12px;
+  }
+
+  .codex-theme-actions {
+    display: grid;
+  }
+
+  .codex-theme-actions .secondary-action {
+    width: 100%;
   }
 
   .passcode-form {
@@ -3566,17 +3782,26 @@ dd {
 @media (max-width: 900px) {
   .codex-sidebar {
     position: fixed;
-    top: 0;
     left: 0;
-    width: 320px;
-    height: 100dvh;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    max-height: 84dvh;
     z-index: 60;
-    transform: translateX(-100%);
-    transition: transform 220ms ease;
+    border-top-left-radius: 22px;
+    border-top-right-radius: 22px;
+    border-top: 1px solid var(--border);
+    box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.28);
+    overflow: hidden;
+    transform: translateY(100%);
+    transition: transform 240ms ease;
   }
 
   .codex-sidebar.is-open {
-    transform: translateX(0);
+    transform: translateY(0);
   }
 
   .codex-sidebar-toggle {
@@ -5959,7 +6184,7 @@ button.codex-activity-row:hover,
 }
 
 .codex-activity-detail-code {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -6230,7 +6455,7 @@ button.codex-activity-row:hover,
 
 .handoff-field .handoff-summary-editor {
   min-height: 230px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: var(--ui-code-font-family);
   font-size: 0.78125rem;
 }
 
@@ -6384,8 +6609,7 @@ button.codex-activity-row:hover,
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
-  font-family:
-    "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  font-family: var(--ui-code-font-family);
 }
 
 .codex-file-change-added,
@@ -9842,7 +10066,7 @@ button.codex-activity-row:hover,
   display: none;
 }
 
-@media (max-width: 640px) {
+@media (max-width: 900px) {
   .codex-sidebar-sheet-handle {
     display: flex;
     align-items: center;

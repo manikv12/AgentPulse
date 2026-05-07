@@ -1,6 +1,7 @@
 import {
   ApprovalDecisionResponseSchema,
   ApprovalInboxResponseSchema,
+  AppearanceSettingsSchema,
   CatalogCommandsResponseSchema,
   CatalogModelsResponseSchema,
   CatalogPluginsResponseSchema,
@@ -37,6 +38,8 @@ import {
   type SelectableCodexPermissionModeId,
   type ApprovalDecisionRequest,
   type AgentProvider,
+  type AppearanceSettings,
+  type AppearanceSettingsUpdateRequest,
   type CatalogCommand,
   type CatalogModel,
   type CatalogPlugin,
@@ -93,6 +96,7 @@ export type HelperSettingsSnapshot = {
   lanEnabled?: boolean;
   mobileSendEnabled?: boolean;
   enabledProviders?: AgentProvider[];
+  appearance?: AppearanceSettings;
   remoteAccess?: RemoteAccessSettings;
 };
 
@@ -201,6 +205,23 @@ export async function updateEnabledProviders(
 
   const payload = (await response.json()) as { settings?: HelperSettingsSnapshot };
   return payload.settings ?? {};
+}
+
+export async function updateAppearanceSettings(
+  token: string,
+  input: AppearanceSettingsUpdateRequest
+): Promise<AppearanceSettings> {
+  const response = await adminFetch('/settings/appearance', token, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, 'Could not update appearance.'));
+  }
+
+  const payload = (await response.json()) as { appearance?: unknown };
+  return AppearanceSettingsSchema.parse(payload.appearance);
 }
 
 export async function configureCloudflareRemoteAccess(

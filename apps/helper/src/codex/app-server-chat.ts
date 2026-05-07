@@ -10,6 +10,7 @@ import type {
   Thread,
   ThreadGoal,
   ThreadMessageResponse,
+  ThreadPlanItem,
   ThreadSendState,
   ThreadTranscript,
   ThreadUsage
@@ -20,11 +21,13 @@ import {
   CodexPermissionModeSchema,
   ThreadGoalSchema,
   ThreadMessageResponseSchema,
+  ThreadPlanItemSchema,
   ThreadSchema,
   ThreadTranscriptSchema,
   ThreadUsageSchema
 } from '@agent-pulse/shared';
-import { workspaceNameFromCwd } from './thread-reader';
+import type { RolloutLookup } from './rollout-lookup';
+import { readLastLines, workspaceNameFromCwd } from './thread-reader';
 import {
   CodexTranscriptionAuthError,
   parseCodexTranscriptionAuthContext,
@@ -69,6 +72,10 @@ type TurnStartOptions = {
   collaborationMode?: CollaborationModeKind;
   permissionMode?: SelectableCodexPermissionModeId;
   attachments?: ChatAttachment[];
+};
+
+export type CodexAppServerChatOptions = {
+  rolloutLookup?: RolloutLookup;
 };
 
 type AppServerCollaborationMode = {
@@ -206,6 +213,7 @@ type AppServerThread = {
   permissionProfile?: unknown;
   sandboxPolicy?: unknown;
   serviceTier?: unknown;
+  collaborationMode?: CollaborationModeKind;
 };
 
 type AppServerThreadStatus =
@@ -240,6 +248,7 @@ type AppServerThreadItem =
       type: 'plan';
       id: string;
       text: string;
+      plan?: unknown[];
     }
   | {
       type: 'reasoning';
@@ -294,6 +303,7 @@ type AppServerThreadExecutionSettings = {
   sandboxPolicy?: unknown;
   cwd?: string;
   serviceTier?: unknown;
+  collaborationMode?: CollaborationModeKind;
 };
 
 export type AppServerTurnCompletedEvent = {
@@ -322,7 +332,7 @@ function contextCompactionMessage(input: {
   return ChatMessageSchema.parse({
     id: input.id,
     role: 'activity',
-    kind: 'status',
+    kind: 'compacted',
     phase: CONTEXT_COMPACTION_PHASE,
     text: CONTEXT_COMPACTION_LABEL,
     ...(input.turnId ? { turnId: input.turnId } : {}),
@@ -383,7 +393,10 @@ export class CodexAppServerChat {
   private readonly turnCompletedListeners = new Set<(event: AppServerTurnCompletedEvent) => void>();
   private goalsFeatureEnablementTried = false;
 
-  constructor(private readonly transport: CodexAppServerTransport) {
+  constructor(
+    private readonly transport: CodexAppServerTransport,
+    private readonly options: CodexAppServerChatOptions = {}
+  ) {
     this.transport.onNotification?.((notification) => this.handleNotification(notification));
     this.transport.onServerRequest?.((request) => this.handleServerRequest(request));
     this.transport.onConnectionChange?.((connected) => this.emitConnectionChange(connected));
@@ -454,7 +467,7 @@ export class CodexAppServerChat {
 
   async readTranscript(threadId: string): Promise<ThreadTranscript> {
     const thread = await this.readThreadSnapshot(threadId);
-    return mapThreadToTranscript(thread);
+    return this.applyRolloutTranscriptContext(mapThreadToTranscript(thread));
   }
 
   async readFullTranscript(threadId: string): Promise<ThreadTranscript> {
@@ -462,14 +475,33 @@ export class CodexAppServerChat {
       threadId,
       includeTurns: true
     });
-    return mapThreadToTranscript(
+    return this.applyRolloutTranscriptContext(mapThreadToTranscript(
       {
         ...response.thread,
         model: response.model ?? response.thread.model ?? null,
         reasoningEffort: response.reasoningEffort ?? response.thread.reasoningEffort ?? null
       },
       { messageLimit: null }
-    );
+    ));
+  }
+
+  private async applyRolloutTranscriptContext(transcript: ThreadTranscript): Promise<ThreadTranscript> {
+    const rolloutLookup = this.options.rolloutLookup;
+    if (!rolloutLookup) {
+      return transcript;
+    }
+
+    const rolloutPath = await rolloutLookup.findRolloutPath(transcript.threadId).catch(() => null);
+    if (!rolloutPath) {
+      return transcript;
+    }
+
+    try {
+      const lines = await readLastLines(rolloutPath, 2_000, 8 * 1024 * 1024);
+      return applyRolloutContextToTranscript(transcript, rolloutTranscriptContextFromLines(lines));
+    } catch {
+      return transcript;
+    }
   }
 
   async subscribeThread(threadId: string): Promise<void> {
@@ -577,6 +609,7 @@ export class CodexAppServerChat {
       ...turnStartOverrides(options, thread)
     });
     this.rememberPermissionModeOverride(threadId, options.permissionMode, thread.cwd);
+    this.rememberCollaborationModeOverride(threadId, options.collaborationMode);
     this.markLiveTurnStarted(threadId, response.turn.id, trimmed);
     const updatedTranscript = await this.readTranscriptAfterAcceptedSend(threadId).catch((error) => {
       if (isUnmaterializedDraftError(error)) {
@@ -641,8 +674,9 @@ export class CodexAppServerChat {
     const response = await this.transport.request<AppServerThreadGoalResponse>('thread/goal/get', {
       threadId
     });
-    const goal = normalizeAppServerGoal(response.goal);
-    this.stateForThread(threadId).goal = goal;
+    const state = this.stateForThread(threadId);
+    const goal = mergeGoalProgress(state.goal, normalizeAppServerGoal(response.goal));
+    state.goal = goal;
     this.resetGoalTokenBaseline(threadId, goal);
     this.emitLiveStateChange(threadId);
     return goal;
@@ -663,11 +697,12 @@ export class CodexAppServerChat {
       params.tokenBudget = input.tokenBudget;
     }
     const response = await this.requestGoalSet(params);
-    const goal = normalizeAppServerGoal(response.goal);
+    const state = this.stateForThread(threadId);
+    const goal = mergeGoalProgress(state.goal, normalizeAppServerGoal(response.goal));
     if (!goal) {
       throw new Error('Codex did not return the updated goal.');
     }
-    this.stateForThread(threadId).goal = goal;
+    state.goal = goal;
     this.resetGoalTokenBaseline(threadId, goal);
     this.emitLiveStateChange(threadId);
     return goal;
@@ -768,16 +803,20 @@ export class CodexAppServerChat {
         !existingMessageIds.has(message.id) &&
         !transcriptConfirmsLiveMessage(message, transcriptWithProgress.messages)
     );
-    const messages = [...transcriptWithProgress.messages, ...liveMessages];
+    const messages = appendUserInputRequestMessages(
+      [...transcriptWithProgress.messages, ...liveMessages],
+      [...state.pendingRequests.values()]
+    );
 
     if (state.pendingRequests.size > 0) {
+      const needsUserInput = [...state.pendingRequests.values()].some(isUserInputRequest);
       return ThreadTranscriptSchema.parse({
         ...transcriptWithProgress,
         activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
         sendState: {
           canSend: false,
-          reason: 'waiting_on_approval',
-          label: 'Codex is waiting for approval'
+          reason: needsUserInput ? 'waiting_on_user_input' : 'waiting_on_approval',
+          label: needsUserInput ? 'Codex needs your answer.' : 'Codex is waiting for approval'
         },
         messages
       });
@@ -1028,6 +1067,7 @@ export class CodexAppServerChat {
       expectedTurnId,
       ...overrides
     });
+    this.rememberCollaborationModeOverride(threadId, options.collaborationMode);
     const updatedTranscript = await this.readTranscriptAfterAcceptedSend(threadId).catch(() =>
       startedDraftTranscript(threadId, text, response.turnId)
     );
@@ -1054,6 +1094,7 @@ export class CodexAppServerChat {
       options.permissionMode,
       this.threadExecutionSettings.get(threadId)?.cwd
     );
+    this.rememberCollaborationModeOverride(threadId, options.collaborationMode);
     this.markLiveTurnStarted(threadId, response.turn.id, text);
     const transcript = await this.readTranscriptAfterAcceptedSend(threadId).catch((error) => {
       if (isUnmaterializedDraftError(error)) {
@@ -1151,6 +1192,19 @@ export class CodexAppServerChat {
     });
   }
 
+  private rememberCollaborationModeOverride(
+    threadId: string,
+    mode: CollaborationModeKind | undefined
+  ): void {
+    if (!mode) {
+      return;
+    }
+    this.threadExecutionSettings.set(threadId, {
+      ...this.threadExecutionSettings.get(threadId),
+      collaborationMode: mode
+    });
+  }
+
   private resetGoalTokenBaseline(threadId: string, goal: ThreadGoal | null): void {
     const state = this.stateForThread(threadId);
     state.goalTokenBaseline =
@@ -1241,7 +1295,10 @@ export class CodexAppServerChat {
     }
 
     if (notification.method === 'thread/goal/updated') {
-      const goal = normalizeAppServerGoal(recordFromUnknown(params.goal));
+      const goal = mergeGoalProgress(
+        state.goal,
+        normalizeAppServerGoal(recordFromUnknown(params.goal))
+      );
       const goalTurnId = stringField(params, 'turnId');
       state.goal = goal;
       this.resetGoalTokenBaseline(threadId, goal);
@@ -1482,7 +1539,8 @@ export class CodexAppServerChat {
     const state = this.stateForThread(threadId);
     const turnId = stringField(params, 'turnId') ?? state.activeTurnId ?? appServerLiveTurnId(threadId);
     const text = planTextFromUpdatedNotification(params);
-    if (!text) {
+    const planItems = planItemsFromUpdatedNotification(params);
+    if (!text && planItems.length === 0) {
       this.emitLiveStateChange(threadId);
       return;
     }
@@ -1496,6 +1554,7 @@ export class CodexAppServerChat {
         role: 'activity',
         kind: 'plan',
         text,
+        ...(planItems.length > 0 ? { planItems } : {}),
         turnId,
         createdAt: new Date().toISOString()
       })
@@ -1771,7 +1830,8 @@ function executionSettingsFromThread(thread: AppServerThread): AppServerThreadEx
     permissionProfile: thread.permissionProfile,
     sandboxPolicy: thread.sandboxPolicy,
     cwd: thread.cwd,
-    serviceTier: thread.serviceTier
+    serviceTier: thread.serviceTier,
+    collaborationMode: thread.collaborationMode
   };
 }
 
@@ -1947,29 +2007,55 @@ function planTextFromUpdatedNotification(params: Record<string, unknown>): strin
     lines.push(explanation);
   }
 
-  const planLines = arrayField(params, 'plan')
-    .map((entry) => recordFromUnknown(entry))
+  const planLines = planItemsFromUpdatedNotification(params)
     .map((entry) => {
-      const step = stringField(entry, 'step');
-      if (!step) {
-        return undefined;
-      }
-      const status = stringField(entry, 'status') ?? 'pending';
       const marker =
-        status === 'completed'
+        entry.status === 'completed'
           ? 'x'
-          : status === 'inProgress' || status === 'in_progress'
+          : entry.status === 'in_progress'
             ? '*'
             : ' ';
-      return `[${marker}] ${step}`;
-    })
-    .filter((line): line is string => Boolean(line));
+      return `[${marker}] ${entry.step}`;
+    });
 
   if (lines.length > 0 && planLines.length > 0) {
     lines.push('');
   }
   lines.push(...planLines);
   return lines.join('\n').trim();
+}
+
+function planItemsFromUpdatedNotification(params: Record<string, unknown>): ThreadPlanItem[] {
+  return planItemsFromUnknown(arrayField(params, 'plan'));
+}
+
+function planItemsFromUnknown(value: unknown): ThreadPlanItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    const record = recordFromUnknown(entry);
+    const step = stringField(record, 'step');
+    if (!step) {
+      return [];
+    }
+    return [
+      ThreadPlanItemSchema.parse({
+        step,
+        status: normalizePlanItemStatus(stringField(record, 'status'))
+      })
+    ];
+  });
+}
+
+function normalizePlanItemStatus(status: string | undefined): ThreadPlanItem['status'] {
+  if (status === 'completed') {
+    return 'completed';
+  }
+  if (status === 'inProgress' || status === 'in_progress') {
+    return 'in_progress';
+  }
+  return 'pending';
 }
 
 function sandboxFromConfig(config: Record<string, unknown>): AppServerThreadStartParams['sandbox'] {
@@ -2048,6 +2134,259 @@ function appServerActiveTurnId(threadId: string): string {
   return `${APP_SERVER_ACTIVE_TURN_PREFIX}${threadId}`;
 }
 
+type RolloutQuestion = {
+  id: string;
+  header?: string;
+  question: string;
+};
+
+type RolloutQuestionCall = {
+  callId: string;
+  turnId?: string;
+  createdAt: string;
+  questions: RolloutQuestion[];
+  output?: unknown;
+};
+
+type RolloutTranscriptContext = {
+  collaborationMode?: CollaborationModeKind;
+  questionMessages: ChatMessage[];
+};
+
+function rolloutTranscriptContextFromLines(lines: string[]): RolloutTranscriptContext {
+  const calls = new Map<string, RolloutQuestionCall>();
+  let currentTurnId: string | undefined;
+  let collaborationMode: CollaborationModeKind | undefined;
+
+  for (const line of lines) {
+    const event = parseRolloutJsonLine(line);
+    if (!event) {
+      continue;
+    }
+
+    if (event.type === 'turn_context') {
+      const payload = recordFromUnknown(event.payload);
+      currentTurnId = stringField(payload ?? {}, 'turn_id') ?? currentTurnId;
+      const rawMode = stringField(recordFromUnknown(payload?.collaboration_mode) ?? {}, 'mode');
+      if (rawMode === 'plan' || rawMode === 'default') {
+        collaborationMode = rawMode;
+      }
+      continue;
+    }
+
+    if (event.type !== 'response_item') {
+      continue;
+    }
+
+    const payload = recordFromUnknown(event.payload);
+    const payloadType = stringField(payload ?? {}, 'type');
+    if (payloadType === 'function_call' && stringField(payload ?? {}, 'name') === 'request_user_input') {
+      const callId = stringField(payload ?? {}, 'call_id');
+      const questions = requestUserInputQuestionsFromArguments(stringField(payload ?? {}, 'arguments'));
+      if (callId && questions.length > 0) {
+        calls.set(callId, {
+          callId,
+          ...(currentTurnId ? { turnId: currentTurnId } : {}),
+          createdAt: timestampFromRolloutEvent(event),
+          questions
+        });
+      }
+      continue;
+    }
+
+    if (payloadType === 'function_call_output') {
+      const callId = stringField(payload ?? {}, 'call_id');
+      const call = callId ? calls.get(callId) : undefined;
+      if (call) {
+        call.output = parseJsonMaybe(stringField(payload ?? {}, 'output'));
+      }
+    }
+  }
+
+  return {
+    ...(collaborationMode ? { collaborationMode } : {}),
+    questionMessages: [...calls.values()].map(questionCallMessage)
+  };
+}
+
+function applyRolloutContextToTranscript(
+  transcript: ThreadTranscript,
+  context: RolloutTranscriptContext
+): ThreadTranscript {
+  const withQuestions = mergeQuestionMessagesIntoTranscript(transcript.messages, context.questionMessages);
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    ...(context.collaborationMode ? { collaborationMode: context.collaborationMode } : {}),
+    messages: withQuestions
+  });
+}
+
+function mergeQuestionMessagesIntoTranscript(
+  messages: ChatMessage[],
+  questionMessages: ChatMessage[]
+): ChatMessage[] {
+  const existingIds = new Set(messages.map((message) => message.id));
+  const extras = questionMessages.filter((message) => !existingIds.has(message.id));
+  if (extras.length === 0) {
+    return messages;
+  }
+
+  const extrasByTurn = new Map<string, ChatMessage[]>();
+  const extrasWithoutTurn: ChatMessage[] = [];
+  for (const extra of extras) {
+    if (extra.turnId) {
+      extrasByTurn.set(extra.turnId, [...(extrasByTurn.get(extra.turnId) ?? []), extra]);
+    } else {
+      extrasWithoutTurn.push(extra);
+    }
+  }
+
+  const result: ChatMessage[] = [];
+  const insertedTurns = new Set<string>();
+  for (const message of messages) {
+    const turnExtras = message.turnId ? extrasByTurn.get(message.turnId) : undefined;
+    if (turnExtras && !insertedTurns.has(message.turnId!) && message.kind === 'plan') {
+      result.push(...turnExtras);
+      insertedTurns.add(message.turnId!);
+    }
+    result.push(message);
+  }
+
+  for (const [turnId, turnExtras] of extrasByTurn.entries()) {
+    if (!insertedTurns.has(turnId)) {
+      result.push(...turnExtras);
+    }
+  }
+  result.push(...extrasWithoutTurn);
+  return result;
+}
+
+function appendUserInputRequestMessages(
+  messages: ChatMessage[],
+  requests: PendingApprovalRequest[]
+): ChatMessage[] {
+  const questionMessages = requests
+    .filter(isUserInputRequest)
+    .map((request) => pendingUserInputRequestMessage(request));
+  return mergeQuestionMessagesIntoTranscript(messages, questionMessages);
+}
+
+function pendingUserInputRequestMessage(request: PendingApprovalRequest): ChatMessage {
+  const params = request.params ?? {};
+  const questions = requestUserInputQuestionsFromUnknown(params);
+  return ChatMessageSchema.parse({
+    id: `codex-user-input:${userInputCallIdForRequest(request)}`,
+    role: 'activity',
+    kind: 'status',
+    phase: 'user_input',
+    text: questionSummaryText(questions, undefined),
+    ...(request.turnId ? { turnId: request.turnId } : {}),
+    createdAt: new Date().toISOString()
+  });
+}
+
+function questionCallMessage(call: RolloutQuestionCall): ChatMessage {
+  return ChatMessageSchema.parse({
+    id: `codex-user-input:${call.callId}`,
+    role: 'activity',
+    kind: 'status',
+    phase: 'user_input',
+    text: questionSummaryText(call.questions, call.output),
+    ...(call.turnId ? { turnId: call.turnId } : {}),
+    createdAt: call.createdAt
+  });
+}
+
+function questionSummaryText(questions: RolloutQuestion[], output: unknown): string {
+  const count = questions.length || 1;
+  const lines = [`Asked ${count} question${count === 1 ? '' : 's'}`];
+  for (const question of questions.length > 0 ? questions : [{ id: 'question', question: 'Question' }]) {
+    const answer = answerTextForQuestion(output, question.id);
+    if (count === 1) {
+      lines.push(question.question);
+      lines.push(answer ? `Answer: ${answer}` : 'Waiting for answer');
+    } else {
+      const label = question.header || question.question;
+      lines.push(`${label}: ${answer ?? 'Waiting for answer'}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function answerTextForQuestion(output: unknown, questionId: string): string | undefined {
+  const answers = recordFromUnknown(recordFromUnknown(output)?.answers);
+  const value = answers?.[questionId];
+  const answerRecord = recordFromUnknown(value);
+  const answerList = arrayField(answerRecord ?? {}, 'answers')
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+  if (answerList.length > 0) {
+    return answerList.join(', ');
+  }
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+  return undefined;
+}
+
+function requestUserInputQuestionsFromArguments(raw: string | undefined): RolloutQuestion[] {
+  return requestUserInputQuestionsFromUnknown(parseJsonMaybe(raw));
+}
+
+function requestUserInputQuestionsFromUnknown(value: unknown): RolloutQuestion[] {
+  const record = recordFromUnknown(value);
+  return arrayField(record ?? {}, 'questions')
+    .map((question): RolloutQuestion | undefined => {
+      const candidate = recordFromUnknown(question);
+      const id = stringField(candidate ?? {}, 'id');
+      const questionText = stringField(candidate ?? {}, 'question');
+      if (!id || !questionText) {
+        return undefined;
+      }
+      return {
+        id,
+        question: questionText,
+        ...(stringField(candidate ?? {}, 'header') ? { header: stringField(candidate ?? {}, 'header') } : {})
+      };
+    })
+    .filter((question): question is RolloutQuestion => Boolean(question));
+}
+
+function userInputCallIdForRequest(request: PendingApprovalRequest): string {
+  const params = request.params ?? {};
+  return (
+    stringField(params, 'callId') ??
+    stringField(params, 'call_id') ??
+    request.itemId ??
+    request.id
+  );
+}
+
+type RolloutJsonEvent = {
+  timestamp?: string;
+  type?: string;
+  payload?: unknown;
+};
+
+function parseRolloutJsonLine(line: string): RolloutJsonEvent | undefined {
+  return recordFromUnknown(parseJsonMaybe(line)) as RolloutJsonEvent | undefined;
+}
+
+function timestampFromRolloutEvent(event: RolloutJsonEvent): string {
+  const timestamp = typeof event.timestamp === 'string' ? event.timestamp : undefined;
+  return timestamp && !Number.isNaN(Date.parse(timestamp)) ? timestamp : new Date().toISOString();
+}
+
+function parseJsonMaybe(raw: string | undefined): unknown {
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 function mapThreadToTranscript(
   thread: AppServerThread,
   options: TranscriptMapOptions = {}
@@ -2065,6 +2404,7 @@ function mapThreadToTranscript(
       ? thread.reasoningEffort.trim()
       : undefined;
   const permissionMode = permissionModeFromExecutionSettings(executionSettingsFromThread(thread));
+  const collaborationMode = collaborationModeFromExecutionSettings(executionSettingsFromThread(thread));
 
   return ThreadTranscriptSchema.parse({
     threadId: thread.id,
@@ -2075,8 +2415,17 @@ function mapThreadToTranscript(
     messages,
     ...(model ? { model } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(collaborationMode ? { collaborationMode } : {}),
     ...(permissionMode ? { permissionMode } : {})
   });
+}
+
+function collaborationModeFromExecutionSettings(
+  settings: AppServerThreadExecutionSettings
+): CollaborationModeKind | undefined {
+  return settings.collaborationMode === 'plan' || settings.collaborationMode === 'default'
+    ? settings.collaborationMode
+    : undefined;
 }
 
 function permissionModeFromExecutionSettings(
@@ -2259,11 +2608,13 @@ function mapTurnMessages(turn: AppServerTurn): ChatMessage[] {
       }
 
       if (item.type === 'plan') {
+        const planItems = planItemsFromUnknown(item.plan);
         return {
           id: item.id,
           role: 'activity',
           kind: 'plan',
           text: item.text,
+          ...(planItems.length > 0 ? { planItems } : {}),
           turnId: turn.id,
           createdAt
         };
@@ -2359,11 +2710,13 @@ function messageFromAppServerItem(
   }
 
   if (type === 'plan') {
+    const planItems = planItemsFromUnknown(item.plan);
     return ChatMessageSchema.parse({
       id,
       role: 'activity',
       kind: 'plan',
       text: stringField(item, 'text') ?? '',
+      ...(planItems.length > 0 ? { planItems } : {}),
       ...(turnId ? { turnId } : {}),
       createdAt
     });
@@ -2474,6 +2827,10 @@ function approvalResponseForServerRequest(
     return { decision: response };
   }
   return response;
+}
+
+function isUserInputRequest(request: PendingApprovalRequest): boolean {
+  return request.method === 'item/tool/requestUserInput' || request.method === 'tool/requestUserInput';
 }
 
 function reviewDecisionResponseForAppServerApproval(response: unknown): unknown {
@@ -2713,6 +3070,37 @@ function normalizeAppServerGoal(goal: AppServerThreadGoal | null | undefined): T
     createdAt: goal.createdAt ?? goal.created_at ?? 0,
     updatedAt: goal.updatedAt ?? goal.updated_at ?? 0
   });
+}
+
+function mergeGoalProgress(
+  previous: ThreadGoal | null | undefined,
+  next: ThreadGoal | null
+): ThreadGoal | null {
+  if (!previous || !next || !isSameGoal(previous, next)) {
+    return next;
+  }
+
+  const tokensUsed = Math.max(previous.tokensUsed, next.tokensUsed);
+  const timeUsedSeconds = Math.max(previous.timeUsedSeconds, next.timeUsedSeconds);
+  if (tokensUsed === next.tokensUsed && timeUsedSeconds === next.timeUsedSeconds) {
+    return next;
+  }
+
+  return ThreadGoalSchema.parse({
+    ...next,
+    tokensUsed,
+    timeUsedSeconds
+  });
+}
+
+function isSameGoal(previous: ThreadGoal, next: ThreadGoal): boolean {
+  if (previous.threadId !== next.threadId) {
+    return false;
+  }
+  if (previous.createdAt > 0 && next.createdAt > 0) {
+    return previous.createdAt === next.createdAt;
+  }
+  return previous.objective === next.objective;
 }
 
 type NormalizedAppServerTokenUsage = {

@@ -287,7 +287,7 @@ describe('thread rendering helpers', () => {
       message({
         id: 'compact-1',
         role: 'activity',
-        kind: 'status',
+        kind: 'compacted',
         phase: 'context_compaction',
         text: 'Automatically compacting context',
         createdAt: '2026-04-25T16:14:31Z'
@@ -326,7 +326,7 @@ describe('thread rendering helpers', () => {
       message({
         id: 'compact-1',
         role: 'activity',
-        kind: 'status',
+        kind: 'compacted',
         phase: 'context_compaction',
         text: 'Automatically compacting context',
         createdAt: '2026-04-25T16:14:40Z'
@@ -380,7 +380,7 @@ describe('thread rendering helpers', () => {
       message({
         id: 'compact-1',
         role: 'activity',
-        kind: 'status',
+        kind: 'compacted',
         phase: 'context_compaction',
         text: 'Automatically compacting context',
         createdAt: '2026-04-25T16:14:31Z'

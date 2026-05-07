@@ -54,7 +54,9 @@ const usageProvider = async (threadId: string) => {
 };
 const catalog = new CatalogReader();
 catalog.start();
-const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: app.getVersion() }));
+const appServer = new CodexAppServerChat(new CodexAppServerClient({ version: app.getVersion() }), {
+  rolloutLookup
+});
 const claudeCode = new ClaudeCodeProvider();
 const copilot = new CopilotProvider();
 

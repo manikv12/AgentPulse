@@ -567,6 +567,7 @@ const ACTIVITY_ICONS: Record<ActivityKind, LucideIcon> = {
   command: Terminal,
   file: FileEdit,
   tool: Wrench,
+  compacted: Brain,
   status: Info
 };
 
@@ -1751,6 +1752,18 @@ export function ThreadView({
   }, [provider, thread.threadId, transcript?.permissionMode?.mode]);
 
   useEffect(() => {
+    const transcriptMode = transcript?.collaborationMode;
+    if (!transcriptMode) {
+      return;
+    }
+    const savedDraft = composerDraftsRef.current.get(thread.threadId);
+    if (savedDraft?.collaborationMode) {
+      return;
+    }
+    setCollaborationMode(transcriptMode);
+  }, [thread.threadId, transcript?.collaborationMode]);
+
+  useEffect(() => {
     const previousThreadId = activeDraftThreadIdRef.current;
     if (previousThreadId === thread.threadId) {
       return;
@@ -1760,7 +1773,7 @@ export function ThreadView({
     const nextDraft = composerDraftsRef.current.get(thread.threadId);
     setDraft(nextDraft?.text ?? '');
     setDraftAttachments(nextDraft?.attachments ?? []);
-    setCollaborationMode(nextDraft?.collaborationMode ?? 'default');
+    setCollaborationMode(nextDraft?.collaborationMode ?? transcript?.collaborationMode ?? 'default');
     setPermissionMode(
       nextDraft?.permissionMode ??
         selectablePermissionModeFromTranscript(transcript?.permissionMode) ??
