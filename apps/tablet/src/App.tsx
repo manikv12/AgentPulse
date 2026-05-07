@@ -42,6 +42,7 @@ import {
   Monitor,
   Moon,
   Palette,
+  Pencil,
   RefreshCw,
   ShieldCheck,
   Sun,
@@ -171,6 +172,7 @@ type AdminPairingPin = {
   pin: string;
   expiresAt?: string;
   deviceId?: string;
+  deviceName?: string;
 };
 
 function sameSession(
@@ -3512,13 +3514,18 @@ function SettingsScreen({
 }) {
   const [pin, setPin] = useState('');
   const [pinExpiresAt, setPinExpiresAt] = useState<string | undefined>();
+  const [pinDeviceName, setPinDeviceName] = useState<string | undefined>();
   const [lanEnabled, setLanEnabled] = useState(false);
   const [mobileSendEnabled, setMobileSendEnabled] = useState(false);
   const [enabledProviders, setEnabledProviders] = useState<AgentProvider[]>(() => [...AGENT_PROVIDERS]);
   const [remoteAccess, setRemoteAccess] = useState<RemoteAccessSettings>(() => defaultRemoteAccess());
   const [devices, setDevices] = useState<AdminDevice[]>([]);
   const [selectedPairDeviceId, setSelectedPairDeviceId] = useState('');
+  const [newDeviceName, setNewDeviceName] = useState('Admin tablet');
   const [devicePins, setDevicePins] = useState<Record<string, AdminPairingPin>>({});
+  const [editingDeviceId, setEditingDeviceId] = useState('');
+  const [editingDeviceName, setEditingDeviceName] = useState('');
+  const [renameError, setRenameError] = useState('');
   const { theme, appearance, setAppearance, setTheme } = useThemePreference();
   const remoteTone = remoteAccess.status === 'healthy' ? 'green' : remoteAccess.enabled ? 'blue' : 'gray';
 
@@ -3545,6 +3552,7 @@ function SettingsScreen({
         const pins = splitPairingPins(payload.pairingPins ?? []);
         setPin(pins.newDevicePin?.pin ?? '');
         setPinExpiresAt(pins.newDevicePin?.expiresAt);
+        setPinDeviceName(pins.newDevicePin?.deviceName);
         setDevicePins(pins.devicePins);
       })
       .catch((error: unknown) => {
@@ -3555,9 +3563,17 @@ function SettingsScreen({
   }, [adminToken, onAdminExpired]);
 
   const createPin = async (deviceId?: string) => {
+    const nextDeviceName = deviceId ? undefined : newDeviceName.trim() || undefined;
+    const requestBody =
+      deviceId || nextDeviceName
+        ? {
+            ...(deviceId ? { deviceId } : {}),
+            ...(nextDeviceName ? { deviceName: nextDeviceName } : {})
+          }
+        : undefined;
     const response = await adminFetch('/settings/pairing-pin', adminToken, {
       method: 'POST',
-      ...(deviceId ? { body: JSON.stringify({ deviceId }) } : {})
+      ...(requestBody ? { body: JSON.stringify(requestBody) } : {})
     });
     if (!response.ok) {
       if (response.status === 401) {
@@ -3576,7 +3592,67 @@ function SettingsScreen({
 
     setPin(payload.pin);
     setPinExpiresAt(payload.expiresAt);
+    setPinDeviceName(payload.deviceName);
     return payload.pin;
+  };
+
+  const startDeviceRename = (device: AdminDevice) => {
+    setRenameError('');
+    setEditingDeviceId(device.deviceId);
+    setEditingDeviceName(device.deviceName);
+  };
+
+  const cancelDeviceRename = () => {
+    setRenameError('');
+    setEditingDeviceId('');
+    setEditingDeviceName('');
+  };
+
+  const submitDeviceRename = async (deviceId: string) => {
+    const nextName = editingDeviceName.trim();
+    if (!nextName) {
+      setRenameError('Enter a device name.');
+      return;
+    }
+
+    const previousDevices = devices;
+    setRenameError('');
+    setEditingDeviceId('');
+    setEditingDeviceName('');
+    setDevices((current) =>
+      current.map((device) =>
+        device.deviceId === deviceId ? { ...device, deviceName: nextName } : device
+      )
+    );
+
+    const response = await adminFetch('/settings/device/rename', adminToken, {
+      method: 'POST',
+      body: JSON.stringify({ deviceId, deviceName: nextName })
+    });
+    const payload = (await response.json().catch(() => ({}))) as {
+      error?: unknown;
+      device?: AdminDevice;
+    };
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        onAdminExpired();
+        return;
+      }
+      setDevices(previousDevices);
+      setRenameError(
+        typeof payload.error === 'string' ? payload.error : 'Could not rename this device.'
+      );
+      return;
+    }
+
+    if (payload.device) {
+      setDevices((current) =>
+        current.map((device) =>
+          device.deviceId === deviceId ? { ...device, ...payload.device } : device
+        )
+      );
+    }
   };
 
   const toggleLan = async () => {
@@ -3695,7 +3771,7 @@ function SettingsScreen({
   const selectedPairPin = selectedPairDevice
     ? devicePins[selectedPairDevice.deviceId]
     : pin
-      ? { pin, expiresAt: pinExpiresAt }
+      ? { pin, expiresAt: pinExpiresAt, ...(pinDeviceName ? { deviceName: pinDeviceName } : {}) }
       : undefined;
   const selectedPairPinValue = selectedPairPin?.pin ?? '';
   const selectedPairPinExpiresAt = selectedPairPin?.expiresAt;
@@ -3708,7 +3784,7 @@ function SettingsScreen({
     void onPair(
       selectedPairDevice
         ? { pin: selectedPairPinValue, existingDeviceId: selectedPairDevice.deviceId }
-        : { pin: selectedPairPinValue, deviceName: 'Admin tablet' }
+        : { pin: selectedPairPinValue, deviceName: newDeviceName.trim() || 'Admin tablet' }
     );
   };
 
@@ -3822,9 +3898,24 @@ function SettingsScreen({
               </select>
             </label>
           ) : null}
+          {!selectedPairDevice ? (
+            <label>
+              New device name
+              <input
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                value={newDeviceName}
+                onChange={(event) => setNewDeviceName(event.target.value)}
+              />
+            </label>
+          ) : null}
           {selectedPairPinValue ? (
             <div className="pin-stack">
               <div className="pin-display">{selectedPairPinValue}</div>
+              {selectedPairPin?.deviceName ? (
+                <p className="simple-copy">For {selectedPairPin.deviceName}.</p>
+              ) : null}
               {selectedPairPinExpiresAt ? (
                 <p className="simple-copy">Expires {new Date(selectedPairPinExpiresAt).toLocaleString()}.</p>
               ) : null}
@@ -3895,11 +3986,54 @@ function SettingsScreen({
               {devices.map((device) => (
                 <li key={device.deviceId}>
                   <div className="device-copy">
-                    <span>{device.deviceName}</span>
+                    {editingDeviceId === device.deviceId ? (
+                      <form
+                        className="device-name-edit"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void submitDeviceRename(device.deviceId);
+                        }}
+                      >
+                        <input
+                          aria-label={`Device name for ${device.deviceName}`}
+                          autoCapitalize="off"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          value={editingDeviceName}
+                          onChange={(event) => setEditingDeviceName(event.target.value)}
+                        />
+                        <button
+                          className="icon-button"
+                          type="submit"
+                          title="Save name"
+                          disabled={!editingDeviceName.trim()}
+                        >
+                          <CheckCircle2 size={16} />
+                        </button>
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title="Cancel rename"
+                          onClick={cancelDeviceRename}
+                        >
+                          <XCircle size={16} />
+                        </button>
+                      </form>
+                    ) : (
+                      <span>{device.deviceName}</span>
+                    )}
                     <small>{formatDeviceSeen(device.lastSeenAt)}</small>
                     <small>{formatDevicePin(devicePins[device.deviceId])}</small>
                   </div>
                   <div className="device-actions">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title="Rename"
+                      onClick={() => startDeviceRename(device)}
+                    >
+                      <Pencil size={16} />
+                    </button>
                     <button
                       className="icon-button"
                       type="button"
@@ -3949,6 +4083,7 @@ function SettingsScreen({
               ))}
             </ul>
           )}
+          {renameError ? <p className="form-error">{renameError}</p> : null}
         </section>
       </section>
     </main>

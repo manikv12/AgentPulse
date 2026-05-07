@@ -645,6 +645,185 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('renames paired devices and names new-device PINs from admin settings', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const device = await registry.createDevice('iPhone', 'fingerprint-a');
+    const adminAuth = createAdminAuth();
+    const adminToken = adminAuth.issueToken().token;
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth,
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const renamed = await fetch(`${server.url}/settings/device/rename`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          deviceId: device.deviceId,
+          deviceName: 'Office iPhone'
+        })
+      });
+      expect(renamed.status).toBe(200);
+      await expect(renamed.json()).resolves.toMatchObject({
+        ok: true,
+        device: {
+          deviceId: device.deviceId,
+          deviceName: 'Office iPhone'
+        }
+      });
+
+      const settingsResponse = await fetch(`${server.url}/settings/get`, {
+        headers: { authorization: `Bearer ${adminToken}` }
+      });
+      await expect(settingsResponse.json()).resolves.toMatchObject({
+        devices: [
+          expect.objectContaining({
+            deviceId: device.deviceId,
+            deviceName: 'Office iPhone'
+          })
+        ]
+      });
+
+      const namedPinResponse = await fetch(`${server.url}/settings/pairing-pin`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ deviceName: 'Kitchen wall display' })
+      });
+      const namedPin = (await namedPinResponse.json()) as { pin: string; deviceName: string };
+      expect(namedPinResponse.status).toBe(200);
+      expect(namedPin.deviceName).toBe('Kitchen wall display');
+
+      const paired = await fetch(`${server.url}/device/pair`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          pin: namedPin.pin,
+          deviceName: 'Desk tablet',
+          fingerprint: 'fingerprint-b'
+        })
+      });
+      expect(paired.status).toBe(200);
+      await expect(paired.json()).resolves.toMatchObject({
+        deviceName: 'Kitchen wall display'
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('serves safe text file previews for assistant file references', async () => {
+    const workspacePath = mkdtempSync(path.join(tmpdir(), 'agent-pulse-preview-api-'));
+    mkdirSync(path.join(workspacePath, 'docs'), { recursive: true });
+    writeFileSync(
+      path.join(workspacePath, 'docs', 'TEST_PLAN.md'),
+      '# Test Plan\n\nTap this from the phone.\n',
+      'utf8'
+    );
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-file-preview',
+      provider: 'codex',
+      title: 'Create test plan',
+      workspace: 'Preview App',
+      workspacePath,
+      status: 'idle',
+      lastActivityAt: '2026-05-07T00:00:00Z',
+      lastTurnSummary: 'Created docs/TEST_PLAN.md'
+    };
+    const transcript: ThreadTranscript = {
+      threadId: thread.threadId,
+      provider: 'codex',
+      activeTurnId: null,
+      sendState: { canSend: true, reason: 'ready', label: 'Ready' },
+      messages: [
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          kind: 'message',
+          text: 'Created the plan here: docs/TEST_PLAN.md',
+          createdAt: '2026-05-07T00:00:00Z'
+        }
+      ]
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore: { save: vi.fn(), load: vi.fn() } as unknown as HelperSettingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer: {
+        isConnected: () => true,
+        readTranscript: vi.fn(async () => transcript),
+        readFullTranscript: vi.fn(async () => transcript),
+        sendMessage: vi.fn()
+      },
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const transcriptResponse = await fetch(`${server.url}/threads/${thread.threadId}/transcript`, {
+        headers: authHeaders(token, deviceId)
+      });
+      const transcriptBody = (await transcriptResponse.json()) as ThreadTranscript;
+      const reference = transcriptBody.messages[0]?.fileReferences?.[0];
+
+      expect(transcriptResponse.status).toBe(200);
+      expect(reference).toMatchObject({
+        displayPath: 'docs/TEST_PLAN.md',
+        kind: 'markdown',
+        source: 'codex'
+      });
+
+      const previewResponse = await fetch(
+        `${server.url}/threads/${thread.threadId}/files/${reference?.id}`,
+        { headers: authHeaders(token, deviceId) }
+      );
+      const previewBody = (await previewResponse.json()) as {
+        metadata: { displayPath: string; kind: string };
+        content: string;
+      };
+
+      expect(previewResponse.status).toBe(200);
+      expect(previewBody.metadata).toMatchObject({
+        displayPath: 'docs/TEST_PLAN.md',
+        kind: 'markdown'
+      });
+      expect(previewBody.content).toContain('Tap this from the phone.');
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('deduplicates repeated project names and prefers normal workspace paths', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -2133,6 +2312,85 @@ describe('Agent Pulse helper API', () => {
       const imageResponse = await fetch(`${server.url}${attachment?.url}`);
       expect(imageResponse.status).toBe(200);
       expect(imageResponse.headers.get('content-type')).toBe('image/png');
+      await expect(imageResponse.arrayBuffer()).resolves.toEqual(screenshotBytes.buffer.slice(
+        screenshotBytes.byteOffset,
+        screenshotBytes.byteOffset + screenshotBytes.byteLength
+      ));
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('serves data URL transcript screenshots through opaque helper URLs', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const screenshotBytes = Buffer.from('hello');
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(async (): Promise<ThreadTranscript> => ({
+        threadId: 'thread-data-image',
+        activeTurnId: null,
+        sendState: {
+          canSend: true,
+          reason: 'ready',
+          label: 'Ready'
+        },
+        messages: [
+          {
+            id: 'tool-1',
+            role: 'activity',
+            kind: 'tool',
+            text: 'node_repl.js returned image',
+            createdAt: '2026-05-07T05:14:00Z',
+            attachments: [
+              {
+                id: 'tool-1-image-1',
+                kind: 'image',
+                url: `data:image/jpeg;base64,${screenshotBytes.toString('base64')}`,
+                alt: 'Tool screenshot'
+              }
+            ]
+          } as ThreadTranscript['messages'][number]
+        ]
+      })),
+      sendMessage: vi.fn()
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      appServer,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(`${server.url}/threads/thread-data-image/transcript`, {
+        headers: authHeaders(token, deviceId)
+      });
+      const transcript = (await response.json()) as ThreadTranscript;
+      const attachment = transcript.messages[0]?.attachments?.[0];
+
+      expect(response.status).toBe(200);
+      expect(attachment?.url).toMatch(/^\/attachments\/[a-f0-9]+$/);
+
+      const imageResponse = await fetch(`${server.url}${attachment?.url}`);
+      expect(imageResponse.status).toBe(200);
+      expect(imageResponse.headers.get('content-type')).toBe('image/jpeg');
       await expect(imageResponse.arrayBuffer()).resolves.toEqual(screenshotBytes.buffer.slice(
         screenshotBytes.byteOffset,
         screenshotBytes.byteOffset + screenshotBytes.byteLength

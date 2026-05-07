@@ -181,6 +181,22 @@ export class DeviceRegistry {
     });
   }
 
+  async renameDevice(deviceId: string, deviceName: string): Promise<DeviceRecord | undefined> {
+    const devices = await this.store.list();
+    const device = devices.find((candidate) => candidate.deviceId === deviceId);
+
+    if (!device || device.revokedAt) {
+      return undefined;
+    }
+
+    const nextDevice = {
+      ...device,
+      deviceName: deviceName.trim()
+    };
+    await this.store.save(nextDevice);
+    return nextDevice;
+  }
+
   async validate(
     token: string | undefined,
     deviceId: string | undefined,
@@ -230,6 +246,7 @@ type PinRecord = {
   pin: string;
   expiresAt: Date;
   deviceId?: string;
+  deviceName?: string;
 };
 
 const NEW_DEVICE_PIN_SCOPE = '__new-device__';
@@ -279,31 +296,35 @@ export class PairingManager {
     });
   }
 
-  createPin(options: { deviceId?: string } = {}): {
+  createPin(options: { deviceId?: string; deviceName?: string } = {}): {
     pin: string;
     expiresAt: string;
     deviceId?: string;
+    deviceName?: string;
   } {
     this.purgeExpiredPins();
     const raw = Number.parseInt(randomBytes(4).toString('hex'), 16);
     const pin = String(raw % 1_000_000).padStart(6, '0');
     const expiresAt = new Date(this.now().getTime() + this.pinTtlMs);
     const deviceId = options.deviceId?.trim() || undefined;
+    const deviceName = deviceId ? undefined : options.deviceName?.trim() || undefined;
 
-    this.activePins.set(pinScopeKey(deviceId), { pin, expiresAt, deviceId });
+    this.activePins.set(pinScopeKey(deviceId), { pin, expiresAt, deviceId, deviceName });
     return {
       pin,
       expiresAt: expiresAt.toISOString(),
-      ...(deviceId ? { deviceId } : {})
+      ...(deviceId ? { deviceId } : {}),
+      ...(deviceName ? { deviceName } : {})
     };
   }
 
-  listPins(): Array<{ pin: string; expiresAt: string; deviceId?: string }> {
+  listPins(): Array<{ pin: string; expiresAt: string; deviceId?: string; deviceName?: string }> {
     this.purgeExpiredPins();
     return [...this.activePins.values()].map((record) => ({
       pin: record.pin,
       expiresAt: record.expiresAt.toISOString(),
-      ...(record.deviceId ? { deviceId: record.deviceId } : {})
+      ...(record.deviceId ? { deviceId: record.deviceId } : {}),
+      ...(record.deviceName ? { deviceName: record.deviceName } : {})
     }));
   }
 
@@ -364,7 +385,7 @@ export class PairingManager {
 
     const suffix = this.randomId();
     const device = await this.registry.createDevice(
-      input.deviceName?.trim() || `Tablet ${suffix}`,
+      activePin.deviceName?.trim() || input.deviceName?.trim() || `Tablet ${suffix}`,
       input.fingerprint
     );
 

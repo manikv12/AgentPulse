@@ -49,6 +49,47 @@ describe('pairing and device auth', () => {
     ).resolves.toEqual({ ok: false, reason: 'revoked' });
   });
 
+  it('renames active devices', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const device = await registry.createDevice('Kitchen tablet', 'fingerprint-a');
+
+    await expect(registry.renameDevice(device.deviceId, 'Kitchen wall display')).resolves.toMatchObject({
+      deviceId: device.deviceId,
+      deviceName: 'Kitchen wall display'
+    });
+    await expect(registry.listPublicDevices()).resolves.toEqual([
+      expect.objectContaining({
+        deviceId: device.deviceId,
+        deviceName: 'Kitchen wall display'
+      })
+    ]);
+  });
+
+  it('uses an admin-provided name from a new-device pairing PIN', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry, {
+      now: () => new Date('2026-04-25T16:00:00Z')
+    });
+
+    const pin = pairing.createPin({ deviceName: 'Kitchen wall display' });
+    expect(pairing.listPins()).toEqual([
+      {
+        pin: pin.pin,
+        expiresAt: '2026-04-25T16:05:00.000Z',
+        deviceName: 'Kitchen wall display'
+      }
+    ]);
+
+    const result = await pairing.exchangePin({
+      pin: pin.pin,
+      deviceName: 'Desk tablet',
+      fingerprint: 'tablet-fingerprint',
+      ip: '192.168.1.20'
+    });
+
+    expect(result.device.deviceName).toBe('Kitchen wall display');
+  });
+
   it('reconnects a saved device without creating a duplicate record', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry, {

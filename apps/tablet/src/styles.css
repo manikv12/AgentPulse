@@ -2678,6 +2678,18 @@ dd {
   gap: 3px;
 }
 
+.device-name-edit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px 38px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.device-name-edit input {
+  min-height: 38px;
+}
+
 .device-copy span {
   overflow: hidden;
   color: var(--text);
@@ -2977,7 +2989,7 @@ dd {
 
   .device-actions {
     display: grid;
-    grid-template-columns: repeat(3, minmax(44px, 1fr));
+    grid-template-columns: repeat(4, minmax(44px, 1fr));
     width: 100%;
   }
 
