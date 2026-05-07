@@ -13,6 +13,8 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import {
   ApprovalDecisionRequestSchema,
   ApprovalDecisionResponseSchema,
+  AppearanceSettingsSchema,
+  AppearanceSettingsUpdateRequestSchema,
   ApprovalInboxResponseSchema,
   CatalogCommandsResponseSchema,
   CatalogModelSchema,
@@ -72,6 +74,7 @@ import {
   resolveThreadStatus,
   type CollaborationModeKind,
   type AgentProvider,
+  type AppearanceSettings,
   type ChatAttachment,
   type SelectableCodexPermissionModeId,
   type ChatMessage,
@@ -120,7 +123,7 @@ import {
   normalizeThreadsForWorkspaceDisplay,
   WorkspaceDisplayRootResolver
 } from './workspace-display';
-import { normalizeEnabledProviders, type HelperSettings, type HelperSettingsStore } from './settings';
+import { normalizeAppearanceSettings, normalizeEnabledProviders, type HelperSettings, type HelperSettingsStore } from './settings';
 import { createTabletDevProxy, type TabletDevProxy } from './tablet-dev-proxy';
 
 type ThreadOpener = ReturnType<typeof createThreadOpener>;
@@ -720,10 +723,9 @@ function createApp(
   // is consumed when the user sends the next
   // message — at that point we pass it directly to turn/start, no ownership needed.
   const pendingModelOverrides = new Map<string, { model: string; effort?: string }>();
-  // Last-known-good transcript per thread, updated whenever any path successfully reads
-  // one (HTTP fetch, poller broadcast). Used as a fallback when `appServer.readTranscript`
-  // is slow or upstream Codex is degraded — we'd rather return slightly stale data fast
-  // than block long enough for the cloudflared tunnel to cancel the request.
+  // Last-known-good transcript per thread. Live WebSocket events use this only as
+  // a base for app-server live overlays; HTTP transcript reads must still come
+  // from Codex directly so the mobile app never accepts stale data as current.
   const transcriptCache = new Map<string, ThreadTranscript>();
   const handoffPackages = new Map<string, HandoffPackage>();
   // Maps threadId → workspace path on disk. Populated whenever we list threads or start
@@ -1357,6 +1359,13 @@ function createApp(
     return visibleTranscript;
   };
 
+  const codexPendingRequestsForThread = (threadId: string): PendingApprovalRequest[] => {
+    if (!options.mirror?.isConnected() || !options.mirror.isThreadWaitingForApproval?.(threadId)) {
+      return [];
+    }
+    return options.mirror.getPendingApprovalRequests?.(threadId) ?? [];
+  };
+
   const pendingRequestsForThread = (threadId: string): PendingApprovalRequest[] => {
     if (isClaudeThreadId(threadId)) {
       return options.claudeCode?.getPendingApprovalRequests?.(threadId) ?? [];
@@ -1364,10 +1373,7 @@ function createApp(
     if (isCopilotThreadId(threadId)) {
       return options.copilot?.getPendingApprovalRequests?.(threadId) ?? [];
     }
-    return mergePendingApprovalRequests(
-      options.appServer?.getPendingApprovalRequests?.(threadId) ?? [],
-      options.mirror?.getPendingApprovalRequests?.(threadId) ?? []
-    );
+    return codexPendingRequestsForThread(threadId);
   };
 
   app.use('*', async (context, next) => {
@@ -1650,6 +1656,7 @@ function createApp(
     const remoteAccess = options.remoteAccess?.getStatus() ?? currentSettings.remoteAccess;
     currentSettings = {
       ...currentSettings,
+      appearance: normalizeAppearanceSettings(currentSettings.appearance),
       remoteAccess
     };
 
@@ -1799,6 +1806,43 @@ function createApp(
     currentSettings = nextSettings;
     await options.settingsStore.save(nextSettings);
     return context.json({ ok: true, settings: nextSettings });
+  });
+
+  app.post('/settings/appearance', async (context) => {
+    if (!isAdminRequest(context.req.raw, options.adminAuth)) {
+      return adminForbidden(context);
+    }
+
+    const parsed = AppearanceSettingsUpdateRequestSchema.parse(
+      await context.req.json().catch(() => ({}))
+    );
+    const currentAppearance = normalizeAppearanceSettings(currentSettings.appearance);
+    const codexThemes: AppearanceSettings['codexThemes'] = {
+      ...currentAppearance.codexThemes
+    };
+
+    if (parsed.clearVariant) {
+      delete codexThemes[parsed.clearVariant];
+    }
+    if (parsed.codexTheme) {
+      codexThemes[parsed.codexTheme.variant] = {
+        ...parsed.codexTheme,
+        importedAt: parsed.codexTheme.importedAt ?? new Date().toISOString()
+      };
+    }
+
+    const appearance = AppearanceSettingsSchema.parse({
+      ...currentAppearance,
+      ...(parsed.themePreference ? { themePreference: parsed.themePreference } : {}),
+      codexThemes
+    });
+    const nextSettings: HelperSettings = {
+      ...currentSettings,
+      appearance
+    };
+    currentSettings = nextSettings;
+    await options.settingsStore.save(nextSettings);
+    return context.json({ ok: true, appearance });
   });
 
   app.post('/settings/device/revoke', async (context) => {
@@ -2303,11 +2347,6 @@ function createApp(
 
     await settleWithin(ensureAppServerLiveSubscription(threadId), 750);
 
-    // Race the live transcript read against a short timeout. When Codex's app-server is
-    // healthy this resolves in milliseconds; when it's degraded (mcp transport flapping,
-    // chatgpt.com 503ing) it can hang for tens of seconds. Rather than block long enough
-    // for cloudflared to cancel the stream, fall back to the last-known-good transcript
-    // cached either by an earlier successful fetch or the background poller.
     const TRANSCRIPT_READ_TIMEOUT_MS = 5_000;
     const liveResult = await settleWithin(
       options.appServer.readTranscript(threadId).catch(() => undefined),
@@ -2315,12 +2354,8 @@ function createApp(
     );
 
     let transcript: ThreadTranscript | undefined;
-    let stale = false;
     if (liveResult.ok && liveResult.value) {
       transcript = liveResult.value;
-    } else {
-      transcript = transcriptCache.get(threadId);
-      stale = true;
     }
 
     if (!transcript) {
@@ -2336,11 +2371,6 @@ function createApp(
         ? await options.usageProvider(threadId).catch(() => undefined)
         : undefined;
       hub.broadcast({ type: 'health/changed', payload: healthPayload(options, startedAt) });
-      if (stale) {
-        // Hint to the client that the body is from cache. Headers stay out of the zod
-        // schema so we don't have to thread a flag through every transcript shape.
-        context.header('X-Transcript-Stale', '1');
-      }
       const visibleTranscript = presentTranscriptForView(
         transformTranscript(
           limitTranscriptMessages(transcript, messageLimit),
@@ -2691,15 +2721,6 @@ function createApp(
       }
 
       await options.appServer?.ensureConnected?.().catch(() => undefined);
-      const mirrorReady = options.mirror?.isConnected() === true;
-      const appServerReady =
-        options.appServer?.isConnected() === true && typeof options.appServer.sendMessage === 'function';
-      if (!mirrorReady && !appServerReady) {
-        return context.json(
-          { error: 'Codex desktop is not connected. Open Codex on this Mac to send.' },
-          503
-        );
-      }
       await registerKnownSharedCodexChatThread(threadId);
 
       // Slash commands the Codex desktop intercepts client-side. Sending the
@@ -2749,9 +2770,18 @@ function createApp(
         }
       }
 
-      // Prefer the desktop IPC path for existing Codex threads so remote sends
-      // show up in the real Codex window. If that bridge cannot deliver, fall
-      // back to the app-server path so tablet/remote sends still work.
+      const mirrorReady = options.mirror?.isConnected() === true && typeof options.mirror?.sendMessage === 'function';
+      if (!mirrorReady) {
+        return context.json(
+          { error: 'Codex desktop IPC is not connected. Open Codex on this Mac to send.' },
+          503
+        );
+      }
+
+      // Codex sends must go through the desktop IPC path so the real Codex
+      // window owns the turn and plan-mode state. Do not fall back to the
+      // app-server transcript path, because that creates a helper-only turn
+      // that the desktop app never sees.
       const override = pendingModelOverrides.get(threadId);
       const cwdForPermissionMode = parsed.permissionMode
         ? threadCwdByThreadId.get(threadId)
@@ -2773,7 +2803,6 @@ function createApp(
                 : {})
             }
           : undefined;
-      let result: ThreadMessageResponse;
       const sendWithMirror = (
         allowOpen: boolean,
         openThreadOptions?: Parameters<ThreadOpener['openThread']>[1]
@@ -2786,26 +2815,7 @@ function createApp(
           { allowOpen, openThreadOptions }
         );
 
-      if (mirrorReady) {
-        try {
-          result = ThreadMessageResponseSchema.parse(await sendWithMirror(true, {}));
-        } catch (error) {
-          if (!appServerReady || !options.appServer?.sendMessage) {
-            throw error;
-          }
-          console.warn('[send] IPC mirror could not deliver thread send; falling back to app-server', {
-            threadId,
-            reason: error instanceof SendBlockedError ? error.reason : String(error)
-          });
-          result = ThreadMessageResponseSchema.parse(
-            await options.appServer.sendMessage(threadId, textToSend, mirrorSendOptions)
-          );
-        }
-      } else {
-        result = ThreadMessageResponseSchema.parse(
-          await options.appServer!.sendMessage(threadId, textToSend, mirrorSendOptions)
-        );
-      }
+      const result = ThreadMessageResponseSchema.parse(await sendWithMirror(true, {}));
 
       rememberAgentPulseTurn(threadId, result.turnId, result.mode);
 
@@ -3317,29 +3327,16 @@ function createApp(
         return context.json({ error: `Could not record Copilot approval: ${detail}` }, 503);
       }
     }
-    const appServer = options.appServer;
-    const appServerPending = appServer?.getPendingApprovalRequests?.(threadId) ?? [];
-    if (
-      appServerPending.some((request) => request.id === requestId && request.method === parsed.method)
-    ) {
-      if (!appServer?.respondToApproval || !appServer.isConnected()) {
-        return context.json(
-          { error: 'Codex app-server is not available to respond to this approval.' },
-          503
-        );
-      }
-      try {
-        await appServer.respondToApproval(threadId, requestId, parsed.method, parsed.decision);
-        return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        return context.json({ error: `Could not record approval: ${detail}` }, 503);
-      }
-    }
     if (!options.mirror?.respondToApproval || !options.mirror.isConnected()) {
       return context.json(
         { error: 'Codex desktop IPC is not available to respond to approvals.' },
         503
+      );
+    }
+    if (!codexPendingRequestsForThread(threadId).some((request) => request.id === requestId && request.method === parsed.method)) {
+      return context.json(
+        { error: 'This Codex approval request is not pending for this thread anymore.' },
+        409
       );
     }
     try {
@@ -3353,7 +3350,8 @@ function createApp(
           ),
         options.opener,
         threadId,
-        options.mirror
+        options.mirror,
+        { openBeforeApply: false }
       );
       return context.json(ApprovalDecisionResponseSchema.parse({ ok: true }));
     } catch (error) {
@@ -3515,8 +3513,8 @@ function createApp(
   }
 
   const transformTranscript = (transcript: ThreadTranscript, threadId: string): ThreadTranscript => {
-    // The poller hands us a fresh transcript on every successful reconcile — cache it so
-    // the HTTP fallback path always has a recent copy to serve when a live read times out.
+    // Keep a base transcript for live overlays. HTTP transcript reads do not use
+    // this as a fallback, because the phone must not treat old data as current.
     const appServerTranscript =
       options.appServer?.applyLiveState?.(transcript, threadId) ?? transcript;
     const compactionTranscript = applyMirrorCompactionState(
@@ -3782,19 +3780,21 @@ async function runWithFollowerOwnership<T>(
     ownershipTimeoutMs?: number;
     retryDelayMs?: number;
     allowOpen?: boolean;
+    openBeforeApply?: boolean;
     openThreadOptions?: Parameters<ThreadOpener['openThread']>[1];
   } = {}
 ): Promise<T> {
   const ownershipTimeoutMs = options.ownershipTimeoutMs ?? 4_000;
   const retryDelayMs = options.retryDelayMs ?? 800;
   const allowOpen = options.allowOpen ?? true;
+  const openBeforeApply = options.openBeforeApply ?? true;
   const openThreadOptions = options.openThreadOptions ?? { refreshMode: 'mini-window' };
   let openedForOwnership = false;
 
   const owned = mirror?.isThreadOwned?.(threadId);
-  debugLog('[ownership] enter', { threadId, owned, allowOpen });
+  debugLog('[ownership] enter', { threadId, owned, allowOpen, openBeforeApply });
 
-  if (allowOpen && mirror?.isThreadOwned && !owned) {
+  if (allowOpen && openBeforeApply && mirror?.isThreadOwned && !owned) {
     debugLog('[ownership] not owned — opening thread on Mac', { threadId });
     try {
       await opener.openThread(threadId, openThreadOptions);
@@ -5015,37 +5015,16 @@ function applyAppServerLiveThreadStatus(
   mirror: CodexMirrorBridge | undefined,
   liveStatuses?: Map<string, Thread['status']>
 ): Thread {
-  // Self-heal: if our in-memory mirror still believes this thread is waiting
-  // on approval but Codex's authoritative `thread/loaded/list` says the
-  // thread is idle, the resolution notification was missed (typical cause: a
-  // brief IPC disconnect mid-turn or a thread that lost ownership before the
-  // matching "remove approval" patch arrived). Without this, the orphan
-  // approval entry sticks forever and the tablet shows "Codex is waiting for
-  // approval" indefinitely. Clear it before computing the merged status so
-  // the rest of this function — and the broadcast pipeline — sees a clean
-  // slate.
-  const remoteForHeal = liveStatuses?.get(thread.threadId);
-  if (
-    remoteForHeal === 'idle' &&
-    mirror?.isThreadWaitingForApproval?.(thread.threadId) &&
-    mirror?.clearPendingApprovalsForThread
-  ) {
-    mirror.clearPendingApprovalsForThread(thread.threadId);
-  }
-
   // Live notification-derived state from in-memory flags (notifications are
   // pushed in real time and beat the snapshot returned by thread/loaded/list).
-  const mirrorApprovalRequests = mirror?.getPendingApprovalRequests?.(thread.threadId) ?? [];
-  const appServerApprovalRequests = appServer?.getPendingApprovalRequests?.(thread.threadId) ?? [];
+  const mirrorApprovalRequests =
+    mirror?.isConnected() && mirror?.isThreadWaitingForApproval?.(thread.threadId)
+      ? mirror.getPendingApprovalRequests?.(thread.threadId) ?? []
+      : [];
   let inMemoryStatus: Thread['status'] | undefined;
   if (
     mirrorApprovalRequests.length > 0 &&
     mirror?.isThreadWaitingForApproval?.(thread.threadId)
-  ) {
-    inMemoryStatus = 'waiting_approval';
-  } else if (
-    appServerApprovalRequests.length > 0 &&
-    appServer?.isThreadWaitingForApproval?.(thread.threadId)
   ) {
     inMemoryStatus = 'waiting_approval';
   } else if (appServer?.isThreadCompacting?.(thread.threadId)) {
@@ -5062,6 +5041,11 @@ function applyAppServerLiveThreadStatus(
   // notification while disconnected), trust the remote status. This keeps the
   // tablet's working badge correct even after a brief helper reconnect.
   const remote = liveStatuses?.get(thread.threadId);
+  if (remote === 'waiting_approval') {
+    return mirrorApprovalRequests.length > 0
+      ? ThreadSchema.parse({ ...thread, status: remote })
+      : thread;
+  }
   if (remote && remote !== 'idle' && remote !== 'unknown') {
     return ThreadSchema.parse({ ...thread, status: remote });
   }
@@ -5175,20 +5159,6 @@ function watchFinishedMessageSnippet(
   return truncateForSummary(normalized, 120);
 }
 
-function mergePendingApprovalRequests(
-  primary: PendingApprovalRequest[],
-  secondary: PendingApprovalRequest[]
-): PendingApprovalRequest[] {
-  const byKey = new Map<string, PendingApprovalRequest>();
-  for (const request of [...primary, ...secondary]) {
-    const key = `${request.method}:${request.id}`;
-    if (!byKey.has(key)) {
-      byKey.set(key, request);
-    }
-  }
-  return [...byKey.values()];
-}
-
 function buildTouchCommands(hasActiveThread: boolean) {
   return TouchCommandSheetResponseSchema.shape.commands.parse([
     {
@@ -5294,7 +5264,11 @@ function approvalTypeLabel(method: string): string {
 
 function approvalShortReason(request: PendingApprovalRequest): string {
   const params = request.params ?? {};
-  const reason = stringParam(params, 'reason') || stringParam(params, 'title') || stringParam(params, 'question');
+  const reason =
+    stringParam(params, 'reason') ||
+    stringParam(params, 'title') ||
+    stringParam(params, 'question') ||
+    questionSummaryFromParams(params);
   return truncateForSummary(reason || approvalCommandOrFileSummary(request) || approvalTypeLabel(request.method), 180);
 }
 
@@ -5310,6 +5284,26 @@ function approvalCommandOrFileSummary(request: PendingApprovalRequest): string |
     return truncateForSummary(command, 220);
   }
   return stringParam(params, 'path') || stringParam(params, 'filePath') || stringParam(params, 'itemId');
+}
+
+function questionSummaryFromParams(params: Record<string, unknown>): string | undefined {
+  const questions = params.questions;
+  if (!Array.isArray(questions)) {
+    return undefined;
+  }
+
+  for (const rawQuestion of questions) {
+    if (!rawQuestion || typeof rawQuestion !== 'object' || Array.isArray(rawQuestion)) {
+      continue;
+    }
+    const question = rawQuestion as Record<string, unknown>;
+    const summary = stringParam(question, 'question') || stringParam(question, 'label') || stringParam(question, 'header');
+    if (summary) {
+      return summary;
+    }
+  }
+
+  return undefined;
 }
 
 function approvalRiskLevel(request: PendingApprovalRequest): ApprovalInboxItem['riskLevel'] {
@@ -5810,7 +5804,7 @@ function applyMirrorCompactionState(
   }
   const activeTurnId = transcript.activeTurnId ?? `mirror-compaction:${threadId}`;
   const hasCompactionMessage = transcript.messages.some(
-    (message) => message.phase === 'context_compaction'
+    (message) => message.kind === 'compacted' || message.phase === 'context_compaction'
   );
   const messages = hasCompactionMessage
     ? transcript.messages
@@ -5819,7 +5813,7 @@ function applyMirrorCompactionState(
         ChatMessageSchema.parse({
           id: `context-compaction:${activeTurnId}`,
           role: 'activity',
-          kind: 'status',
+          kind: 'compacted',
           phase: 'context_compaction',
           text: 'Automatically compacting context',
           turnId: activeTurnId,

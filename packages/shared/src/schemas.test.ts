@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   ChatMessageSchema,
+  AppearanceSettingsUpdateRequestSchema,
   HelperHealthSchema,
+  ImportedCodexThemeSchema,
   LiveEventSchema,
   PairRequestSchema,
   PairResponseSchema,
@@ -130,6 +132,35 @@ describe('shared schemas', () => {
     expect(settings.status).toBe('off');
     expect(settings.tunnelProtocol).toBe('http2');
     expect(settings.checklist.dependencyInstalled).toBe(false);
+  });
+
+  it('validates imported Codex themes for appearance settings', () => {
+    const importedTheme = ImportedCodexThemeSchema.parse({
+      codeThemeId: 'notion',
+      theme: {
+        accent: '#3183D8',
+        contrast: 45,
+        fonts: { code: null, ui: null },
+        ink: '#37352F',
+        opaqueWindows: true,
+        semanticColors: {
+          diffAdded: '#008000',
+          diffRemoved: '#a31515',
+          skill: '#0000ff'
+        },
+        surface: '#ffffff'
+      },
+      variant: 'light'
+    });
+
+    expect(importedTheme.theme.accent).toBe('#3183d8');
+    expect(importedTheme.variant).toBe('light');
+    expect(
+      AppearanceSettingsUpdateRequestSchema.parse({
+        codexTheme: importedTheme,
+        themePreference: 'light'
+      }).themePreference
+    ).toBe('light');
   });
 
   it('masks tokens without printing the full secret', () => {

@@ -27,6 +27,10 @@ describe('HelperSettingsStore remote access settings', () => {
         hostnameAssigned: false
       }
     });
+    expect(settings.appearance).toEqual({
+      codexThemes: {},
+      themePreference: 'system'
+    });
     expect(settings.remoteAccess.configPath).toContain('cloudflared/config.yml');
     expect(settings.remoteAccess.metricsUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/metrics$/);
   });
@@ -45,13 +49,16 @@ describe('HelperSettingsStore remote access settings', () => {
     expect(settings.port).toBe(54123);
     expect(settings.lanEnabled).toBe(true);
     expect(settings.mobileSendEnabled).toBe(true);
+    expect(settings.appearance?.themePreference).toBe('system');
     expect(settings.remoteAccess.provider).toBe('cloudflare');
     expect(settings.remoteAccess.mode).toBe('quick');
     expect(settings.remoteAccess.enabled).toBe(false);
 
     const saved = JSON.parse(await readFile(settingsPath, 'utf8')) as {
+      appearance?: { themePreference?: string };
       remoteAccess?: { provider?: string };
     };
+    expect(saved.appearance?.themePreference).toBe('system');
     expect(saved.remoteAccess?.provider).toBe('cloudflare');
   });
 

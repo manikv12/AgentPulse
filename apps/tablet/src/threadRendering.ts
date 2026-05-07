@@ -208,7 +208,10 @@ function contextCompactionStatus(
 }
 
 function isContextCompactionMessage(message: ChatMessage): boolean {
-  return message.role === 'activity' && message.phase === 'context_compaction';
+  return (
+    message.role === 'activity' &&
+    (message.kind === 'compacted' || message.phase === 'context_compaction')
+  );
 }
 
 function fileChangesForTurn(
@@ -378,6 +381,12 @@ export function formatWorkLabel(
   if (counts.message > 0) {
     return 'Shared progress';
   }
+  if (counts.status > 0) {
+    const questionSummary = userInputActivitySummary(messages);
+    if (questionSummary) {
+      return questionSummary;
+    }
+  }
 
   return formatActivityDuration(messages, startedAt, endedAt) ?? `Activity`;
 }
@@ -414,6 +423,8 @@ export function classifyWorkMessage(message: ChatMessage): WorkSummaryKind {
       return 'reasoning';
     case 'plan':
       return 'plan';
+    case 'compacted':
+      return 'status';
     case 'status':
       return 'status';
     case 'message':
@@ -517,6 +528,9 @@ function activityTitleForKind(kind: WorkSummaryKind, message: ChatMessage): stri
     case 'search':
       return 'Searched';
     case 'status':
+      if (message.phase === 'user_input') {
+        return message.text.split('\n')[0] || 'Asked question';
+      }
       return message.phase === 'context_compaction' ? 'Compacting context' : 'Status';
     case 'subagent':
       return 'Used subagent';
@@ -525,6 +539,17 @@ function activityTitleForKind(kind: WorkSummaryKind, message: ChatMessage): stri
     default:
       return 'Activity';
   }
+}
+
+function userInputActivitySummary(messages: ChatMessage[]): string | undefined {
+  const userInputMessages = messages.filter((message) => message.phase === 'user_input');
+  if (userInputMessages.length === 0) {
+    return undefined;
+  }
+  if (userInputMessages.length === 1) {
+    return userInputMessages[0]?.text.split('\n')[0] || 'Asked question';
+  }
+  return `Asked ${userInputMessages.length} question groups`;
 }
 
 function summarizeActivityDetail(message: ChatMessage, kind: WorkSummaryKind): string | undefined {

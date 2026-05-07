@@ -46,7 +46,9 @@ import {
   ShieldCheck,
   Sun,
   Tablet,
-  Trash2
+  Trash2,
+  Upload,
+  XCircle
 } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
@@ -100,6 +102,7 @@ import {
   updateThreadGoal,
   stopThreadWork,
   transcribeVoiceAudio,
+  updateAppearanceSettings,
   updateRemoteAccess,
   updateEnabledProviders,
   updateThreadModel,
@@ -110,7 +113,15 @@ import { AppMark } from './AppMark';
 import { Dashboard, type NewThreadTarget } from './Dashboard';
 import { ProviderMark } from './ProviderMark';
 import { providerLabel, providerTone } from './providers';
-import { useThemePreference, type ThemePreference } from './theme';
+import {
+  defaultAppearanceSettings,
+  normalizeAppearanceSettings,
+  parseCodexThemeImport,
+  useThemePreference,
+  type AppearanceSettings,
+  type ImportedCodexTheme,
+  type ThemePreference
+} from './theme';
 
 type AppScreen =
   | 'chooser'
@@ -3508,7 +3519,7 @@ function SettingsScreen({
   const [devices, setDevices] = useState<AdminDevice[]>([]);
   const [selectedPairDeviceId, setSelectedPairDeviceId] = useState('');
   const [devicePins, setDevicePins] = useState<Record<string, AdminPairingPin>>({});
-  const { theme, setTheme } = useThemePreference();
+  const { theme, appearance, setAppearance, setTheme } = useThemePreference();
   const remoteTone = remoteAccess.status === 'healthy' ? 'green' : remoteAccess.enabled ? 'blue' : 'gray';
 
   useEffect(() => {
@@ -3523,6 +3534,7 @@ function SettingsScreen({
         setLanEnabled(Boolean(payload.settings?.lanEnabled));
         setMobileSendEnabled(Boolean(payload.settings?.mobileSendEnabled));
         setEnabledProviders(normalizeEnabledProvidersForUi(payload.settings?.enabledProviders));
+        setAppearance(normalizeAppearanceSettingsForUi(payload.settings?.appearance));
         const nextRemote = payload.settings?.remoteAccess ?? defaultRemoteAccess();
         setRemoteAccess(nextRemote);
         const activeDevices = activeAdminDevices(payload.devices ?? []);
@@ -3597,6 +3609,67 @@ function SettingsScreen({
       setEnabledProviders(normalizeEnabledProvidersForUi(nextSettings.enabledProviders));
     } catch {
       setEnabledProviders(enabledProviders);
+    }
+  };
+
+  const saveThemePreference = async (nextTheme: ThemePreference) => {
+    const previous = appearance;
+    const nextAppearance = { ...appearance, themePreference: nextTheme };
+    setTheme(nextTheme);
+    setAppearance(nextAppearance);
+    try {
+      const saved = await updateAppearanceSettings(adminToken, { themePreference: nextTheme });
+      setAppearance(saved);
+    } catch {
+      setAppearance(previous);
+      setTheme(previous.themePreference);
+    }
+  };
+
+  const saveCodexTheme = async (
+    codexTheme: ImportedCodexTheme,
+    options: { switchToVariant?: boolean } = {}
+  ) => {
+    const previous = appearance;
+    const nextAppearance = {
+      ...appearance,
+      codexThemes: {
+        ...appearance.codexThemes,
+        [codexTheme.variant]: codexTheme
+      }
+    };
+    setAppearance(nextAppearance);
+    if (options.switchToVariant) {
+      setTheme(codexTheme.variant);
+    }
+    try {
+      const saved = await updateAppearanceSettings(adminToken, {
+        codexTheme,
+        ...(options.switchToVariant ? { themePreference: codexTheme.variant } : {})
+      });
+      setAppearance(saved);
+    } catch {
+      setAppearance(previous);
+      if (options.switchToVariant) {
+        setTheme(previous.themePreference);
+      }
+    }
+  };
+
+  const clearCodexTheme = async (variant: ImportedCodexTheme['variant']) => {
+    const previous = appearance;
+    const nextCodexThemes = { ...appearance.codexThemes };
+    delete nextCodexThemes[variant];
+    const nextAppearance = {
+      ...appearance,
+      codexThemes: nextCodexThemes
+    };
+    setAppearance(nextAppearance);
+    try {
+      const saved = await updateAppearanceSettings(adminToken, { clearVariant: variant });
+      setAppearance(saved);
+    } catch {
+      setAppearance(previous);
     }
   };
 
@@ -3793,9 +3866,15 @@ function SettingsScreen({
           <PanelHeading
             icon={<Palette size={22} />}
             title="Appearance"
-            description="Choose the display mode for this device."
+            description="Choose the admin theme and import Codex theme files."
           />
-          <ThemeSegmentedControl theme={theme} onChange={setTheme} />
+          <ThemeSegmentedControl theme={theme} onChange={(next) => void saveThemePreference(next)} />
+          <CodexThemeImporter
+            appearance={appearance}
+            onClear={(variant) => void clearCodexTheme(variant)}
+            onImport={(codexTheme) => void saveCodexTheme(codexTheme, { switchToVariant: true })}
+            onUpdate={(codexTheme) => void saveCodexTheme(codexTheme)}
+          />
         </section>
 
         <ChangePasscodeCard adminToken={adminToken} />
@@ -4212,6 +4291,10 @@ function normalizeEnabledProvidersForUi(input: unknown): AgentProvider[] {
   return uniqueProviders.length > 0 ? uniqueProviders : [...AGENT_PROVIDERS];
 }
 
+function normalizeAppearanceSettingsForUi(input: unknown): AppearanceSettings {
+  return normalizeAppearanceSettings(input ?? defaultAppearanceSettings());
+}
+
 function activeAdminDevices(devices: AdminDevice[]): AdminDevice[] {
   return devices.filter((device) => !device.revokedAt);
 }
@@ -4537,4 +4620,263 @@ function ThemeSegmentedControl({
       })}
     </div>
   );
+}
+
+function CodexThemeImporter({
+  appearance,
+  onClear,
+  onImport,
+  onUpdate
+}: {
+  appearance: AppearanceSettings;
+  onClear: (variant: ImportedCodexTheme['variant']) => void;
+  onImport: (codexTheme: ImportedCodexTheme) => void;
+  onUpdate: (codexTheme: ImportedCodexTheme) => void;
+}) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [themeText, setThemeText] = useState('');
+  const [importError, setImportError] = useState('');
+  const [importStatus, setImportStatus] = useState('');
+
+  const importSource = (source: string, sourceName?: string) => {
+    try {
+      const parsed = parseCodexThemeImport(source, sourceName);
+      setImportError('');
+      setImportStatus(`${variantLabel(parsed.variant)} theme imported`);
+      setThemeText('');
+      onImport(parsed);
+    } catch (error) {
+      setImportStatus('');
+      setImportError(error instanceof Error ? error.message : 'Could not import theme.');
+    }
+  };
+
+  const importFile = async (file: File | undefined) => {
+    if (!file) {
+      return;
+    }
+    importSource(await file.text(), file.name);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  return (
+    <div className="codex-theme-importer">
+      <div className="codex-theme-slots">
+        {(['light', 'dark'] as const).map((variant) => {
+          const imported = appearance.codexThemes[variant];
+          const themeForVariant = imported ?? defaultCodexTheme(variant);
+          return (
+            <div key={variant} className={`codex-theme-slot ${imported ? 'has-theme' : ''}`}>
+              <div className="codex-theme-slot-header">
+                <div className="codex-theme-slot-copy">
+                  <span>{variantLabel(variant)} theme</span>
+                  <small>{imported ? imported.codeThemeId ?? imported.sourceName ?? 'Custom saved colors' : 'Default colors'}</small>
+                </div>
+                <div className="codex-theme-swatch-row" aria-hidden="true">
+                  <span style={{ background: themeForVariant.theme.surface }} />
+                  <span style={{ background: themeForVariant.theme.ink }} />
+                  <span style={{ background: themeForVariant.theme.accent }} />
+                </div>
+                {imported ? (
+                  <button
+                    className="icon-button"
+                    type="button"
+                    title={`Clear ${variantLabel(variant)} theme`}
+                    onClick={() => onClear(variant)}
+                  >
+                    <XCircle size={16} />
+                  </button>
+                ) : null}
+              </div>
+              <ThemeColorEditor
+                theme={themeForVariant}
+                onUpdate={(nextTheme) => {
+                  setImportError('');
+                  setImportStatus(`${variantLabel(nextTheme.variant)} colors saved`);
+                  onUpdate(nextTheme);
+                }}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div className="codex-theme-import-box">
+        <textarea
+          className="codex-theme-input"
+          value={themeText}
+          onChange={(event) => {
+            setImportError('');
+            setImportStatus('');
+            setThemeText(event.target.value);
+          }}
+          placeholder="Paste codex-theme-v1:{...}"
+          spellCheck={false}
+        />
+        <div className="codex-theme-actions">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,.txt,.theme"
+            className="visually-hidden"
+            onChange={(event) => {
+              void importFile(event.currentTarget.files?.[0]);
+            }}
+          />
+          <button
+            className="secondary-action"
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Upload size={16} />
+            File
+          </button>
+          <button
+            className="secondary-action"
+            type="button"
+            disabled={!themeText.trim()}
+            onClick={() => importSource(themeText)}
+          >
+            Paste
+          </button>
+        </div>
+      </div>
+      {importError ? <p className="form-error">{importError}</p> : null}
+      {importStatus ? <p className="simple-copy">{importStatus}</p> : null}
+    </div>
+  );
+}
+
+function variantLabel(variant: ImportedCodexTheme['variant']): string {
+  return variant === 'light' ? 'Light' : 'Dark';
+}
+
+function defaultCodexTheme(variant: ImportedCodexTheme['variant']): ImportedCodexTheme {
+  if (variant === 'dark') {
+    return {
+      codeThemeId: 'github',
+      sourceName: 'Default dark',
+      theme: {
+        accent: '#1f6feb',
+        contrast: 89,
+        fonts: {
+          code: null,
+          ui: 'Inter'
+        },
+        ink: '#e6edf3',
+        opaqueWindows: false,
+        semanticColors: {
+          diffAdded: '#2ea043',
+          diffRemoved: '#f85149',
+          skill: '#58a6ff'
+        },
+        surface: '#0d1117'
+      },
+      variant
+    };
+  }
+
+  return {
+    codeThemeId: 'notion',
+    sourceName: 'Default light',
+    theme: {
+      accent: '#3183d8',
+      contrast: 45,
+      fonts: {
+        code: null,
+        ui: null
+      },
+      ink: '#37352f',
+      opaqueWindows: true,
+      semanticColors: {
+        diffAdded: '#008000',
+        diffRemoved: '#a31515',
+        skill: '#0000ff'
+      },
+      surface: '#ffffff'
+    },
+    variant
+  };
+}
+
+function ThemeColorEditor({
+  theme,
+  onUpdate
+}: {
+  theme: ImportedCodexTheme;
+  onUpdate: (codexTheme: ImportedCodexTheme) => void;
+}) {
+  const updateThemeColor = (field: 'accent' | 'ink' | 'surface', value: string) => {
+    onUpdate({
+      ...theme,
+      sourceName: theme.sourceName ?? theme.codeThemeId ?? `${variantLabel(theme.variant)} custom theme`,
+      theme: {
+        ...theme.theme,
+        [field]: value
+      }
+    });
+  };
+
+  const updateSemanticColor = (
+    field: keyof ImportedCodexTheme['theme']['semanticColors'],
+    value: string
+  ) => {
+    onUpdate({
+      ...theme,
+      sourceName: theme.sourceName ?? theme.codeThemeId ?? `${variantLabel(theme.variant)} custom theme`,
+      theme: {
+        ...theme.theme,
+        semanticColors: {
+          ...theme.theme.semanticColors,
+          [field]: value
+        }
+      }
+    });
+  };
+
+  return (
+    <div className="codex-theme-editor" aria-label={`${variantLabel(theme.variant)} theme colors`}>
+      <ThemeColorField label="Accent" value={theme.theme.accent} onChange={(value) => updateThemeColor('accent', value)} />
+      <ThemeColorField label="Background" value={theme.theme.surface} onChange={(value) => updateThemeColor('surface', value)} />
+      <ThemeColorField label="Foreground" value={theme.theme.ink} onChange={(value) => updateThemeColor('ink', value)} />
+      <ThemeColorField
+        label="Added diff"
+        value={theme.theme.semanticColors.diffAdded ?? '#008000'}
+        onChange={(value) => updateSemanticColor('diffAdded', value)}
+      />
+      <ThemeColorField
+        label="Removed diff"
+        value={theme.theme.semanticColors.diffRemoved ?? '#a31515'}
+        onChange={(value) => updateSemanticColor('diffRemoved', value)}
+      />
+    </div>
+  );
+}
+
+function ThemeColorField({
+  label,
+  value,
+  onChange
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="codex-theme-color-field">
+      <span>{label}</span>
+      <input
+        type="color"
+        value={toColorInputValue(value)}
+        onChange={(event) => onChange(event.currentTarget.value)}
+      />
+      <span className="codex-theme-hex">{toColorInputValue(value).toUpperCase()}</span>
+    </label>
+  );
+}
+
+function toColorInputValue(value: string): string {
+  const withoutAlpha = value.slice(0, 7);
+  return /^#[0-9a-fA-F]{6}$/.test(withoutAlpha) ? withoutAlpha : '#000000';
 }

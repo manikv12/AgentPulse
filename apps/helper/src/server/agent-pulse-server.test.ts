@@ -1209,6 +1209,83 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('saves imported Codex themes in admin appearance settings', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const adminAuth = createAdminAuth();
+    await adminAuth.ensureInitialized();
+    const { token: adminToken } = adminAuth.issueToken();
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: false,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth,
+      threadProvider: { listThreads: async () => [] },
+      opener: createThreadOpener({ execFile: vi.fn((_command, _args, callback) => callback(null)) }),
+      version: '0.1.0'
+    });
+
+    try {
+      const response = await fetch(`${server.url}/settings/appearance`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          codexTheme: {
+            codeThemeId: 'notion',
+            theme: {
+              accent: '#3183d8',
+              contrast: 45,
+              fonts: { code: null, ui: null },
+              ink: '#37352f',
+              opaqueWindows: true,
+              semanticColors: {
+                diffAdded: '#008000',
+                diffRemoved: '#a31515',
+                skill: '#0000ff'
+              },
+              surface: '#ffffff'
+            },
+            variant: 'light'
+          },
+          themePreference: 'light'
+        })
+      });
+
+      expect(response.status).toBe(200);
+      const payload = (await response.json()) as {
+        appearance: {
+          codexThemes: { light?: { codeThemeId?: string } };
+          themePreference: string;
+        };
+      };
+      expect(payload.appearance.themePreference).toBe('light');
+      expect(payload.appearance.codexThemes.light?.codeThemeId).toBe('notion');
+      expect(settingsStore.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appearance: expect.objectContaining({
+            themePreference: 'light'
+          })
+        })
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('ignores spoofed forwarded IP headers on direct admin login attempts', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -2559,7 +2636,13 @@ describe('Agent Pulse helper API', () => {
 
       expect(settingsResponse.status).toBe(200);
       await expect(settingsResponse.json()).resolves.toEqual({
-        settings,
+        settings: {
+          ...settings,
+          appearance: {
+            codexThemes: {},
+            themePreference: 'system'
+          }
+        },
         devices: [
           {
             deviceId: existing.deviceId,
@@ -3187,6 +3270,7 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(),
       getPendingApprovalRequests: (threadId: string) =>
         threadId === 'thread-approval' ? [pendingApproval] : [],
+      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval',
       isThreadOwned: () => true,
       waitForOwnership: async () => true
     };
@@ -3244,7 +3328,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('returns pending approval payloads from the app-server live state', async () => {
+  it('does not expose Codex approval payloads from the app-server live state', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const thread: Thread = {
@@ -3323,14 +3407,14 @@ describe('Agent Pulse helper API', () => {
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({
         threadId: 'thread-app-approval',
-        requests: [pendingApproval]
+        requests: []
       });
     } finally {
       await server.stop();
     }
   });
 
-  it('records approval decisions through the app-server when the request came from app-server', async () => {
+  it('rejects Codex approval decisions when the desktop mirror has no matching request for the thread', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const pendingApproval = {
@@ -3343,13 +3427,12 @@ describe('Agent Pulse helper API', () => {
       },
       turnId: 'turn-7'
     };
-    const pendingApprovals: PendingApprovalRequest[] = [pendingApproval];
     const appServer = {
       isConnected: () => true,
       readTranscript: vi.fn(),
       sendMessage: vi.fn(),
       getPendingApprovalRequests: (threadId: string) =>
-        threadId === 'thread-approval' ? pendingApprovals : [],
+        threadId === 'thread-approval' ? [pendingApproval] : [],
       respondToApproval: vi.fn(async () => undefined)
     };
     const mirror = {
@@ -3357,6 +3440,7 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(),
       respondToApproval: vi.fn(async () => undefined),
       getPendingApprovalRequests: () => [],
+      isThreadWaitingForApproval: () => false,
       isThreadOwned: () => true,
       waitForOwnership: async () => true
     };
@@ -3406,55 +3490,13 @@ describe('Agent Pulse helper API', () => {
         }
       );
 
-      expect(response.status).toBe(200);
-      await expect(response.json()).resolves.toEqual({ ok: true });
-      expect(appServer.respondToApproval).toHaveBeenCalledWith(
-        'thread-approval',
-        '42',
-        'item/tool/requestUserInput',
-        { answers: { answer: { answers: ['Yes'] } } }
-      );
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({
+        error: 'This Codex approval request is not pending for this thread anymore.'
+      });
+      expect(appServer.respondToApproval).not.toHaveBeenCalled();
       expect(mirror.respondToApproval).not.toHaveBeenCalled();
       expect(opener.openThread).not.toHaveBeenCalled();
-
-      const browserApproval = {
-        id: 'browser-use-approval-1',
-        method: 'mcpServer/elicitation/request',
-        params: {
-          threadId: 'thread-approval',
-          turnId: 'turn-8',
-          serverName: 'browser-use',
-          message: 'Allow Browser Use to open a page?'
-        },
-        turnId: 'turn-8'
-      };
-      pendingApprovals.splice(0, pendingApprovals.length, browserApproval);
-      appServer.respondToApproval.mockClear();
-      mirror.respondToApproval.mockClear();
-
-      const browserResponse = await fetch(
-        `${server.url}/threads/thread-approval/approvals/browser-use-approval-1`,
-        {
-          method: 'POST',
-          headers: {
-            ...authHeaders(token, deviceId),
-            'content-type': 'application/json'
-          },
-          body: JSON.stringify({
-            method: 'mcpServer/elicitation/request',
-            decision: { action: 'accept', content: {}, _meta: null }
-          })
-        }
-      );
-
-      expect(browserResponse.status).toBe(200);
-      expect(appServer.respondToApproval).toHaveBeenCalledWith(
-        'thread-approval',
-        'browser-use-approval-1',
-        'mcpServer/elicitation/request',
-        { action: 'accept', content: {}, _meta: null }
-      );
-      expect(mirror.respondToApproval).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -3475,6 +3517,11 @@ describe('Agent Pulse helper API', () => {
       isConnected: () => true,
       sendMessage: vi.fn(),
       respondToApproval: vi.fn(async () => undefined),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === 'thread-approval'
+          ? [{ id: 'request-1', method: 'item/fileChange/requestApproval' }]
+          : [],
+      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval',
       isThreadOwned: () => true,
       waitForOwnership: async () => true
     };
@@ -3534,6 +3581,177 @@ describe('Agent Pulse helper API', () => {
       );
       expect(appServer.respondToApproval).not.toHaveBeenCalled();
       expect(opener.openThread).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('submits IPC approval decisions without opening Codex when the mirror can handle it quietly', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      respondToApproval: vi.fn(async () => {
+        throw new Error('app-server should not be used for approval decisions.');
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      respondToApproval: vi.fn(async () => undefined),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === 'thread-approval'
+          ? [{ id: 'request-quiet', method: 'item/commandExecution/requestApproval' }]
+          : [],
+      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval',
+      isThreadOwned: () => false,
+      waitForOwnership: vi.fn(async () => true)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(
+        `${server.url}/threads/thread-approval/approvals/request-quiet`,
+        {
+          method: 'POST',
+          headers: {
+            ...authHeaders(token, deviceId),
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            method: 'item/commandExecution/requestApproval',
+            decision: 'accept'
+          })
+        }
+      );
+
+      expect(response.status).toBe(200);
+      expect(mirror.respondToApproval).toHaveBeenCalledWith(
+        'thread-approval',
+        'request-quiet',
+        'item/commandExecution/requestApproval',
+        'accept'
+      );
+      expect(opener.openThread).not.toHaveBeenCalled();
+      expect(mirror.waitForOwnership).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('opens Codex for IPC approval decisions only after Codex reports the thread is unavailable', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const appServer = {
+      isConnected: () => true,
+      readTranscript: vi.fn(),
+      sendMessage: vi.fn(),
+      respondToApproval: vi.fn(async () => {
+        throw new Error('app-server should not be used for approval decisions.');
+      })
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      respondToApproval: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new SendBlockedError(
+            'thread_unavailable',
+            'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+          )
+        )
+        .mockResolvedValueOnce(undefined),
+      getPendingApprovalRequests: (threadId: string) =>
+        threadId === 'thread-approval'
+          ? [{ id: 'request-retry', method: 'item/fileChange/requestApproval' }]
+          : [],
+      isThreadWaitingForApproval: (threadId: string) => threadId === 'thread-approval',
+      isThreadOwned: () => false,
+      waitForOwnership: vi.fn(async () => true)
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const response = await fetch(
+        `${server.url}/threads/thread-approval/approvals/request-retry`,
+        {
+          method: 'POST',
+          headers: {
+            ...authHeaders(token, deviceId),
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({
+            method: 'item/fileChange/requestApproval',
+            decision: 'accept'
+          })
+        }
+      );
+
+      expect(response.status).toBe(200);
+      expect(mirror.respondToApproval).toHaveBeenCalledTimes(2);
+      expect(opener.openThread).toHaveBeenCalledWith('thread-approval', {
+        refreshMode: 'mini-window'
+      });
+      expect(mirror.waitForOwnership).toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -3930,7 +4148,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('falls back to app-server after a normal desktop focus send fails', async () => {
+  it('returns the IPC send failure instead of falling back to app-server', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -4000,20 +4218,24 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ text: 'Hello from phone.' })
       });
 
-      expect(sendResponse.status).toBe(200);
+      expect(sendResponse.status).toBe(409);
+      await expect(sendResponse.json()).resolves.toMatchObject({
+        reason: 'thread_unavailable',
+        error: expect.stringContaining('not currently focused')
+      });
       expect(opener.openThread).toHaveBeenCalledWith('thread-1', {});
       expect(opener.openThread).toHaveBeenCalledTimes(1);
       expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(1, 'thread-1', 4_000);
       expect(mirror.waitForOwnership).toHaveBeenNthCalledWith(2, 'thread-1', 2_000);
       expect(mirror.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
       expect(mirror.sendMessage).toHaveBeenCalledTimes(2);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', undefined);
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
   });
 
-  it('uses app-server send when Codex desktop never owns the thread', async () => {
+  it('returns the IPC ownership failure when Codex desktop never owns the thread', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -4083,15 +4305,10 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ text: 'Hello from phone.', collaborationMode: 'plan' })
       });
 
-      expect(sendResponse.status).toBe(200);
-      await expect(sendResponse.json()).resolves.toEqual({
-        ok: true,
-        mode: 'start',
-        turnId: 'app-server-turn-1',
-        transcript: {
-          ...transcript,
-          provider: 'codex'
-        }
+      expect(sendResponse.status).toBe(409);
+      await expect(sendResponse.json()).resolves.toMatchObject({
+        reason: 'thread_unavailable',
+        error: expect.stringContaining('not currently focused')
       });
       expect(opener.openThread).toHaveBeenCalledWith('thread-1', {});
       expect(opener.openThread).toHaveBeenCalledTimes(1);
@@ -4101,9 +4318,7 @@ describe('Agent Pulse helper API', () => {
         collaborationMode: 'plan'
       });
       expect(mirror.sendMessage).toHaveBeenCalledTimes(2);
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hello from phone.', {
-        collaborationMode: 'plan'
-      });
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -4738,7 +4953,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('uses app-server fallback when the IPC mirror is not connected', async () => {
+  it('rejects Codex sends when the IPC mirror is not connected', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const transcript: ThreadTranscript = {
@@ -4753,7 +4968,7 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(async () => ({
         ok: true as const,
         mode: 'start' as const,
-        turnId: 'fallback-turn-1',
+        turnId: 'private-app-server-turn-1',
         transcript
       }))
     };
@@ -4801,14 +5016,12 @@ describe('Agent Pulse helper API', () => {
         body: JSON.stringify({ text: 'Hi.' })
       });
 
-      expect(sendResponse.status).toBe(200);
+      expect(sendResponse.status).toBe(503);
       await expect(sendResponse.json()).resolves.toMatchObject({
-        ok: true,
-        mode: 'start',
-        turnId: 'fallback-turn-1'
+        error: expect.stringContaining('Codex desktop IPC is not connected')
       });
       expect(mirror.sendMessage).not.toHaveBeenCalled();
-      expect(appServer.sendMessage).toHaveBeenCalledWith('thread-1', 'Hi.', undefined);
+      expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
@@ -6148,7 +6361,8 @@ describe('Agent Pulse helper API', () => {
       isConnected: () => true,
       sendMessage: vi.fn(),
       getPendingApprovalRequests: (threadId: string) =>
-        threadId === thread.threadId ? [pendingApproval] : []
+        threadId === thread.threadId ? [pendingApproval] : [],
+      isThreadWaitingForApproval: (threadId: string) => threadId === thread.threadId
     };
     const watchPushDelivery = {
       send: vi.fn(async () => undefined)
