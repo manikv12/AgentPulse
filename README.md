@@ -97,10 +97,83 @@ You need:
 
 - a Mac or Windows PC running the helper
 - at least one supported local provider, such as Codex, Claude Code, or GitHub Copilot
-- `pnpm` for local development
+- Node.js `22` or newer for the npm release package
+- `pnpm` for local development from source
 - an iPad, Android tablet, phone, or browser-capable display for local or remote access
 
 The client is just a web app. The helper uses platform-specific storage for pairing and settings. Some provider actions still depend on what the local provider supports on that operating system.
+
+## Install From GitHub Release
+
+Use this path if you just want to run Agent Pulse, especially on Windows. You do not need to clone the repo or install `pnpm`.
+
+Install Node.js `22` or newer first:
+
+- Windows: install Node.js from [nodejs.org](https://nodejs.org/), then open PowerShell.
+- macOS: install Node.js from [nodejs.org](https://nodejs.org/) or your usual package manager, then open Terminal.
+
+Then install the Agent Pulse helper package from the GitHub Release:
+
+```bash
+npm install -g https://github.com/manikv12/AgentPulse/releases/download/v0.1.0/agent-pulse-helper-0.1.0.tgz
+```
+
+Start the helper:
+
+```bash
+agent-pulse
+```
+
+The helper prints a local settings URL, for example:
+
+```text
+Agent Pulse helper running at http://127.0.0.1:58445
+Open settings at http://127.0.0.1:58445/#/settings
+```
+
+Open that settings URL in a browser on the helper computer. From there you can pair a phone, tablet, or another browser.
+
+### Windows Notes
+
+On Windows, run the commands in PowerShell:
+
+```powershell
+npm install -g https://github.com/manikv12/AgentPulse/releases/download/v0.1.0/agent-pulse-helper-0.1.0.tgz
+agent-pulse
+```
+
+Agent Pulse stores its Windows helper data here:
+
+```text
+%APPDATA%\Agent Pulse
+```
+
+That folder contains settings, pairing records, and the `helper.lock` file used to prevent multiple helper instances.
+
+If you start `agent-pulse` twice, the second copy should exit with a message like:
+
+```text
+Another Agent Pulse helper is already running (pid 1234).
+```
+
+Provider-specific tools must also be installed on Windows. For example, Codex control needs `codex.cmd` available in the Windows `PATH`. If Codex is not installed, Agent Pulse can still start, but Codex-specific controls will show as unavailable or disconnected.
+
+### macOS Notes
+
+On macOS, the same npm command works:
+
+```bash
+npm install -g https://github.com/manikv12/AgentPulse/releases/download/v0.1.0/agent-pulse-helper-0.1.0.tgz
+agent-pulse
+```
+
+Agent Pulse stores its macOS helper data here:
+
+```text
+~/Library/Application Support/Agent Pulse
+```
+
+On macOS, paired device records use Keychain. On Windows, paired device records use `devices.json` in `%APPDATA%\Agent Pulse`.
 
 ## Repository Layout
 
@@ -164,7 +237,7 @@ The package is written to:
 dist/release/agent-pulse-helper-0.1.0.tgz
 ```
 
-Users can install that release artifact with npm:
+After uploading the tarball to a GitHub Release, users can install it with npm:
 
 ```bash
 npm install -g https://github.com/manikv12/AgentPulse/releases/download/v0.1.0/agent-pulse-helper-0.1.0.tgz
