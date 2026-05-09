@@ -473,7 +473,7 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
       turnId: typeof params.turnId === 'string' ? params.turnId : undefined,
       // Pass the raw params through so the renderer can show answer options
       // (options + freeform fallback) — without this the tablet just shows
-      // "Open Codex on this computer to answer." with no way to respond.
+      // "Open Codex on the helper computer to answer." with no way to respond.
       params: req.params as Record<string, unknown> | undefined
     };
   }

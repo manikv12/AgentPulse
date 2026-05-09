@@ -1,3 +1,4 @@
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { agentPulseDataDir, displayPath } from './paths';
@@ -26,7 +27,7 @@ describe('platform paths', () => {
   });
 
   it('shortens home paths for user-facing messages', () => {
-    const home = process.env.HOME;
+    const home = homedir();
     if (!home) {
       return;
     }

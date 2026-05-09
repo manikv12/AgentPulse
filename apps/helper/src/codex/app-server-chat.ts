@@ -421,7 +421,7 @@ export class CodexAppServerChat {
     if (!this.transport.isConnected()) {
       throw new SendBlockedError(
         'thread_unavailable',
-        'Codex app-server is not connected. Open Codex on this computer to use voice transcription.'
+        'Codex app-server is not connected. Open Codex on the helper computer to use voice transcription.'
       );
     }
 
@@ -2801,7 +2801,7 @@ function sendStateForThread(thread: AppServerThread, activeTurn: AppServerTurn |
       return {
         canSend: false,
         reason: 'waiting_on_user_input',
-        label: 'Codex needs input on this computer.'
+        label: 'Codex needs input on the helper computer.'
       };
     }
 
