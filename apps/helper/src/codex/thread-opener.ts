@@ -161,7 +161,7 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
                 ? fallbackError.message
                 : scriptError instanceof Error
                   ? scriptError.message
-                  : 'Could not refresh Codex on this computer.'
+                  : 'Could not refresh Codex on the helper computer.'
           };
         }
       }
@@ -345,7 +345,7 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
           error:
             fallbackError instanceof Error
               ? fallbackError.message
-              : 'Could not open Codex on this computer.'
+              : 'Could not open Codex on the helper computer.'
         };
       }
     }

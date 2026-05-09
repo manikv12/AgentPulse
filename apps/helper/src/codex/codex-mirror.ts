@@ -514,7 +514,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     if (!ipc.isReady()) {
       throw new SendBlockedError(
         'thread_unavailable',
-        'Not connected to the Codex app — open Codex on this computer to mirror messages.'
+        'Not connected to the Codex app — open Codex on the helper computer to mirror messages.'
       );
     }
     try {
@@ -524,7 +524,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       if (THREAD_UNAVAILABLE_ERROR_MARKERS.some((marker) => message.includes(marker))) {
         throw new SendBlockedError(
           'thread_unavailable',
-          'Codex could not deliver the request — the thread is not currently focused on this computer. Try again in a moment.'
+          'Codex could not deliver the request — the thread is not currently focused on the helper computer. Try again in a moment.'
         );
       }
       if (message.includes('timeout') || message.includes('request-timeout')) {
@@ -612,7 +612,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     if (!ipc.isReady()) {
       throw new SendBlockedError(
         'thread_unavailable',
-        'Not connected to the Codex app — open Codex on this computer to mirror messages.'
+        'Not connected to the Codex app — open Codex on the helper computer to mirror messages.'
       );
     }
 
@@ -788,7 +788,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
       if (THREAD_UNAVAILABLE_ERROR_MARKERS.some((marker) => message.includes(marker))) {
         throw new SendBlockedError(
           'thread_unavailable',
-          'Codex Desktop has the apply-patch command, but this app build does not expose it to Agent Pulse yet. Open Codex on this computer to use Undo/Reapply for now.'
+          'Codex Desktop has the apply-patch command, but this app build does not expose it to Agent Pulse yet. Open Codex on the helper computer to use Undo/Reapply for now.'
         );
       }
       throw error;
@@ -810,7 +810,7 @@ export function createCodexMirror(options: CodexMirrorOptions): CodexMirror {
     if (!ipc.isReady()) {
       throw new SendBlockedError(
         'thread_unavailable',
-        'Codex Desktop is not connected. Open Codex on this computer to use voice transcription.'
+        'Codex Desktop is not connected. Open Codex on the helper computer to use voice transcription.'
       );
     }
 
