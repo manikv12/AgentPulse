@@ -131,6 +131,70 @@ describe('Codex App Server same-thread chat', () => {
     ]);
   });
 
+  it('keeps app-server plan updates visible after the turn completes', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+
+    transport.emitNotification({
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-1',
+        turn: turn('turn-1', 'inProgress')
+      }
+    });
+    transport.emitNotification({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        plan: [
+          { step: 'Check the plan UI', status: 'completed' },
+          { step: 'Implement the fix', status: 'in_progress' }
+        ]
+      }
+    });
+    transport.emitNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: turn('turn-1', 'completed')
+      }
+    });
+
+    const visible = chat.applyLiveState(
+      {
+        ...emptyTranscript('thread-1'),
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            kind: 'message',
+            text: 'Please implement this plan.',
+            turnId: 'turn-1',
+            createdAt: '2026-05-07T10:00:00.000Z'
+          },
+          {
+            id: 'assistant-1',
+            role: 'assistant',
+            kind: 'message',
+            text: 'Done.',
+            phase: 'final_answer',
+            turnId: 'turn-1',
+            createdAt: '2026-05-07T10:00:00.000Z'
+          }
+        ]
+      },
+      'thread-1'
+    );
+
+    expect(visible.messages.map((message) => message.id)).toEqual(['user-1', 'plan:turn-1', 'assistant-1']);
+    expect(visible.messages[1]).toMatchObject({
+      role: 'activity',
+      kind: 'plan',
+      text: ['[x] Check the plan UI', '[*] Implement the fix'].join('\n')
+    });
+  });
+
   it('emits app-server thread status changes as tablet live events', () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);
@@ -153,6 +217,48 @@ describe('Codex App Server same-thread chat', () => {
       }
     });
     expect(chat.isThreadStreaming('thread-1')).toBe(true);
+  });
+
+  it('clears stale running state as soon as app-server reports the thread idle', () => {
+    const transport = eventTransport();
+    const chat = new CodexAppServerChat(transport);
+    const liveEvents: unknown[] = [];
+    chat.onLiveEvent((event) => liveEvents.push(event));
+
+    transport.emitNotification({
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-1',
+        turn: turn('turn-1', 'inProgress')
+      }
+    });
+    transport.emitNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: 'thread-1',
+        status: { type: 'idle' }
+      }
+    });
+
+    const visible = chat.applyLiveState(emptyTranscript('thread-1'), 'thread-1');
+
+    expect(chat.isThreadStreaming('thread-1')).toBe(false);
+    expect(visible.activeTurnId).toBeNull();
+    expect(visible.sendState).toMatchObject({
+      canSend: true,
+      reason: 'ready'
+    });
+    expect(liveEvents).toContainEqual({
+      type: 'thread/status/changed',
+      payload: {
+        threadId: 'thread-1',
+        status: 'idle'
+      }
+    });
+    expect(liveEvents).toContainEqual({
+      type: 'thread/streaming-changed',
+      payload: { threadId: 'thread-1', isStreaming: false }
+    });
   });
 
   it('merges app-server token usage updates into live goal progress', () => {
@@ -391,7 +497,7 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
-  it('keeps a thread working when a stale idle status arrives before turn completion', () => {
+  it('clears a thread when app-server idle status arrives before turn completion', () => {
     const transport = eventTransport();
     const chat = new CodexAppServerChat(transport);
     const liveEvents: unknown[] = [];
@@ -412,17 +518,24 @@ describe('Codex App Server same-thread chat', () => {
       }
     });
 
-    expect(chat.isThreadStreaming('thread-1')).toBe(true);
+    expect(chat.isThreadStreaming('thread-1')).toBe(false);
     expect(chat.applyLiveState(emptyTranscript('thread-1'), 'thread-1').sendState).toMatchObject({
-      canSend: false,
-      reason: 'thread_changed',
-      label: 'Codex is working'
+      canSend: true,
+      reason: 'ready',
+      label: 'Ready'
     });
     expect(liveEvents).toContainEqual({
       type: 'thread/status/changed',
       payload: {
         threadId: 'thread-1',
-        status: 'running'
+        status: 'idle'
+      }
+    });
+    expect(liveEvents).toContainEqual({
+      type: 'thread/streaming-changed',
+      payload: {
+        threadId: 'thread-1',
+        isStreaming: false
       }
     });
 

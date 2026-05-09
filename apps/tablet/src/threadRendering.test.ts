@@ -1,6 +1,6 @@
 import type { ChatMessage } from '@agent-pulse/shared';
 import { describe, expect, it } from 'vitest';
-import { buildRenderableEntries } from './threadRendering';
+import { buildRenderableEntries, classifyWorkMessage } from './threadRendering';
 
 const message = (overrides: Partial<ChatMessage> & Pick<ChatMessage, 'id'>): ChatMessage => ({
   role: 'activity',
@@ -11,6 +11,27 @@ const message = (overrides: Partial<ChatMessage> & Pick<ChatMessage, 'id'>): Cha
 });
 
 describe('thread rendering helpers', () => {
+  it('does not treat screenshot-only activity as browser work', () => {
+    expect(
+      classifyWorkMessage(
+        message({
+          id: 'screenshot-tool',
+          kind: 'tool',
+          text: 'Captured screenshot'
+        })
+      )
+    ).toBe('tool');
+    expect(
+      classifyWorkMessage(
+        message({
+          id: 'browser-screenshot-tool',
+          kind: 'tool',
+          text: 'browser.screenshot completed'
+        })
+      )
+    ).toBe('browser');
+  });
+
   it('renders user, collapsed activity summary, then final answer for a completed turn', () => {
     const entries = buildRenderableEntries([
       message({

@@ -442,8 +442,8 @@ export function classifyWorkMessage(message: ChatMessage): WorkSummaryKind {
       }
       if (
         text.includes('browser') ||
+        text.includes('browser-use') ||
         text.includes('playwright') ||
-        text.includes('screenshot') ||
         text.includes('computer_use') ||
         text.includes('computer use')
       ) {

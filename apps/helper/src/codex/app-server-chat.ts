@@ -289,6 +289,7 @@ type AppServerLiveThreadState = {
   isCompacting: boolean;
   pendingRequests: Map<string, PendingApprovalRequest>;
   liveMessages: Map<string, ChatMessage>;
+  retainedPlanMessages: Map<string, ChatMessage>;
   goal?: ThreadGoal | null;
   usage?: ThreadUsage;
   tokenUsageTotal?: number;
@@ -796,23 +797,27 @@ export class CodexAppServerChat {
     }
 
     const transcriptWithProgress = transcriptWithLiveProgress(transcript, state);
+    const transcriptWithPlans = transcriptWithRetainedPlanMessages(
+      transcriptWithProgress,
+      state.retainedPlanMessages
+    );
     const syntheticTurnId = state.activeTurnId ?? appServerLiveTurnId(threadId);
-    const existingMessageIds = new Set(transcriptWithProgress.messages.map((message) => message.id));
+    const existingMessageIds = new Set(transcriptWithPlans.messages.map((message) => message.id));
     const liveMessages = [...state.liveMessages.values()].filter(
       (message) =>
         !existingMessageIds.has(message.id) &&
-        !transcriptConfirmsLiveMessage(message, transcriptWithProgress.messages)
+        !transcriptConfirmsLiveMessage(message, transcriptWithPlans.messages)
     );
     const messages = appendUserInputRequestMessages(
-      [...transcriptWithProgress.messages, ...liveMessages],
+      [...transcriptWithPlans.messages, ...liveMessages],
       [...state.pendingRequests.values()]
     );
 
     if (state.pendingRequests.size > 0) {
       const needsUserInput = [...state.pendingRequests.values()].some(isUserInputRequest);
       return ThreadTranscriptSchema.parse({
-        ...transcriptWithProgress,
-        activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
+        ...transcriptWithPlans,
+        activeTurnId: transcriptWithPlans.activeTurnId ?? syntheticTurnId,
         sendState: {
           canSend: false,
           reason: needsUserInput ? 'waiting_on_user_input' : 'waiting_on_approval',
@@ -824,8 +829,8 @@ export class CodexAppServerChat {
 
     if (state.isCompacting) {
       return ThreadTranscriptSchema.parse({
-        ...transcriptWithProgress,
-        activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
+        ...transcriptWithPlans,
+        activeTurnId: transcriptWithPlans.activeTurnId ?? syntheticTurnId,
         sendState: {
           canSend: false,
           reason: 'compacting_context',
@@ -837,10 +842,10 @@ export class CodexAppServerChat {
 
     if (state.isStreaming) {
       return ThreadTranscriptSchema.parse({
-        ...transcriptWithProgress,
-        activeTurnId: transcriptWithProgress.activeTurnId ?? syntheticTurnId,
-        sendState: transcriptWithProgress.activeTurnId
-          ? transcriptWithProgress.sendState
+        ...transcriptWithPlans,
+        activeTurnId: transcriptWithPlans.activeTurnId ?? syntheticTurnId,
+        sendState: transcriptWithPlans.activeTurnId
+          ? transcriptWithPlans.sendState
           : {
               canSend: false,
               reason: 'thread_changed',
@@ -850,14 +855,14 @@ export class CodexAppServerChat {
       });
     }
 
-    if (messages.length !== transcriptWithProgress.messages.length) {
+    if (messages.length !== transcriptWithPlans.messages.length) {
       return ThreadTranscriptSchema.parse({
-        ...transcriptWithProgress,
+        ...transcriptWithPlans,
         messages
       });
     }
 
-    return transcriptWithProgress;
+    return transcriptWithPlans;
   }
 
   async respondToApproval(
@@ -1271,23 +1276,20 @@ export class CodexAppServerChat {
         }
         state.pendingRequests.clear();
       }
-      // thread/status/changed is the only notification that should toggle isStreaming
-      // off — short-lived events like item/completed and serverRequest/resolved happen
-      // many times inside one turn, and using them to clear isStreaming makes the
-      // tablet's working badge flicker. Any active flag (running, waitingOnApproval,
-      // waitingOnUserInput) keeps the thread in a working state.
-      const shouldKeepActiveTurn = type !== 'active' && state.activeTurnId !== null;
-      state.isStreaming = type === 'active' || shouldKeepActiveTurn;
-      if (type !== 'active' && !shouldKeepActiveTurn) {
+      // thread/status/changed is the authoritative running/idle signal. Do not
+      // keep an old activeTurnId alive after Codex reports a non-active status:
+      // turn/completed can arrive later, and waiting for it leaves the phone
+      // showing "Codex is working" after the desktop has already stopped.
+      state.isStreaming = type === 'active';
+      if (type !== 'active') {
         state.activeTurnId = null;
         state.isCompacting = false;
       }
-      const visibleType = shouldKeepActiveTurn ? 'active' : type;
       this.emitLiveEvent({
         type: 'thread/status/changed',
         payload: {
           threadId,
-          status: mapAppServerStatus({ type: visibleType, activeFlags } as AppServerThreadStatus)
+          status: mapAppServerStatus({ type, activeFlags } as AppServerThreadStatus)
         }
       });
       this.emitThreadStateChanged(threadId);
@@ -1547,18 +1549,17 @@ export class CodexAppServerChat {
 
     state.activeTurnId = turnId;
     state.isStreaming = true;
-    state.liveMessages.set(
-      `plan:${turnId}`,
-      ChatMessageSchema.parse({
-        id: `plan:${turnId}`,
-        role: 'activity',
-        kind: 'plan',
-        text,
-        ...(planItems.length > 0 ? { planItems } : {}),
-        turnId,
-        createdAt: new Date().toISOString()
-      })
-    );
+    const planMessage = ChatMessageSchema.parse({
+      id: `plan:${turnId}`,
+      role: 'activity',
+      kind: 'plan',
+      text,
+      ...(planItems.length > 0 ? { planItems } : {}),
+      turnId,
+      createdAt: new Date().toISOString()
+    });
+    state.liveMessages.set(`plan:${turnId}`, planMessage);
+    state.retainedPlanMessages.set(turnId, planMessage);
     this.emitThreadStateChanged(threadId);
   }
 
@@ -1583,6 +1584,7 @@ export class CodexAppServerChat {
       isCompacting: false,
       pendingRequests: new Map(),
       liveMessages: new Map(),
+      retainedPlanMessages: new Map(),
       lastStreaming: false
     };
     this.liveThreads.set(threadId, created);
@@ -1768,6 +1770,66 @@ function transcriptConfirmsLiveMessage(liveMessage: ChatMessage, transcriptMessa
     const messageCreatedAt = Date.parse(message.createdAt);
     return !Number.isFinite(messageCreatedAt) || messageCreatedAt >= minCreatedAt;
   });
+}
+
+function transcriptWithRetainedPlanMessages(
+  transcript: ThreadTranscript,
+  retainedPlanMessages: Map<string, ChatMessage>
+): ThreadTranscript {
+  const plans = [...retainedPlanMessages.values()]
+    .filter((plan) => !transcriptConfirmsPlanMessage(plan, transcript.messages))
+    .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+  if (plans.length === 0) {
+    return transcript;
+  }
+
+  const messages = [...transcript.messages];
+  for (const plan of plans) {
+    messages.splice(retainedPlanInsertionIndex(messages, plan), 0, plan);
+  }
+  return ThreadTranscriptSchema.parse({
+    ...transcript,
+    messages
+  });
+}
+
+function transcriptConfirmsPlanMessage(plan: ChatMessage, messages: ChatMessage[]): boolean {
+  return messages.some((message) => {
+    if (message.id === plan.id) {
+      return true;
+    }
+    return Boolean(plan.turnId && message.kind === 'plan' && message.turnId === plan.turnId);
+  });
+}
+
+function retainedPlanInsertionIndex(messages: ChatMessage[], plan: ChatMessage): number {
+  if (plan.turnId) {
+    const firstNonUserIndex = messages.findIndex(
+      (message) => message.turnId === plan.turnId && !(message.role === 'user' && message.kind === 'message')
+    );
+    if (firstNonUserIndex >= 0) {
+      return firstNonUserIndex;
+    }
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.turnId === plan.turnId) {
+        return index + 1;
+      }
+    }
+  }
+
+  const planCreatedAt = Date.parse(plan.createdAt);
+  if (Number.isFinite(planCreatedAt)) {
+    const laterMessageIndex = messages.findIndex((message) => {
+      const messageCreatedAt = Date.parse(message.createdAt);
+      return Number.isFinite(messageCreatedAt) && messageCreatedAt > planCreatedAt;
+    });
+    if (laterMessageIndex >= 0) {
+      return laterMessageIndex;
+    }
+  }
+
+  return messages.length;
 }
 
 function userTextInput(text: string, attachments: ChatAttachment[] = []) {

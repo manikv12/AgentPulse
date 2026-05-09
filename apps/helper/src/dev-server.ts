@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { acquireSingleInstanceLock, SINGLE_INSTANCE_LOCK_PATH } from './single-instance';
 import { AdminAuth } from './auth/admin';
 import { KeychainDeviceStore } from './auth/keychain-store';
 import { ClaudeCodeProvider } from './claude/claude-code';
@@ -21,6 +22,18 @@ import { SeenThreadStore } from './server/seen-thread-store';
 import { HelperSettingsStore } from './server/settings';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const singleInstanceLock = await acquireSingleInstanceLock();
+if (!singleInstanceLock.acquired) {
+  console.error(
+    `Another Agent Pulse helper is already running (pid ${singleInstanceLock.existingPid}).`
+  );
+  console.error(
+    `If that is wrong, delete the lock file and try again:\n  ${SINGLE_INSTANCE_LOCK_PATH}`
+  );
+  process.exit(1);
+}
+
 const settingsStore = new HelperSettingsStore();
 const registry = new DeviceRegistry(new KeychainDeviceStore());
 const pairing = new PairingManager(registry);
@@ -132,6 +145,7 @@ process.on('SIGINT', async () => {
   opener.dispose();
   claudeCode.dispose();
   catalog.dispose();
+  await singleInstanceLock.release();
   process.exit(0);
 });
 
@@ -142,5 +156,6 @@ process.on('SIGTERM', async () => {
   opener.dispose();
   claudeCode.dispose();
   catalog.dispose();
+  await singleInstanceLock.release();
   process.exit(0);
 });

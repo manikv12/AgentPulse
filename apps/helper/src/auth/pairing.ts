@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { maskToken } from '@agent-pulse/shared';
+import { maskToken, type PushNotificationPreferences } from '@agent-pulse/shared';
 
 const DEFAULT_PIN_TTL_MS = 5 * 60 * 1000;
 const GLOBAL_PAIRING_LIMIT_KEY = '__global_pairing_failures__';
@@ -16,6 +16,7 @@ export type DeviceRecord = {
   watchPushTokenUpdatedAt?: string;
   watchPushBundleId?: string;
   watchPushEnvironment?: 'sandbox' | 'production';
+  watchPushPreferences?: PushNotificationPreferences;
 };
 
 export type PublicDeviceRecord = Omit<DeviceRecord, 'token'> & {
@@ -131,7 +132,11 @@ export class DeviceRegistry {
   async setWatchPushToken(
     deviceId: string,
     watchPushToken: string | undefined,
-    options: { bundleId?: string; environment?: 'sandbox' | 'production' } = {}
+    options: {
+      bundleId?: string;
+      environment?: 'sandbox' | 'production';
+      preferences?: PushNotificationPreferences;
+    } = {}
   ): Promise<DeviceRecord | undefined> {
     const devices = await this.store.list();
     const device = devices.find((candidate) => candidate.deviceId === deviceId);
@@ -151,13 +156,36 @@ export class DeviceRegistry {
       if (options.environment) {
         next.watchPushEnvironment = options.environment;
       }
+      if (options.preferences) {
+        next.watchPushPreferences = options.preferences;
+      }
     } else {
       delete next.watchPushToken;
       delete next.watchPushTokenUpdatedAt;
       delete next.watchPushBundleId;
       delete next.watchPushEnvironment;
+      delete next.watchPushPreferences;
     }
 
+    await this.store.save(next);
+    return next;
+  }
+
+  async setWatchPushPreferences(
+    deviceId: string,
+    preferences: PushNotificationPreferences
+  ): Promise<DeviceRecord | undefined> {
+    const devices = await this.store.list();
+    const device = devices.find((candidate) => candidate.deviceId === deviceId);
+
+    if (!device || device.revokedAt) {
+      return undefined;
+    }
+
+    const next: DeviceRecord = {
+      ...device,
+      watchPushPreferences: preferences
+    };
     await this.store.save(next);
     return next;
   }

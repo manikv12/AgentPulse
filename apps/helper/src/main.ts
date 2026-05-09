@@ -1,6 +1,7 @@
-import { app, BrowserWindow, Menu, nativeImage, Tray } from 'electron';
+import { app, BrowserWindow, Menu, nativeImage, Tray, dialog } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { acquireSingleInstanceLock, SINGLE_INSTANCE_LOCK_PATH } from './single-instance';
 import { AdminAuth } from './auth/admin';
 import { DeviceRegistry, PairingManager } from './auth/pairing';
 import { KeychainDeviceStore } from './auth/keychain-store';
@@ -23,10 +24,29 @@ import { HelperSettingsStore } from './server/settings';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Refuse to start if another Agent Pulse window is already open. Electron's
+// built-in lock handles two app launches; the file lock below also blocks
+// against a dev-server (`pnpm start`) running in parallel.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  process.exit(0);
+}
+
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let runningServer: RunningAgentPulseServer | undefined;
 let remoteSupervisor: CloudflareTunnelSupervisor | undefined;
+let releaseSingleInstanceLock: (() => Promise<void>) | undefined;
+
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  } else {
+    void createWindow();
+  }
+});
 const advertiser = new BonjourAdvertiser();
 const settingsStore = new HelperSettingsStore();
 const registry = new DeviceRegistry(new KeychainDeviceStore());
@@ -167,6 +187,17 @@ function createTray(): void {
 }
 
 app.whenReady().then(async () => {
+  const lock = await acquireSingleInstanceLock();
+  if (!lock.acquired) {
+    const message =
+      `Another Agent Pulse helper is already running (pid ${lock.existingPid}).\n\n` +
+      `If this is wrong, delete the lock file and try again:\n${SINGLE_INSTANCE_LOCK_PATH}`;
+    console.error(message);
+    dialog.showErrorBox('Agent Pulse already running', message);
+    app.quit();
+    return;
+  }
+  releaseSingleInstanceLock = lock.release;
   createTray();
   await createWindow();
 });
@@ -182,4 +213,5 @@ app.on('before-quit', async () => {
   opener.dispose();
   claudeCode.dispose();
   catalog.dispose();
+  await releaseSingleInstanceLock?.();
 });

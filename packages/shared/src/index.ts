@@ -297,12 +297,37 @@ export const PairLookupResponseSchema = z.object({
 export const WatchPushRegisterRequestSchema = z.object({
   pushToken: z.string().trim().min(8).max(512),
   bundleId: z.string().trim().min(1).max(240).optional(),
-  environment: z.enum(['sandbox', 'production']).optional()
+  environment: z.enum(['sandbox', 'production']).optional(),
+  preferences: z
+    .object({
+      deliveryMode: z.enum(['notifications', 'liveActivity', 'off']).optional(),
+      enabled: z.boolean().default(true),
+      approvals: z.boolean().default(true),
+      completions: z.boolean().default(true),
+      errors: z.boolean().default(true),
+      liveActivities: z.boolean().default(true)
+    })
+    .optional()
 });
 
 export const WatchPushRegisterResponseSchema = z.object({
   ok: z.literal(true)
 });
+
+export const PushNotificationPreferencesSchema = z.object({
+  deliveryMode: z.enum(['notifications', 'liveActivity', 'off']).optional(),
+  enabled: z.boolean().default(true),
+  approvals: z.boolean().default(true),
+  completions: z.boolean().default(true),
+  errors: z.boolean().default(true),
+  liveActivities: z.boolean().default(true)
+});
+
+export const PushNotificationPreferencesUpdateRequestSchema = z.object({
+  preferences: PushNotificationPreferencesSchema
+});
+
+export type PushNotificationPreferences = z.infer<typeof PushNotificationPreferencesSchema>;
 
 export const ThreadOpenRequestSchema = z.object({
   threadId: z.string().min(1),

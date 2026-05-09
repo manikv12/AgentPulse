@@ -571,11 +571,11 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
-/** Stream cancellations with error code 0 (NO_ERROR) are clean client-initiated
- *  aborts (e.g. the browser navigated away before the response finished).
- *  These are normal and should not mark the tunnel as degraded. */
+/** Stream cancellations are clean client-initiated aborts (e.g. the browser or
+ *  phone navigated away before the response finished). These are normal and
+ *  should not mark the tunnel as degraded. */
 function isBenignStreamError(message: string): boolean {
-  return /canceled by remote with error code 0/i.test(message);
+  return /canceled by remote with error code 0|context canceled/i.test(message);
 }
 
 function redactSecrets(value: string): string {

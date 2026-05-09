@@ -42,6 +42,8 @@ import {
   ProjectFilesResponseSchema,
   ProjectListResponseSchema,
   ProjectSchema,
+  PushNotificationPreferencesSchema,
+  PushNotificationPreferencesUpdateRequestSchema,
   RemoteActivityLogEntrySchema,
   RemoteAccessProtocolSchema,
   RemoteAccessSettingsSchema,
@@ -89,6 +91,7 @@ import {
   type LiveEvent,
   type PendingApprovalRequest,
   type Project,
+  type PushNotificationPreferences,
   type RemoteActivityLogEntry,
   type RemoteAccessSettings,
   type RemoteAccessMode,
@@ -161,7 +164,7 @@ const CHATGPT_TRANSCRIPTIONS_URL = 'https://chatgpt.com/backend-api/transcribe';
 const OPENAI_TRANSCRIPTIONS_URL = 'https://api.openai.com/v1/audio/transcriptions';
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
 const WATCH_APNS_JWT_TTL_MS = 50 * 60_000;
-const DEFAULT_WATCH_APNS_TOPIC = 'com.agentpulse.watch';
+const DEFAULT_WATCH_APNS_TOPIC = 'com.developingadventures.agentpulse';
 const DEFAULT_WATCH_APNS_ENVIRONMENT: WatchApnsEnvironment = 'sandbox';
 
 type WatchPushNotification = {
@@ -800,6 +803,28 @@ function createApp(
   const requestIp = (context: Context): string =>
     clientIp(context.req.raw, getConnInfo(context).remote.address, currentSettings);
 
+  const pushPreferencesForDevice = (device: DeviceRecord): PushNotificationPreferences =>
+    PushNotificationPreferencesSchema.parse(device.watchPushPreferences ?? {});
+  const deviceAllowsPushNotification = (
+    device: DeviceRecord,
+    notification: WatchPushNotification
+  ): boolean => {
+    const preferences = pushPreferencesForDevice(device);
+    if (preferences.deliveryMode === 'off' || preferences.deliveryMode === 'liveActivity') {
+      return false;
+    }
+    if (!preferences.enabled) {
+      return false;
+    }
+    if (notification.kind === 'finished') {
+      return preferences.completions;
+    }
+    if (notification.kind === 'errored') {
+      return preferences.errors;
+    }
+    return preferences.approvals;
+  };
+
   const notifyWatchDevices = (input: {
     threadId: string;
     kind: 'finished' | 'errored' | 'attention';
@@ -813,6 +838,9 @@ function createApp(
       .then((devices) => {
         if (devices.length === 0) return;
         for (const device of devices) {
+          if (!deviceAllowsPushNotification(device, input)) {
+            continue;
+          }
           void watchPushDelivery
             .send(device, input)
             .then(() => {
@@ -840,23 +868,48 @@ function createApp(
       .catch(() => undefined);
   };
 
-  const watchFinishedNotification = async (threadId: string): Promise<WatchPushNotification> => {
+  const notificationTranscriptForThread = async (
+    threadId: string,
+    provider: AgentProvider
+  ): Promise<ThreadTranscript | undefined> => {
+    const transcript =
+      provider === 'claude-code'
+        ? await options.claudeCode?.readTranscript(threadId).catch(() => undefined)
+        : provider === 'copilot'
+          ? await options.copilot?.readTranscript(threadId).catch(() => undefined)
+          : await options.appServer?.readTranscript(threadId).catch(() => undefined);
+    return transcript ? transformTranscript(transcript, threadId) : transcriptCache.get(threadId);
+  };
+
+  const watchFinishedNotification = async (
+    threadId: string
+  ): Promise<WatchPushNotification | undefined> => {
     const thread = (await listAllThreads().catch(() => ({ threads: [] as Thread[] }))).threads
       .find((candidate) => candidate.threadId === threadId);
     const provider = thread ? providerForMemoryThread(thread) : providerForThreadId(threadId);
     const providerName = displayNameForProvider(provider);
-    const cachedTranscript = transcriptCache.get(threadId);
-    return buildWatchFinishedNotification(threadId, providerName, thread, cachedTranscript);
+    const transcript = await notificationTranscriptForThread(threadId, provider);
+    return buildWatchFinishedNotification(threadId, providerName, thread, transcript);
   };
 
-  const maybeNotifyWatchOfStatusChange = (threadId: string, nextStatus: Thread['status']): void => {
+  const maybeNotifyWatchOfStatusChange = (
+    threadId: string,
+    nextStatus: Thread['status'],
+    options: { notifyInitial?: boolean } = {}
+  ): void => {
+    const notifyInitial = options.notifyInitial ?? true;
     const previous = lastStatusByThread.get(threadId);
     lastStatusByThread.set(threadId, nextStatus);
     if (previous === nextStatus) return;
+    if (!notifyInitial && previous === undefined) return;
 
     if (nextStatus === 'idle' && (previous === 'running' || previous === 'compacting')) {
       void watchFinishedNotification(threadId)
-        .then((notification) => notifyWatchDevices(notification))
+        .then((notification) => {
+          if (notification) {
+            notifyWatchDevices(notification);
+          }
+        })
         .catch(() =>
           notifyWatchDevices({
             threadId,
@@ -892,16 +945,20 @@ function createApp(
   const maybeNotifyWatchOfStreamingChange = (threadId: string, isStreaming: boolean): void => {
     if (isStreaming) {
       maybeNotifyWatchOfStatusChange(threadId, 'running');
-      return;
     }
-    maybeNotifyWatchOfStatusChange(threadId, 'idle');
   };
 
-  // Intercept every status/streaming broadcast once so the watch-push hook fires
-  // automatically without sprinkling calls at every emit site. Some Codex paths
-  // surface completion as "streaming stopped" before a clean status transition.
+  // Intercept status broadcasts once so the watch/phone push hook fires from
+  // meaningful thread state: active->idle completion, approval/user attention,
+  // and errors. Streaming changes still mark a thread as running, but
+  // streaming=false is too noisy to mean "finished" by itself.
   const originalBroadcast = hub.broadcast.bind(hub);
   hub.broadcast = (event: LiveEvent): void => {
+    if (event.type === 'thread/upsert') {
+      maybeNotifyWatchOfStatusChange(event.payload.threadId, event.payload.status, {
+        notifyInitial: false
+      });
+    }
     if (event.type === 'thread/status/changed') {
       maybeNotifyWatchOfStatusChange(event.payload.threadId, event.payload.status);
     }
@@ -1247,6 +1304,32 @@ function createApp(
       )
     );
   };
+  const overlayLiveStatus = (thread: Thread): Thread => {
+    const provider = providerForThreadId(thread.threadId);
+    if (provider === 'claude-code') {
+      if (options.claudeCode?.isThreadWaitingForApproval?.(thread.threadId)) {
+        return ThreadSchema.parse({ ...thread, status: 'waiting_approval' });
+      }
+      if (options.claudeCode?.isThreadStreaming?.(thread.threadId)) {
+        return ThreadSchema.parse({ ...thread, status: 'running' });
+      }
+      return thread;
+    }
+    if (provider === 'copilot') {
+      if (options.copilot?.isThreadWaitingForApproval?.(thread.threadId)) {
+        return ThreadSchema.parse({ ...thread, status: 'waiting_approval' });
+      }
+      if (options.copilot?.isThreadStreaming?.(thread.threadId)) {
+        return ThreadSchema.parse({ ...thread, status: 'running' });
+      }
+      return thread;
+    }
+    return applyAppServerLiveThreadStatus(thread, options.appServer, options.mirror);
+  };
+  const overlayLiveStatusOnResult = (base: ThreadListResult): ThreadListResult => ({
+    ...base,
+    threads: base.threads.map(overlayLiveStatus)
+  });
   const listThreadsForEndpoint = async (
     groupLimits: Map<string, number>,
     defaultLimit: number
@@ -1262,10 +1345,10 @@ function createApp(
         });
     }
     const result = await settleWithin(threadListEndpointInFlight, LIST_ENDPOINT_TIMEOUT_MS);
-    if (result.ok) {
-      return result.value;
-    }
-    return lastThreadListResult ?? { threads: [], groups: [] };
+    const base = result.ok
+      ? result.value
+      : lastThreadListResult ?? { threads: [], groups: [] };
+    return overlayLiveStatusOnResult(base);
   };
   const listProjectsForEndpoint = async (): Promise<Project[]> => {
     if (!projectListEndpointInFlight) {
@@ -3257,9 +3340,56 @@ function createApp(
     return context.json({ ok: true });
   });
 
-  // Watch APNs registration: stores the watch's APNs device token and routing
-  // metadata against the already-paired DeviceRecord so the helper can deliver
-  // finish / error / attention notifications later.
+  // Phone APNs registration: stores the iPhone APNs token and routing metadata
+  // against the already-paired DeviceRecord. iOS can then mirror those phone
+  // notifications to Apple Watch, so the watch app does not need its own APNs
+  // token or direct helper registration.
+  app.post('/devices/phone-push', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const rawBody = await context.req.json().catch(() => undefined);
+    if (!rawBody) {
+      return context.json({ error: 'Request body required.' }, 400);
+    }
+    const parsed = WatchPushRegisterRequestSchema.parse(rawBody);
+    await options.registry.setWatchPushToken(auth.device.deviceId, parsed.pushToken, {
+      bundleId: parsed.bundleId,
+      environment: parsed.environment,
+      preferences: parsed.preferences ? PushNotificationPreferencesSchema.parse(parsed.preferences) : undefined
+    });
+    return context.json(WatchPushRegisterResponseSchema.parse({ ok: true }));
+  });
+
+  app.post('/devices/phone-push/preferences', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+
+    const rawBody = await context.req.json().catch(() => undefined);
+    if (!rawBody) {
+      return context.json({ error: 'Request body required.' }, 400);
+    }
+    const parsed = PushNotificationPreferencesUpdateRequestSchema.parse(rawBody);
+    await options.registry.setWatchPushPreferences(auth.device.deviceId, parsed.preferences);
+    return context.json(WatchPushRegisterResponseSchema.parse({ ok: true }));
+  });
+
+  app.delete('/devices/phone-push', async (context) => {
+    const auth = await authenticate(context);
+    if (!auth.ok) {
+      return context.json({ error: auth.reason }, auth.reason === 'revoked' ? 403 : 401);
+    }
+    await options.registry.setWatchPushToken(auth.device.deviceId, undefined);
+    return context.json(WatchPushRegisterResponseSchema.parse({ ok: true }));
+  });
+
+  // Backward-compatible route for older watch builds. New phone builds use
+  // /devices/phone-push, but the stored fields stay watchPush* for now to
+  // avoid a storage migration.
   app.post('/devices/watch-push', async (context) => {
     const auth = await authenticate(context);
     if (!auth.ok) {
@@ -4534,6 +4664,9 @@ function selectWatchFinalAssistantMessage(
 }
 
 function transcriptIsLiveForWatch(transcript: ThreadTranscript): boolean {
+  if (transcript.sendState.canSend || transcript.sendState.reason === 'ready') {
+    return false;
+  }
   if (transcript.sendState.reason === 'waiting_on_approval') {
     return true;
   }
@@ -5035,6 +5168,7 @@ function startThreadPolling(
   transformTranscript?: (transcript: ThreadTranscript, threadId: string) => ThreadTranscript
 ) {
   let previous = new Map<string, string>();
+  let previousStatuses = new Map<string, Thread['status']>();
   let inFlight = false;
   let tickCount = 0;
 
@@ -5085,6 +5219,13 @@ function startThreadPolling(
         if (previous.get(thread.threadId) !== next.get(thread.threadId)) {
           hub.broadcast({ type: 'thread/upsert', payload: thread });
         }
+        const previousStatus = previousStatuses.get(thread.threadId);
+        if (previousStatus !== undefined && previousStatus !== thread.status) {
+          hub.broadcast({
+            type: 'thread/status/changed',
+            payload: { threadId: thread.threadId, status: thread.status }
+          });
+        }
         // Push transcripts for any thread we successfully reconciled. This keeps the tablet's
         // last-known-good messages fresh without using app-server status as the live state.
         if (transcript) {
@@ -5099,6 +5240,7 @@ function startThreadPolling(
       }
 
       previous = next;
+      previousStatuses = new Map(reconciled.map(({ thread }) => [thread.threadId, thread.status]));
 
       // Do not prune seen-thread entries from this poll result. The thread list
       // is intentionally filtered/limited for the UI, so a missing id here does
@@ -5285,9 +5427,15 @@ function buildWatchFinishedNotification(
   providerName: string,
   thread: Thread | undefined,
   transcript: ThreadTranscript | undefined
-): WatchPushNotification {
+): WatchPushNotification | undefined {
+  if (!transcript || transcriptIsLiveForWatch(transcript)) {
+    return undefined;
+  }
   const project = watchThreadProjectLabel(thread);
-  const snippet = watchFinishedMessageSnippet(thread, transcript);
+  const snippet = watchFinishedMessageSnippet(transcript);
+  if (!snippet) {
+    return undefined;
+  }
   const body = [project, snippet]
     .filter((part): part is string => Boolean(part))
     .join(': ');
@@ -5315,13 +5463,20 @@ function watchThreadProjectLabel(thread: Thread | undefined): string | undefined
 }
 
 function watchFinishedMessageSnippet(
-  thread: Thread | undefined,
   transcript: ThreadTranscript | undefined
 ): string | undefined {
-  const transcriptMessage = [...(transcript?.messages ?? [])]
+  const latestMessage = [...(transcript?.messages ?? [])]
     .reverse()
-    .find((message) => message.role === 'assistant' && message.kind === 'message' && message.text.trim());
-  const text = transcriptMessage?.text || thread?.lastTurnSummary;
+    .find(
+      (message) =>
+        (message.role === 'assistant' || message.role === 'user') &&
+        message.kind === 'message' &&
+        message.text.trim()
+    );
+  if (!latestMessage || latestMessage.role !== 'assistant') {
+    return undefined;
+  }
+  const text = latestMessage.text;
   const normalized = text?.replace(/\s+/g, ' ').trim();
   if (!normalized || normalized === 'No summary yet.') {
     return undefined;

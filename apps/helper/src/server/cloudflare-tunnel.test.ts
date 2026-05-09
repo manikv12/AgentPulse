@@ -213,6 +213,37 @@ describe('CloudflareTunnelSupervisor', () => {
     });
   });
 
+  it('keeps named tunnels healthy when clients cancel long requests', async () => {
+    const settings = await createSettings({
+      enabled: true,
+      mode: 'named',
+      hostname: 'pulse.example.com',
+      publicUrl: 'https://pulse.example.com',
+      tunnelName: 'agent-pulse',
+      tunnelId: '11111111-2222-3333-4444-555555555555'
+    });
+    const child = createChildProcess();
+    const supervisor = new CloudflareTunnelSupervisor({
+      settings,
+      settingsStore: createSettingsStore(),
+      helperPort: settings.port,
+      execFile: successfulExecFile,
+      spawn: vi.fn(() => child)
+    });
+
+    await supervisor.setEnabled(true);
+    child.stderr.emit(
+      'data',
+      '2026-05-08T18:59:37Z ERR error="Incoming request ended abruptly: context canceled" type=http'
+    );
+    await Promise.resolve();
+
+    expect(supervisor.getStatus()).toMatchObject({
+      status: 'healthy',
+      lastError: ''
+    });
+  });
+
   it('stops the running process without turning the saved remote switch off', async () => {
     const settings = await createSettings({
       enabled: true,
