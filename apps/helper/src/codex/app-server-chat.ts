@@ -421,7 +421,7 @@ export class CodexAppServerChat {
     if (!this.transport.isConnected()) {
       throw new SendBlockedError(
         'thread_unavailable',
-        'Codex app-server is not connected. Open Codex on your Mac to use voice transcription.'
+        'Codex app-server is not connected. Open Codex on this computer to use voice transcription.'
       );
     }
 
@@ -1678,7 +1678,7 @@ function mapAppServerStatus(status: AppServerThreadStatus | undefined): Thread['
       // waiting_approval so the tablet shows the attention badge and disables the
       // composer, matching what sendStateForThread already does for the transcript
       // path. waitingOnUserInput means Codex needs the user to answer something on
-      // the Mac (e.g. an MCP elicitation), waitingOnApproval means it needs an
+      // the helper computer (e.g. an MCP elicitation), waitingOnApproval means it needs an
       // approval click for a tool/file/permission change.
       return status.activeFlags.includes('waitingOnApproval') ||
         status.activeFlags.includes('waitingOnUserInput')
@@ -2793,7 +2793,7 @@ function sendStateForThread(thread: AppServerThread, activeTurn: AppServerTurn |
       return {
         canSend: false,
         reason: 'waiting_on_approval',
-        label: 'Approve on Mac to continue.'
+        label: 'Approve in Codex to continue.'
       };
     }
 
@@ -2801,7 +2801,7 @@ function sendStateForThread(thread: AppServerThread, activeTurn: AppServerTurn |
       return {
         canSend: false,
         reason: 'waiting_on_user_input',
-        label: 'Codex needs input on the Mac.'
+        label: 'Codex needs input on this computer.'
       };
     }
 

@@ -2,7 +2,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireSingleInstanceLock, SINGLE_INSTANCE_LOCK_PATH } from './single-instance';
 import { AdminAuth } from './auth/admin';
-import { KeychainDeviceStore } from './auth/keychain-store';
 import { ClaudeCodeProvider } from './claude/claude-code';
 import { CopilotProvider } from './copilot/copilot';
 import { CodexAppServerChat } from './codex/app-server-chat';
@@ -20,6 +19,7 @@ import { CloudflareTunnelSupervisor } from './server/cloudflare-tunnel';
 import { BonjourAdvertiser } from './server/mdns';
 import { SeenThreadStore } from './server/seen-thread-store';
 import { HelperSettingsStore } from './server/settings';
+import { createDefaultDeviceStore } from './auth/device-store';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,7 +35,7 @@ if (!singleInstanceLock.acquired) {
 }
 
 const settingsStore = new HelperSettingsStore();
-const registry = new DeviceRegistry(new KeychainDeviceStore());
+const registry = new DeviceRegistry(createDefaultDeviceStore());
 const pairing = new PairingManager(registry);
 const adminAuth = new AdminAuth({
   onPasscodeGenerated: (passcode) => {

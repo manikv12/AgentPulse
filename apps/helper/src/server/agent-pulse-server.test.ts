@@ -339,7 +339,7 @@ describe('Agent Pulse helper API', () => {
     const mirrorResolveTranscriptionAuthContext = vi.fn(async () => {
       throw new SendBlockedError(
         'thread_unavailable',
-        'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+        'Codex could not deliver the request — the thread is not currently focused on this computer.'
       );
     });
     const server = await startAgentPulseServer({
@@ -3122,7 +3122,7 @@ describe('Agent Pulse helper API', () => {
         sendState: {
           canSend: false,
           reason: 'mobile_send_disabled',
-          label: 'Mobile sending is off on the Mac.'
+          label: 'Mobile sending is off on this computer.'
         }
       });
 
@@ -3137,7 +3137,7 @@ describe('Agent Pulse helper API', () => {
 
       expect(sendResponse.status).toBe(403);
       await expect(sendResponse.json()).resolves.toEqual({
-        error: 'Mobile sending is off on the Mac.'
+        error: 'Mobile sending is off on this computer.'
       });
       expect(appServer.sendMessage).not.toHaveBeenCalled();
     } finally {
@@ -3946,7 +3946,7 @@ describe('Agent Pulse helper API', () => {
         .mockRejectedValueOnce(
           new SendBlockedError(
             'thread_unavailable',
-            'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+            'Codex could not deliver the request — the thread is not currently focused on this computer.'
           )
         )
         .mockResolvedValueOnce(undefined),
@@ -4430,7 +4430,7 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(async () => {
         throw new SendBlockedError(
           'thread_unavailable',
-          'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+          'Codex could not deliver the request — the thread is not currently focused on this computer.'
         );
       }),
       isThreadOwned: () => false,
@@ -4517,7 +4517,7 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(async () => {
         throw new SendBlockedError(
           'thread_unavailable',
-          'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+          'Codex could not deliver the request — the thread is not currently focused on this computer.'
         );
       }),
       isThreadOwned: () => false,
@@ -4597,7 +4597,7 @@ describe('Agent Pulse helper API', () => {
       sendMessage: vi.fn(async () => {
         throw new SendBlockedError(
           'thread_unavailable',
-          'Codex could not deliver the request — the thread is not currently focused on the Mac.'
+          'Codex could not deliver the request — the thread is not currently focused on this computer.'
         );
       })
     };

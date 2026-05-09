@@ -12,13 +12,7 @@ function helperTarget(): string {
   }
 
   try {
-    const settingsPath = path.join(
-      homedir(),
-      'Library',
-      'Application Support',
-      'Agent Pulse',
-      'settings.json'
-    );
+    const settingsPath = agentPulseSettingsPath();
     const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { port?: unknown };
     if (typeof settings.port === 'number' && Number.isInteger(settings.port) && settings.port > 0) {
       return `http://127.0.0.1:${settings.port}`;
@@ -41,13 +35,7 @@ function remoteAllowedHosts(): string[] {
   }
 
   try {
-    const settingsPath = path.join(
-      homedir(),
-      'Library',
-      'Application Support',
-      'Agent Pulse',
-      'settings.json'
-    );
+    const settingsPath = agentPulseSettingsPath();
     const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as {
       remoteAccess?: { hostname?: unknown; publicUrl?: unknown };
     };
@@ -64,6 +52,20 @@ function remoteAllowedHosts(): string[] {
   }
 
   return [...hosts];
+}
+
+function agentPulseSettingsPath(): string {
+  if (process.platform === 'darwin') {
+    return path.join(homedir(), 'Library', 'Application Support', 'Agent Pulse', 'settings.json');
+  }
+  if (process.platform === 'win32') {
+    return path.join(
+      process.env.APPDATA?.trim() || path.join(homedir(), 'AppData', 'Roaming'),
+      'Agent Pulse',
+      'settings.json'
+    );
+  }
+  return path.join(process.env.XDG_CONFIG_HOME?.trim() || path.join(homedir(), '.config'), 'agent-pulse', 'settings.json');
 }
 
 function remoteHmrConfig():

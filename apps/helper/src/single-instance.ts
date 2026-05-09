@@ -1,15 +1,15 @@
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { readFileSync, unlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { agentPulseDataPath } from './platform/paths';
 
-const LOCK_PATH = path.join(
-  homedir(),
-  'Library',
-  'Application Support',
-  'Agent Pulse',
-  'helper.lock'
-);
+const LOCK_PATH = agentPulseDataPath('helper.lock');
+
+export type SingleInstanceLockOptions = {
+  lockPath?: string;
+  processId?: number;
+  isProcessAlive?: (pid: number) => boolean;
+};
 
 export type SingleInstanceLock = {
   acquired: true;
@@ -24,22 +24,57 @@ export type SingleInstanceConflict = {
 
 export type SingleInstanceResult = SingleInstanceLock | SingleInstanceConflict;
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) {
-    return false;
+export async function acquireSingleInstanceLock(
+  options: SingleInstanceLockOptions = {}
+): Promise<SingleInstanceResult> {
+  const lockPath = options.lockPath ?? LOCK_PATH;
+  const processId = options.processId ?? process.pid;
+  const isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive(processId);
+
+  await mkdir(path.dirname(lockPath), { recursive: true });
+
+  if (await tryWriteExclusive(lockPath, processId)) {
+    return makeAcquired(lockPath, processId);
   }
+
+  const existingPid = await readLockPid(lockPath);
+  if (isProcessAlive(existingPid)) {
+    return { acquired: false, existingPid, lockPath };
+  }
+
+  // Stale lock from a crashed or replaced process - clear and retry once.
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but is owned by a different user.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
+    await unlink(lockPath);
+  } catch {
+    // Someone else may have removed it; the retry below will resolve who wins.
   }
+
+  if (await tryWriteExclusive(lockPath, processId)) {
+    return makeAcquired(lockPath, processId);
+  }
+
+  const racingPid = await readLockPid(lockPath);
+  return { acquired: false, existingPid: racingPid, lockPath };
 }
 
-async function tryWriteExclusive(): Promise<boolean> {
+function defaultIsProcessAlive(currentPid: number): (pid: number) => boolean {
+  return (pid) => {
+    if (!Number.isFinite(pid) || pid <= 0 || pid === currentPid) {
+      return false;
+    }
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      // EPERM means the process exists but is owned by a different user.
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  };
+}
+
+async function tryWriteExclusive(lockPath: string, processId: number): Promise<boolean> {
   try {
-    await writeFile(LOCK_PATH, String(process.pid), { flag: 'wx', encoding: 'utf8' });
+    await writeFile(lockPath, String(processId), { flag: 'wx', encoding: 'utf8' });
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -49,74 +84,49 @@ async function tryWriteExclusive(): Promise<boolean> {
   }
 }
 
-async function readLockPid(): Promise<number> {
+async function readLockPid(lockPath: string): Promise<number> {
   try {
-    const contents = await readFile(LOCK_PATH, 'utf8');
+    const contents = await readFile(lockPath, 'utf8');
     return Number.parseInt(contents.trim(), 10);
   } catch {
     return Number.NaN;
   }
 }
 
-function releaseSync(): void {
+function releaseSync(lockPath: string, processId: number): void {
   try {
-    const contents = readFileSync(LOCK_PATH, 'utf8');
-    if (Number.parseInt(contents.trim(), 10) === process.pid) {
-      unlinkSync(LOCK_PATH);
+    const contents = readFileSync(lockPath, 'utf8');
+    if (Number.parseInt(contents.trim(), 10) === processId) {
+      unlinkSync(lockPath);
     }
   } catch {
-    // Lock already gone or unreadable — nothing to do.
+    // Lock already gone or unreadable - nothing to do.
   }
 }
 
-export async function acquireSingleInstanceLock(): Promise<SingleInstanceResult> {
-  await mkdir(path.dirname(LOCK_PATH), { recursive: true });
-
-  if (await tryWriteExclusive()) {
-    return makeAcquired();
-  }
-
-  const existingPid = await readLockPid();
-  if (isProcessAlive(existingPid)) {
-    return { acquired: false, existingPid, lockPath: LOCK_PATH };
-  }
-
-  // Stale lock from a crashed or replaced process — clear and retry once.
-  try {
-    await unlink(LOCK_PATH);
-  } catch {
-    // Someone else may have removed it; the retry below will resolve who wins.
-  }
-
-  if (await tryWriteExclusive()) {
-    return makeAcquired();
-  }
-
-  const racingPid = await readLockPid();
-  return { acquired: false, existingPid: racingPid, lockPath: LOCK_PATH };
-}
-
-function makeAcquired(): SingleInstanceLock {
+function makeAcquired(lockPath: string, processId: number): SingleInstanceLock {
   let released = false;
+
+  const onExit = (): void => {
+    if (released) return;
+    released = true;
+    releaseSync(lockPath, processId);
+  };
 
   const release = async (): Promise<void> => {
     if (released) return;
     released = true;
+    process.removeListener('exit', onExit);
     try {
-      const contents = await readFile(LOCK_PATH, 'utf8');
-      if (Number.parseInt(contents.trim(), 10) === process.pid) {
-        await unlink(LOCK_PATH);
+      const contents = await readFile(lockPath, 'utf8');
+      if (Number.parseInt(contents.trim(), 10) === processId) {
+        await unlink(lockPath);
       }
     } catch {
       // Already removed.
     }
   };
 
-  const onExit = (): void => {
-    if (released) return;
-    released = true;
-    releaseSync();
-  };
   process.once('exit', onExit);
 
   return { acquired: true, release };

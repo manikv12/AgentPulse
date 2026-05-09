@@ -1,10 +1,10 @@
 import { app, BrowserWindow, Menu, nativeImage, Tray, dialog } from 'electron';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireSingleInstanceLock, SINGLE_INSTANCE_LOCK_PATH } from './single-instance';
 import { AdminAuth } from './auth/admin';
 import { DeviceRegistry, PairingManager } from './auth/pairing';
-import { KeychainDeviceStore } from './auth/keychain-store';
 import { ClaudeCodeProvider } from './claude/claude-code';
 import { CopilotProvider } from './copilot/copilot';
 import { CodexAppServerChat } from './codex/app-server-chat';
@@ -21,6 +21,8 @@ import { CloudflareTunnelSupervisor } from './server/cloudflare-tunnel';
 import { BonjourAdvertiser } from './server/mdns';
 import { SeenThreadStore } from './server/seen-thread-store';
 import { HelperSettingsStore } from './server/settings';
+import { createDefaultDeviceStore } from './auth/device-store';
+import { displayPath } from './platform/paths';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,7 +51,7 @@ app.on('second-instance', () => {
 });
 const advertiser = new BonjourAdvertiser();
 const settingsStore = new HelperSettingsStore();
-const registry = new DeviceRegistry(new KeychainDeviceStore());
+const registry = new DeviceRegistry(createDefaultDeviceStore());
 const pairing = new PairingManager(registry);
 const adminAuth = new AdminAuth({
   onPasscodeGenerated: (passcode) => {
@@ -57,7 +59,7 @@ const adminAuth = new AdminAuth({
     console.log('========================================');
     console.log('Agent Pulse admin passcode (save this):');
     console.log(`  ${passcode}`);
-    console.log('You can also re-read it from ~/Library/Application Support/Agent Pulse/admin.json (hashed only).');
+    console.log(`The hashed copy is saved at ${displayPath(settingsStorePath('admin.json'))}.`);
     console.log('========================================');
     console.log('');
   }
@@ -95,6 +97,10 @@ const mirror = createCodexMirror({ ipc, reader: appServer });
 ipc.connect();
 
 const seenThreadStore = new SeenThreadStore();
+
+function settingsStorePath(fileName: string): string {
+  return path.join(path.dirname(SINGLE_INSTANCE_LOCK_PATH), fileName);
+}
 
 async function startOrRestartServer(): Promise<RunningAgentPulseServer> {
   await seenThreadStore.load().catch(() => undefined);
@@ -166,7 +172,10 @@ async function createWindow(): Promise<void> {
 }
 
 function createTray(): void {
-  const icon = nativeImage.createFromPath('/Applications/Codex.app/Contents/Resources/codexTemplate.png');
+  const iconPath = '/Applications/Codex.app/Contents/Resources/codexTemplate.png';
+  const icon = process.platform === 'darwin' && existsSync(iconPath)
+    ? nativeImage.createFromPath(iconPath)
+    : nativeImage.createEmpty();
   tray = new Tray(icon);
   tray.setToolTip('Agent Pulse');
   tray.setContextMenu(

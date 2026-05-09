@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { codexStderrLinesForLog } from './app-server-client';
+import path from 'node:path';
+import { codexStderrLinesForLog, resolveCodexBinary } from './app-server-client';
 
 describe('Codex App Server stderr logging', () => {
   it('suppresses known noisy Codex warnings in normal logs', () => {
@@ -52,5 +53,52 @@ describe('Codex App Server stderr logging', () => {
     ].join('\n');
 
     expect(codexStderrLinesForLog(authRetryNoise)).toEqual([]);
+  });
+});
+
+describe('resolveCodexBinary', () => {
+  it('uses an explicit binary override first', () => {
+    expect(
+      resolveCodexBinary({
+        codexBinary: 'C:\\Tools\\codex-custom.exe',
+        platform: 'win32',
+        exists: () => false
+      })
+    ).toBe('C:\\Tools\\codex-custom.exe');
+  });
+
+  it('keeps the bundled macOS Codex binary when it exists', () => {
+    expect(
+      resolveCodexBinary({
+        platform: 'darwin',
+        exists: (candidate) => candidate === '/Applications/Codex.app/Contents/Resources/codex',
+        env: { PATH: '' }
+      })
+    ).toBe('/Applications/Codex.app/Contents/Resources/codex');
+  });
+
+  it('checks Windows cmd and exe candidates from PATH', () => {
+    const toolDir = 'C:\\Tools';
+    const npmDir = 'C:\\Users\\me\\AppData\\Roaming\\npm';
+
+    expect(
+      resolveCodexBinary({
+        platform: 'win32',
+        homeDir: 'C:\\Users\\me',
+        env: { PATH: `${toolDir};${npmDir}` },
+        exists: (candidate) => candidate === path.join(toolDir, 'codex.cmd')
+      })
+    ).toBe(path.join(toolDir, 'codex.cmd'));
+  });
+
+  it('falls back to codex.cmd on Windows', () => {
+    expect(
+      resolveCodexBinary({
+        platform: 'win32',
+        homeDir: 'C:\\Users\\me',
+        env: { PATH: '' },
+        exists: () => false
+      })
+    ).toBe('codex.cmd');
   });
 });

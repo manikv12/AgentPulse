@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsup src/main.ts src/dev-server.ts --format esm --platform node --target node22 --out-dir dist --external electron && mkdir -p dist/codex/scripts && cp src/codex/scripts/codex-refresh.applescript dist/codex/scripts/codex-refresh.applescript",
+    "build": "tsup --config tsup.config.ts && node ../../scripts/copy-helper-assets.mjs",
     "start": "node dist/dev-server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

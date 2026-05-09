@@ -660,6 +660,7 @@ export class ClaudeCodeProvider {
       return this.spawnProcess(this.executable, args, {
         cwd,
         env: process.env,
+        shell: process.platform === 'win32',
         stdio: 'pipe'
       }) as ChildProcessWithoutNullStreams;
     } catch (error) {
@@ -1600,9 +1601,20 @@ function resolveClaudeExecutable(): string {
 
 function collectClaudeExecutableCandidates(): string[] {
   const home = homedir();
+  const pathCandidates = (process.env.PATH ?? '')
+    .split(path.delimiter)
+    .filter(Boolean)
+    .flatMap((dir) => [
+      path.join(dir, 'claude'),
+      path.join(dir, 'claude.cmd'),
+      path.join(dir, 'claude.exe')
+    ]);
   return [
+    ...pathCandidates,
     path.join(home, '.local', 'bin', 'claude'),
     path.join(home, '.local', 'share', 'claude', 'latest'),
+    path.join(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
+    path.join(home, 'AppData', 'Roaming', 'npm', 'claude.exe'),
     ...collectClaudeAppCandidates(path.join(home, 'Library', 'Application Support', 'Claude', 'claude-code')),
     ...collectClaudeExtensionCandidates(path.join(home, '.vscode-insiders', 'extensions')),
     ...collectClaudeExtensionCandidates(path.join(home, '.vscode', 'extensions')),

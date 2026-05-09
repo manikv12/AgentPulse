@@ -1008,7 +1008,7 @@ export const ThreadModelUpdateResponseSchema = z.object({
 
 // Map of threadId -> "user last reviewed this at" epoch ms. The helper is the
 // source of truth so the seen state is shared across every device paired with
-// the same Mac.
+// the same helper computer.
 export const SeenThreadActivityMapSchema = z.record(
   z.string().min(1),
   z.number().int().nonnegative()

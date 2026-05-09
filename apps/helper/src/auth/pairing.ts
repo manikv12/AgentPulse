@@ -49,11 +49,10 @@ export type ValidationResult =
   | { ok: true; device: DeviceRecord }
   | { ok: false; reason: 'missing' | 'unknown-device' | 'invalid' | 'revoked' };
 
-// Don't rewrite a device's keychain entry on every authenticated request just
-// to bump lastSeenAt by a few seconds. The previous behaviour churned the
-// keychain hundreds of times per session, multiplying the chance of a
-// delete-then-readd write losing data. One write per minute per device is
-// plenty for "device is alive" telemetry.
+// Don't rewrite a device's persisted entry on every authenticated request just
+// to bump lastSeenAt by a few seconds. One write per minute per device is
+// plenty for "device is alive" telemetry and avoids excess churn in the
+// platform storage backend.
 const LAST_SEEN_THROTTLE_MS = 60 * 1000;
 
 export class DeviceRegistry {
