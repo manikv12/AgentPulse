@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import readline from 'node:readline';
 import { debugEnabled } from '../debug';
 import type { CodexAppServerTransport } from './app-server-chat';
@@ -66,6 +68,14 @@ export type CodexAppServerClientOptions = {
   codexBinary?: string;
   version?: string;
   requestTimeoutMs?: number;
+};
+
+export type ResolveCodexBinaryOptions = {
+  codexBinary?: string;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  exists?: (filePath: string) => boolean;
 };
 
 export class CodexAppServerClient implements CodexAppServerTransport {
@@ -152,13 +162,15 @@ export class CodexAppServerClient implements CodexAppServerTransport {
   }
 
   private async startSubprocess(): Promise<void> {
-    const child = spawn(this.codexBinary(), ['app-server'], {
-      stdio: ['pipe', 'pipe', 'pipe']
+    const codexBinary = this.codexBinary();
+    const child = spawn(codexBinary, ['app-server'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: process.platform === 'win32'
     });
     this.process = child;
     this.stderrRing = '';
     console.warn(
-      `[codex app-server] spawned pid=${child.pid ?? 'unknown'} binary=${this.codexBinary()}`
+      `[codex app-server] spawned pid=${child.pid ?? 'unknown'} binary=${codexBinary}`
     );
     child.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8');
@@ -209,12 +221,7 @@ export class CodexAppServerClient implements CodexAppServerTransport {
   }
 
   private codexBinary(): string {
-    if (this.options.codexBinary) {
-      return this.options.codexBinary;
-    }
-
-    const bundled = '/Applications/Codex.app/Contents/Resources/codex';
-    return existsSync(bundled) ? bundled : 'codex';
+    return resolveCodexBinary({ codexBinary: this.options.codexBinary });
   }
 
   private sendRequest<T>(method: string, params: unknown): Promise<T> {
@@ -356,6 +363,61 @@ export class CodexAppServerClient implements CodexAppServerTransport {
       }
     }
   }
+}
+
+export function resolveCodexBinary(options: ResolveCodexBinaryOptions = {}): string {
+  if (options.codexBinary) {
+    return options.codexBinary;
+  }
+
+  const platform = options.platform ?? process.platform;
+  const exists = options.exists ?? existsSync;
+
+  if (platform === 'darwin') {
+    const bundled = '/Applications/Codex.app/Contents/Resources/codex';
+    if (exists(bundled)) {
+      return bundled;
+    }
+  }
+
+  const env = options.env ?? process.env;
+  const home = options.homeDir ?? homedir();
+  for (const candidate of collectCodexBinaryCandidates({ platform, env, homeDir: home })) {
+    if (exists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return platform === 'win32' ? 'codex.cmd' : 'codex';
+}
+
+function collectCodexBinaryCandidates(options: {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  homeDir: string;
+}): string[] {
+  const pathCandidates = (options.env.PATH ?? '')
+    .split(pathListDelimiter(options.platform))
+    .filter(Boolean)
+    .flatMap((dir) =>
+      options.platform === 'win32'
+        ? [path.join(dir, 'codex.cmd'), path.join(dir, 'codex.exe'), path.join(dir, 'codex')]
+        : [path.join(dir, 'codex')]
+    );
+
+  if (options.platform !== 'win32') {
+    return pathCandidates;
+  }
+
+  return [
+    ...pathCandidates,
+    path.join(options.homeDir, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
+    path.join(options.homeDir, 'AppData', 'Roaming', 'npm', 'codex.exe')
+  ];
+}
+
+function pathListDelimiter(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? ';' : path.delimiter;
 }
 
 export function codexStderrLinesForLog(

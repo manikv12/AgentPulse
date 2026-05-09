@@ -4,6 +4,7 @@ import { homedir, platform } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { ThreadUsageSchema, type ThreadUsage } from '@agent-pulse/shared';
+import { agentPulseDataPath } from '../platform/paths';
 
 const execFileAsync = promisify(execFile);
 
@@ -243,13 +244,7 @@ function candidateConfigRoots(): string[] {
 }
 
 function agentPulseCredentialCachePath(): string {
-  return path.join(
-    homedir(),
-    'Library',
-    'Application Support',
-    'Agent Pulse',
-    'ClaudeCodeOAuthCache.json'
-  );
+  return agentPulseDataPath('ClaudeCodeOAuthCache.json');
 }
 
 async function readCredentialsFile(filePath: string): Promise<ClaudeOAuthCredentials | undefined> {

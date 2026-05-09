@@ -24,10 +24,16 @@ function fakeNow(start = 1_000_000): { now: () => number; advance: (ms: number) 
   };
 }
 
+function createTestThreadOpener(
+  options: Parameters<typeof createThreadOpener>[0] = {}
+): ReturnType<typeof createThreadOpener> {
+  return createThreadOpener({ platform: 'darwin', ...options });
+}
+
 describe('thread opener', () => {
   it('opens the target thread with AppleScript on openThread', async () => {
     const execFile = vi.fn((_command, _args, callback) => callback(null));
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,
@@ -53,7 +59,7 @@ describe('thread opener', () => {
 
   it('opens the target thread with a mini-window refresh when requested', async () => {
     const execFile = vi.fn((_command, _args, callback) => callback(null));
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,
@@ -81,6 +87,39 @@ describe('thread opener', () => {
     opener.dispose();
   });
 
+  it('opens the target thread with the Windows URL handler on Windows', async () => {
+    const execFile = vi.fn((_command, _args, callback) => callback(null));
+    const opener = createTestThreadOpener({
+      execFile,
+      rolloutLookup: stubLookup,
+      watchRollout: stubWatch,
+      platform: 'win32'
+    });
+
+    await expect(opener.openThread('thread-123')).resolves.toEqual({ ok: true });
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cmd.exe',
+      ['/c', 'start', '', 'codex://threads/thread-123'],
+      expect.any(Function)
+    );
+    opener.dispose();
+  });
+
+  it('does not run AppleScript frontmost checks outside macOS', async () => {
+    const execFile = vi.fn((_command, _args, callback) => callback(null));
+    const opener = createTestThreadOpener({
+      execFile,
+      rolloutLookup: stubLookup,
+      watchRollout: stubWatch,
+      platform: 'win32'
+    });
+
+    await expect(opener.isCodexFrontmost?.()).resolves.toBe(false);
+    expect(execFile).not.toHaveBeenCalled();
+    opener.dispose();
+  });
+
   it('finds the AppleScript copied into the built helper dist folder', async () => {
     const tempRoot = await mkdtemp(path.join(tmpdir(), 'agent-pulse-refresh-script-'));
     const distDir = path.join(tempRoot, 'dist');
@@ -101,7 +140,7 @@ describe('thread opener', () => {
       .fn()
       .mockImplementationOnce((_command, _args, callback) => callback(new Error('osascript missing')))
       .mockImplementationOnce((_command, _args, callback) => callback(null));
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,
@@ -125,7 +164,7 @@ describe('thread opener', () => {
       .mockImplementationOnce((_command, _args, callback) => callback(new Error('osascript missing')))
       .mockImplementationOnce((_command, _args, callback) => callback(new Error('bad thread url')))
       .mockImplementationOnce((_command, _args, callback) => callback(null));
-    const opener = createThreadOpener({ execFile, rolloutLookup: stubLookup, watchRollout: stubWatch });
+    const opener = createTestThreadOpener({ execFile, rolloutLookup: stubLookup, watchRollout: stubWatch });
 
     await expect(opener.openThread('thread-123')).resolves.toEqual({ ok: true });
 
@@ -136,7 +175,7 @@ describe('thread opener', () => {
   it('uses the mini-window refresh path for forced desktop remounts', async () => {
     vi.useFakeTimers();
     const execFile = vi.fn((_command, _args, callback) => callback(null));
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,
@@ -185,7 +224,7 @@ describe('thread opener', () => {
       findRolloutPath: vi.fn(async () => '/sessions/rollout-x.jsonl')
     };
     const watchRollout = vi.fn(stubWatch);
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: lookup,
       watchRollout,
@@ -228,7 +267,7 @@ describe('thread opener', () => {
     vi.useFakeTimers();
     const execFile = vi.fn((_command, _args, callback) => callback(null));
     const time = fakeNow();
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,
@@ -266,7 +305,7 @@ describe('thread opener', () => {
       findRolloutPath: vi.fn(async () => '/sessions/rollout-x.jsonl')
     };
     const time = fakeNow();
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: lookup,
       watchRollout,
@@ -307,7 +346,7 @@ describe('thread opener', () => {
     const lookup: RolloutLookup = {
       findRolloutPath: vi.fn(async () => '/sessions/rollout-x.jsonl')
     };
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: lookup,
       watchRollout,
@@ -336,7 +375,7 @@ describe('thread opener', () => {
     vi.useFakeTimers();
     const execFile = vi.fn((_command, _args, callback) => callback(null));
     const time = fakeNow();
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,
@@ -379,7 +418,7 @@ describe('thread opener', () => {
     const lookup: RolloutLookup = {
       findRolloutPath: vi.fn(async () => '/sessions/rollout-live.jsonl')
     };
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: lookup,
       watchRollout,
@@ -424,7 +463,7 @@ describe('thread opener', () => {
   it('dispose cancels any pending refresh', async () => {
     vi.useFakeTimers();
     const execFile = vi.fn((_command, _args, callback) => callback(null));
-    const opener = createThreadOpener({
+    const opener = createTestThreadOpener({
       execFile,
       rolloutLookup: stubLookup,
       watchRollout: stubWatch,

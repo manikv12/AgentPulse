@@ -2435,7 +2435,7 @@ function createApp(
     }
     if (!voiceTranscriptionAvailable(options)) {
       return context.json(
-        { error: 'Codex voice transcription is unavailable. Open Codex on your Mac first.' },
+        { error: 'Codex voice transcription is unavailable. Open Codex on this computer first.' },
         503
       );
     }
@@ -2444,7 +2444,7 @@ function createApp(
       const authProviders = voiceTranscriptionAuthProviders(options);
       if (authProviders.length === 0) {
         return context.json(
-          { error: 'Codex voice transcription is unavailable. Open Codex on your Mac first.' },
+          { error: 'Codex voice transcription is unavailable. Open Codex on this computer first.' },
           503
         );
       }
@@ -2804,7 +2804,7 @@ function createApp(
     }
 
     if (!currentSettings.mobileSendEnabled) {
-      return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
+      return context.json({ error: 'Mobile sending is off on this computer.' }, 403);
     }
 
     const threadId = context.req.param('threadId');
@@ -2838,7 +2838,7 @@ function createApp(
     }
 
     if (!currentSettings.mobileSendEnabled) {
-      return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
+      return context.json({ error: 'Mobile sending is off on this computer.' }, 403);
     }
 
     const threadId = context.req.param('threadId');
@@ -2871,7 +2871,7 @@ function createApp(
     }
 
     if (!currentSettings.mobileSendEnabled) {
-      return context.json({ error: 'Mobile sending is off on the Mac.' }, 403);
+      return context.json({ error: 'Mobile sending is off on this computer.' }, 403);
     }
 
     const parsed = ThreadMessageRequestSchema.parse(await context.req.json());
@@ -3008,7 +3008,7 @@ function createApp(
       const mirrorReady = options.mirror?.isConnected() === true && typeof options.mirror?.sendMessage === 'function';
       if (!mirrorReady) {
         return context.json(
-          { error: 'Codex desktop IPC is not connected. Open Codex on this Mac to send.' },
+          { error: 'Codex desktop IPC is not connected. Open Codex on this computer to send.' },
           503
         );
       }
@@ -3703,12 +3703,12 @@ function createApp(
     // Single source of truth: drive the change through the IPC follower so
     // the desktop window shows the same "GPT-5.5 -> {selected}" model picker
     // animation as Shift+Tab in the local Codex window.
-    // runWithFollowerOwnership opens the thread on the Mac if Codex desktop
+    // runWithFollowerOwnership opens the thread on this computer if Codex desktop
     // doesn't already own it, then waits for the ownership broadcast before
     // sending. Errors propagate as 503 so the tablet's model chip rolls back.
     if (!options.mirror?.setModelAndReasoning || !options.mirror.isConnected()) {
       return context.json(
-        { error: 'Codex desktop is not connected. Open Codex on this Mac to change the model.' },
+        { error: 'Codex desktop is not connected. Open Codex on this computer to change the model.' },
         503
       );
     }
@@ -4062,7 +4062,7 @@ function projectPathPreference(projectPath: string): number {
 // desktop window doesn't currently own the thread, the follower call returns
 // `client-cannot-handle-request` and surfaces here as a SendBlockedError with
 // reason 'thread_unavailable'. Wrap the apply call in this helper to:
-//   1. Open the thread on the Mac if it isn't owned, so the desktop window
+//   1. Open the thread on this computer if it isn't owned, so the desktop window
 //      becomes the owner.
 //   2. Wait up to ownershipTimeoutMs for the matching `thread-stream-state-changed`
 //      broadcast confirming ownership.
@@ -4093,7 +4093,7 @@ async function runWithFollowerOwnership<T>(
   debugLog('[ownership] enter', { threadId, owned, allowOpen, openBeforeApply });
 
   if (allowOpen && openBeforeApply && mirror?.isThreadOwned && !owned) {
-    debugLog('[ownership] not owned — opening thread on Mac', { threadId });
+    debugLog('[ownership] not owned — opening thread locally', { threadId });
     try {
       await opener.openThread(threadId, openThreadOptions);
       openedForOwnership = true;
@@ -4448,7 +4448,7 @@ function applyMobileSendState(transcript: ThreadTranscript, settings: HelperSett
     sendState: {
       canSend: false,
       reason: 'mobile_send_disabled',
-      label: 'Mobile sending is off on the Mac.'
+      label: 'Mobile sending is off on this computer.'
     }
   });
 }
@@ -5063,7 +5063,7 @@ function attachWebSocketEvents(
   server.on('upgrade', (request, socket, head) => {
     // Wrap the async work so that any thrown error is logged and the socket is
     // closed cleanly. Without this, a rejection from registry.validate (e.g. the
-    // macOS Keychain command failing) becomes an unhandled rejection — fatal on
+    // platform credential-store command failing) becomes an unhandled rejection — fatal on
     // Node 22+ — and the helper exits, after which cloudflared sees
     // "connection refused" on every retry until the helper is restarted.
     void (async () => {
@@ -5511,8 +5511,8 @@ function buildTouchCommands(hasActiveThread: boolean) {
       context: 'global'
     },
     {
-      id: 'open-on-mac',
-      label: 'Open on Mac',
+      id: 'open-on-computer',
+      label: 'Open locally',
       description: 'Open the active thread locally.',
       action: 'open_on_mac',
       enabled: hasActiveThread,

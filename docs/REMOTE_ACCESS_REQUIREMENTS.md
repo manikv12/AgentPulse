@@ -2,7 +2,7 @@
 
 ## Summary
 
-The next milestone after the LAN release should allow paired devices to reach the Mac helper from outside the local network.
+The next milestone after the LAN release should allow paired devices to reach the local helper from outside the local network.
 
 The preferred direction is to extend the current local-first architecture, not rebuild the product around Firebase or a cloud-sync-first model.
 
@@ -12,14 +12,14 @@ This document defines the requirements, architectural direction, locked decision
 
 ## Problem Statement
 
-Today Agent Pulse works well on the same trusted LAN as the Mac helper. That is enough for a desk tablet, but it does not cover these next-step use cases:
+Today Agent Pulse works well on the same trusted LAN as the local helper. That is enough for a desk tablet, but it does not cover these next-step use cases:
 
 - checking threads from outside the home or office
 - opening the dashboard from a phone on cellular
-- using Agent Pulse while traveling away from the Mac's local network
+- using Agent Pulse while traveling away from the helper computer's local network
 - preparing the system for a future hosted product without throwing away the current helper model
 
-The remote-access design must preserve the core product shape: the Mac helper remains the authority that reads local agent state and mediates all actions.
+The remote-access design must preserve the core product shape: the helper remains the authority that reads local agent state and mediates all actions.
 
 ## Current Architecture Constraints
 
@@ -155,10 +155,10 @@ The following decisions are normative for Phase 1 and are not open research ques
 ## Operational Requirements
 
 - Remote access must not require manual router port forwarding for the primary supported setup.
-- The remote entrypoint must recover cleanly after helper restart, Mac sleep/wake, and network change. Recovery target: reconnect within 30 seconds of the network event, or surface a specific actionable error in the settings UI.
+- The remote entrypoint must recover cleanly after helper restart, helper-computer sleep/wake, and network change. Recovery target: reconnect within 30 seconds of the network event, or surface a specific actionable error in the settings UI.
 - On first enable, the helper detects whether the tunnel binary is installed and authenticated. If not, the UI guides the user through install and provider login. The helper must not silently auto-install system binaries.
 - The helper must surface whether the remote dependency is installed, authenticated, and connected — both as a status string and as discrete machine-readable fields suitable for the settings UI checklist.
-- The supervised tunnel survives Mac restart via the existing helper auto-start mechanism. Keychain access while the screen is locked must not block tunnel reconnect.
+- The supervised tunnel survives helper-computer restart via the existing helper auto-start mechanism. Credential-store access while the screen is locked must not block tunnel reconnect.
 - The remote solution must support WebSocket traffic reliably enough for live thread updates: live event end-to-end latency under 1 second p95 for a single client on a typical home network.
 - The helper must remain responsive with at least 5 simultaneous live remote WebSocket clients. No hard cap on paired devices is enforced in Phase 1.
 - The remote solution must provide a stable hostname, not a constantly changing ad hoc URL.
@@ -237,7 +237,7 @@ Must-have:
 - WebSocket stability over long-lived (multi-hour) sessions.
 - Stable hostname; not a constantly changing ad hoc URL.
 - No inbound port forwarding required.
-- Supervisable from the helper as a managed child process on macOS.
+- Supervisable from the helper as a managed child process on macOS and Windows.
 - Exposes connection health the helper can surface in the UI.
 
 Nice-to-have:
@@ -275,7 +275,7 @@ The first remote-access milestone is complete when every bullet below can be ver
 - The helper remains responsive and continues to push live updates with at least 5 simultaneous remote WebSocket clients.
 - Revoking a device terminates its active remote sessions and any in-flight WebSocket connections within 5 seconds, and blocks all future remote requests for that device.
 - Disabling remote access stops the public entrypoint within 5 seconds and does not affect LAN mode if LAN is also enabled.
-- After Mac sleep/wake or Wi-Fi change, the public entrypoint reconnects within 30 seconds, or the settings UI surfaces a specific actionable error.
+- After helper-computer sleep/wake or Wi-Fi change, the public entrypoint reconnects within 30 seconds, or the settings UI surfaces a specific actionable error.
 - A WebSocket upgrade attempt from an origin not in the helper-managed allowlist is rejected.
 - A scripted brute-force attempt against the pairing endpoint trips rate-limit lockout before the PIN space can be exhausted within the PIN TTL.
 - The settings UI shows remote status, public URL, last connection error, and the dependency/auth-state checklist.

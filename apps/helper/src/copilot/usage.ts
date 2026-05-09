@@ -18,6 +18,7 @@ type ExecFileAsyncLike = (
 type CopilotTokenResolverOptions = {
   env?: NodeJS.ProcessEnv;
   execFileImpl?: ExecFileAsyncLike;
+  platform?: NodeJS.Platform;
 };
 
 type CopilotConfigTokenLookup = {
@@ -80,6 +81,7 @@ export async function resolveCopilotToken(
 ): Promise<string | undefined> {
   const env = options.env ?? process.env;
   const execFileImpl = options.execFileImpl ?? execFileAsync;
+  const currentPlatform = options.platform ?? process.platform;
   const envToken = env.COPILOT_GITHUB_TOKEN ?? env.GH_TOKEN ?? env.GITHUB_TOKEN;
   if (envToken?.trim()) {
     return envToken.trim();
@@ -95,7 +97,11 @@ export async function resolveCopilotToken(
     return ghToken;
   }
 
-  const keychainToken = await readTokenFromKeychain(configLookup.keychainAccounts, execFileImpl);
+  const keychainToken = await readTokenFromKeychain(
+    configLookup.keychainAccounts,
+    execFileImpl,
+    currentPlatform
+  );
   if (keychainToken) {
     return keychainToken;
   }
@@ -181,8 +187,13 @@ async function readTokenFromCopilotConfig(configPath: string): Promise<CopilotCo
 
 async function readTokenFromKeychain(
   keychainAccounts: string[],
-  execFileImpl: ExecFileAsyncLike
+  execFileImpl: ExecFileAsyncLike,
+  platform: NodeJS.Platform
 ): Promise<string | undefined> {
+  if (platform !== 'darwin') {
+    return undefined;
+  }
+
   const attempts = dedupeAttempts([
     ...keychainAccounts.map((account) => ['find-generic-password', '-w', '-s', 'copilot-cli', '-a', account]),
     ['find-generic-password', '-w', '-s', 'copilot-cli', '-a', 'github.com'],

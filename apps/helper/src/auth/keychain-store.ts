@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, platform } from 'node:os';
 import type { DeviceRecord, DeviceStore } from './pairing';
 
 type ExecFileCommand = (
@@ -282,6 +282,9 @@ function parseDeviceRecord(raw: string): DeviceRecord | undefined {
 }
 
 function defaultLoginKeychainPath(): string | undefined {
+  if (platform() !== 'darwin') {
+    return undefined;
+  }
   const home = homedir();
   return home ? `${home}/Library/Keychains/login.keychain-db` : undefined;
 }

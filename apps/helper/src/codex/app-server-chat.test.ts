@@ -1525,7 +1525,7 @@ describe('Codex App Server same-thread chat', () => {
     });
   });
 
-  it('blocks mobile sends when Codex is waiting for approval on the Mac', async () => {
+  it('blocks mobile sends when Codex is waiting for approval on the helper computer', async () => {
     const transport = fakeTransport([
       threadResponse('thread-1', 'active', [turn('turn-live', 'inProgress')], ['waitingOnApproval'])
     ]);

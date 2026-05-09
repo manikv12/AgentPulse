@@ -10,6 +10,7 @@
     "dev": "pnpm --filter @agent-pulse/tablet dev",
     "dev:run": "bash ./scripts/dev-run-all.sh",
     "dev:run:local": "bash ./scripts/dev-run.sh",
+    "package:npm": "pnpm build && node scripts/package-npm.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "tsc -p tsconfig.json --noEmit"

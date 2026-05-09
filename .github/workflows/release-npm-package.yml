@@ -1,0 +1,134 @@
+name: Release npm package
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-smoke:
+    name: Windows helper smoke
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test Windows helper behavior
+        run: pnpm vitest run apps/helper/src/platform/paths.test.ts apps/helper/src/auth/file-device-store.test.ts apps/helper/src/auth/device-store.test.ts apps/helper/src/single-instance.test.ts apps/helper/src/copilot/usage.test.ts apps/helper/src/codex/app-server-client.test.ts apps/helper/src/codex/thread-opener.test.ts
+
+      - name: Build and install release tarball
+        shell: pwsh
+        run: |
+          pnpm package:npm
+          $tarball = Get-ChildItem dist/release/*.tgz | Select-Object -First 1
+          $installPrefix = Join-Path $env:RUNNER_TEMP "agent-pulse-install"
+          npm install --prefix $installPrefix -g $tarball.FullName
+
+          $command = Join-Path $installPrefix "agent-pulse.cmd"
+          if (!(Test-Path $command)) {
+            throw "Missing installed agent-pulse command at $command"
+          }
+
+          $stdout = Join-Path $env:RUNNER_TEMP "agent-pulse.out.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "agent-pulse.err.log"
+          $first = Start-Process -FilePath $command -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          try {
+            Start-Sleep -Seconds 5
+
+            if ($first.HasExited) {
+              Get-Content $stdout -ErrorAction SilentlyContinue
+              Get-Content $stderr -ErrorAction SilentlyContinue
+              throw "Packaged helper exited before the smoke test could use it."
+            }
+
+            $secondOut = Join-Path $env:RUNNER_TEMP "agent-pulse-second.out.log"
+            $secondErr = Join-Path $env:RUNNER_TEMP "agent-pulse-second.err.log"
+            $second = Start-Process -FilePath $command -RedirectStandardOutput $secondOut -RedirectStandardError $secondErr -Wait -PassThru
+            if ($second.ExitCode -eq 0) {
+              throw "Second helper instance started successfully, but it should have been blocked."
+            }
+            $secondReportedLock = (Select-String -Path $secondOut -Pattern "already running" -Quiet -ErrorAction SilentlyContinue) -or (Select-String -Path $secondErr -Pattern "already running" -Quiet -ErrorAction SilentlyContinue)
+            if (!$secondReportedLock) {
+              Get-Content $secondOut -ErrorAction SilentlyContinue
+              Get-Content $secondErr -ErrorAction SilentlyContinue
+              throw "Second helper did not report the single-instance lock."
+            }
+
+            if (!(Select-String -Path $stdout -Pattern "Agent Pulse helper running at" -Quiet)) {
+              Get-Content $stdout -ErrorAction SilentlyContinue
+              Get-Content $stderr -ErrorAction SilentlyContinue
+              throw "Packaged helper did not print its startup URL."
+            }
+          } finally {
+            if (!$first.HasExited) {
+              Stop-Process -Id $first.Id -Force
+            }
+          }
+
+  package:
+    name: Build release tarball
+    runs-on: ubuntu-latest
+    needs: windows-smoke
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test helper package paths
+        run: pnpm vitest run apps/helper/src/platform/paths.test.ts apps/helper/src/auth/file-device-store.test.ts apps/helper/src/auth/device-store.test.ts apps/helper/src/single-instance.test.ts apps/helper/src/copilot/usage.test.ts apps/helper/src/codex/app-server-client.test.ts
+
+      - name: Build npm package tarball
+        run: pnpm package:npm
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-pulse-helper-tarball
+          path: dist/release/*.tgz
+          if-no-files-found: error
+
+      - name: Upload tarball to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release/*.tgz

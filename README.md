@@ -4,13 +4,13 @@
 
 # Agent Pulse
 
-Agent Pulse is a browser-based control surface for local coding agents running on your Mac.
+Agent Pulse is a browser-based control surface for local coding agents running on your computer.
 
 It gives you one live dashboard for active agent work, recent threads, approvals, transcripts, models, and health. Open it on an iPad, Android tablet, phone, or desktop browser so you can watch and steer work even when you are not sitting next to your computer.
 
 ![Agent Pulse dashboard preview](assets/agent-pulse-readme-hero.png)
 
-Agent Pulse is local-first with optional remote access: the helper runs on your Mac, reads local agent state, and serves a paired web app to trusted devices. When remote access is enabled, the helper can expose that same paired web app through a Cloudflare Tunnel.
+Agent Pulse is local-first with optional remote access: the helper runs on your Mac or Windows PC, reads local agent state, and serves a paired web app to trusted devices. When remote access is enabled, the helper can expose that same paired web app through a Cloudflare Tunnel.
 
 ## Supported Providers
 
@@ -32,7 +32,7 @@ From a paired tablet, phone, or browser, Agent Pulse can:
 - see active and recent threads across supported providers
 - tell which provider owns each thread with clear provider color and icons
 - show running, waiting, review, error, and idle status
-- open a Codex thread on the Mac
+- open a Codex thread on the helper computer when the provider supports it
 - view transcript history and loaded screenshots/images from provider history
 - send follow-up messages to supported providers
 - start new provider-backed threads from known workspaces
@@ -42,16 +42,16 @@ From a paired tablet, phone, or browser, Agent Pulse can:
 - respond to supported approvals and plan requests
 - manage pairing, local access, and Cloudflare Tunnel remote access settings
 
-The browser UI is the control and visibility surface. The Mac helper remains the trusted process that talks to local agents and owns the local data.
+The browser UI is the control and visibility surface. The local helper remains the trusted process that talks to local agents and owns the local data.
 
 ## How It Works
 
 Agent Pulse has three main parts:
 
-1. **Local agents on your Mac**
+1. **Local agents on your computer**
    Codex, Claude Code, GitHub Copilot, and app-server style backends keep their own local sessions and state.
 2. **Agent Pulse helper**
-   A macOS helper service reads local agent data, tracks status changes, handles pairing, and exposes one safe API for the browser UI.
+   A macOS or Windows helper service reads local agent data, tracks status changes, handles pairing, and exposes one safe API for the browser UI.
 3. **Browser web app**
    A React/Vite web app that connects to the helper over a paired HTTP and WebSocket connection.
 
@@ -63,7 +63,7 @@ Tablet / phone / browser
         | paired HTTP + WebSocket
         | local LAN or optional Cloudflare Tunnel
         v
-Agent Pulse helper on macOS
+Agent Pulse helper on macOS or Windows
         |
         +--> Codex desktop + app-server + ~/.codex
         +--> Claude Code session files / live process
@@ -75,7 +75,7 @@ Agent Pulse helper on macOS
 
 Agent Pulse is currently designed for a trusted personal setup:
 
-- the helper runs on macOS
+- the helper runs on macOS or Windows
 - paired devices can use the browser UI from the local network
 - optional remote access can expose the same paired UI through the helper-managed Cloudflare Tunnel flow
 - pairing is required before a device can read or control thread data
@@ -91,20 +91,20 @@ More detailed product and architecture notes live here:
 
 ## Platform Requirements
 
-Agent Pulse is macOS-first.
+Agent Pulse is local-helper first. The helper can be packaged for macOS and Windows, with macOS still the most complete provider-control path today.
 
 You need:
 
-- a Mac running the helper
+- a Mac or Windows PC running the helper
 - at least one supported local provider, such as Codex, Claude Code, or GitHub Copilot
 - `pnpm` for local development
 - an iPad, Android tablet, phone, or browser-capable display for local or remote access
 
-The client is just a web app. The helper depends on local macOS behavior for pairing storage, provider discovery, and opening local apps.
+The client is just a web app. The helper uses platform-specific storage for pairing and settings. Some provider actions still depend on what the local provider supports on that operating system.
 
 ## Repository Layout
 
-- `apps/helper`: macOS helper server, provider adapters, pairing, settings, remote access, and API routes
+- `apps/helper`: local helper server, provider adapters, pairing, settings, remote access, and API routes
 - `apps/tablet`: React/Vite browser UI for tablet, phone, and desktop access
 - `packages/shared`: shared schemas, provider types, thread types, and API contracts
 - `docs`: product and architecture requirements
@@ -150,9 +150,38 @@ After the helper starts:
 4. Pair the device.
 5. Use the dashboard to monitor and control supported agent threads.
 
+## Build The GitHub Release npm Package
+
+Build a tarball that can be uploaded to a GitHub Release:
+
+```bash
+pnpm package:npm
+```
+
+The package is written to:
+
+```text
+dist/release/agent-pulse-helper-0.1.0.tgz
+```
+
+Users can install that release artifact with npm:
+
+```bash
+npm install -g https://github.com/manikv12/AgentPulse/releases/download/v0.1.0/agent-pulse-helper-0.1.0.tgz
+agent-pulse
+```
+
+The npm command starts the helper and prints the settings URL. If another Agent Pulse helper is already running, the second command exits instead of starting a duplicate helper.
+
+On Windows, the helper stores settings, pairing data, and the single-instance lock under:
+
+```text
+%APPDATA%\Agent Pulse
+```
+
 ## Remote Access With Cloudflare Tunnel
 
-Agent Pulse can be used away from your Mac when remote access is enabled. The Mac still runs the helper and talks to the local agents, but your phone, tablet, or browser can reach the paired Agent Pulse UI through a Cloudflare Tunnel URL.
+Agent Pulse can be used away from your computer when remote access is enabled. Your Mac or Windows PC still runs the helper and talks to the local agents, but your phone, tablet, or browser can reach the paired Agent Pulse UI through a Cloudflare Tunnel URL.
 
 Basic flow:
 
@@ -167,7 +196,7 @@ Basic flow:
 
 Remote access notes:
 
-- The Mac must stay awake and the Agent Pulse helper must keep running.
+- The helper computer must stay awake and the Agent Pulse helper must keep running.
 - Pairing is still required; the tunnel does not make raw provider data public.
 - The remote URL is managed by the helper and can change if the tunnel is restarted or remote access is turned off and on.
 - If you only want local network access, leave remote access off and use the LAN URL from settings.
@@ -189,6 +218,6 @@ This keeps the browser simple and safer. The paired web app talks to Agent Pulse
 ## Notes
 
 - Agent Pulse is local-first and personal-workspace focused.
-- Windows is not supported by the helper today.
+- Windows helper support is available through the npm package path; some provider-specific controls still depend on the local provider's own Windows support.
 - Image display from provider history is supported where transcripts expose images, but composer image sending is not fully wired yet.
 - Provider support will continue to expand behind the shared helper API.

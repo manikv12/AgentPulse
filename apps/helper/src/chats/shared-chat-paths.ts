@@ -7,11 +7,12 @@ import {
   type Project,
   type Thread
 } from '@agent-pulse/shared';
+import { agentPulseDataPath } from '../platform/paths';
 
 export const SHARED_CHAT_WORKSPACE = 'Chats';
 
 export function defaultSharedChatRoot(): string {
-  return path.join(homedir(), 'Library', 'Application Support', 'Agent Pulse', 'Chats');
+  return agentPulseDataPath('Chats');
 }
 
 export function normalizeSharedChatRoot(chatRoot?: string): string {

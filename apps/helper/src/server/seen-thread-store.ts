@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import path from 'node:path';
+import { agentPulseDataPath } from '../platform/paths';
 
 // 14 days. Entries older than this are dropped on every read/write — see the
 // note in CodexPulse design discussion. The UI on the tablet uses a shorter
@@ -33,13 +33,7 @@ export class SeenThreadStore {
   private loaded = false;
 
   constructor(
-    private readonly storePath: string = path.join(
-      homedir(),
-      'Library',
-      'Application Support',
-      'Agent Pulse',
-      'seen-thread-activity.json'
-    ),
+    private readonly storePath: string = agentPulseDataPath('seen-thread-activity.json'),
     private readonly now: () => number = () => Date.now()
   ) {}
 

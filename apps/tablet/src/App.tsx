@@ -473,7 +473,7 @@ function summarizePendingRequest(raw: unknown): PendingRequestSummary | null {
       turnId: typeof params.turnId === 'string' ? params.turnId : undefined,
       // Pass the raw params through so the renderer can show answer options
       // (options + freeform fallback) — without this the tablet just shows
-      // "Open Codex on your Mac to answer." with no way to respond.
+      // "Open Codex on this computer to answer." with no way to respond.
       params: req.params as Record<string, unknown> | undefined
     };
   }
@@ -3239,7 +3239,7 @@ function ChooserScreen({
             </span>
             <span className="chooser-tile-title">Connect a device</span>
             <span className="chooser-tile-copy">
-              Pair this tablet with the Mac helper using a 6-digit PIN.
+              Pair this tablet with the helper using a 6-digit PIN.
             </span>
           </button>
           <button className="chooser-tile" type="button" onClick={onAdmin}>
@@ -3315,7 +3315,7 @@ function PairingScreen({
         <AppMark size="lg" />
         <p className="eyebrow">Connect a device</p>
         <h1>Pair this display</h1>
-        <p className="simple-copy">Enter the PIN shown in admin mode on your Mac.</p>
+        <p className="simple-copy">Enter the PIN shown in admin mode on the helper.</p>
         <form
           onSubmit={(event) => {
             event.preventDefault();
@@ -3421,7 +3421,7 @@ function AdminLoginScreen({
         <p className="eyebrow">Admin mode</p>
         <h1>Enter passcode</h1>
         <p className="simple-copy">
-          The passcode is printed in the Mac helper console the first time you launch it.
+          The passcode is printed in the helper console the first time you launch it.
         </p>
         <form
           onSubmit={(event) => {
@@ -3472,7 +3472,7 @@ function OfflineScreen({ onRetry }: { onRetry: () => void }) {
       <div className="surface-panel state-panel">
         <AlertTriangle size={42} />
         <h1>Helper offline</h1>
-        <p className="simple-copy">The Mac helper is not reachable right now.</p>
+        <p className="simple-copy">The helper is not reachable right now.</p>
         <button className="primary-action full-width" type="button" onClick={onRetry}>
           <RefreshCw size={20} />
           Try again

@@ -4825,7 +4825,7 @@ describe('Agent Pulse tablet UI', () => {
       sendState: {
         canSend: false,
         reason: 'mobile_send_disabled',
-        label: 'Mobile sending is off on the Mac.'
+        label: 'Mobile sending is off on this computer.'
       },
       messages: [
         {
@@ -4913,7 +4913,7 @@ describe('Agent Pulse tablet UI', () => {
     expect(within(drawer).queryByText('Sync')).not.toBeInTheDocument();
     expect(await screen.findByText('I am working on it.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
-    expect(screen.getByText('Mobile sending is off on the Mac.')).toBeInTheDocument();
+    expect(screen.getByText('Mobile sending is off on this computer.')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Close thread chat' }));
     fireEvent.click(screen.getByRole('button', { name: /Open chat for Implement mobile chat/ }));

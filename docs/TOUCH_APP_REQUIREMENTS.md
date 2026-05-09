@@ -4,7 +4,7 @@
 
 Agent Pulse v1 is a touch-controlled app for Codex.
 
-The first version runs as a local web app on an iPad, Android tablet, or small touch-screen browser device. The Mac runs Codex and the Agent Pulse helper. The tablet is the control screen.
+The first version runs as a local web app on an iPad, Android tablet, or small touch-screen browser device. The helper computer runs Codex and the Agent Pulse helper. The tablet is the control screen.
 
 ## Goal
 
@@ -16,14 +16,14 @@ When many Codex threads are running, the user should be able to glance at a desk
 - which thread has an error
 - which workspace the thread belongs to
 
-The user should be able to tap a thread on the tablet and open that thread in Codex on the Mac.
+The user should be able to tap a thread on the tablet and open that thread in Codex on the helper computer.
 
 ## Glossary
 
 - **Thread**: a Codex conversation as shown in Codex Desktop / VS Code, identified by a stable thread ID.
 - **Session**: a single run of Codex producing turns and tool calls for a thread.
 - **Rollout**: the on-disk JSONL file under `~/.codex/sessions/...` that records a session's events.
-- **Helper**: the local Agent Pulse Mac service that reads Codex state and serves the touch app.
+- **Helper**: the local Agent Pulse service that reads Codex state and serves the touch app.
 - **Tablet**: any paired browser client (iPad Safari, Android Chrome, kiosk browser).
 
 In the API and UI, "thread" is the user-visible unit. Sessions and rollouts are implementation details inside the helper.
@@ -32,7 +32,7 @@ In the API and UI, "thread" is the user-visible unit. Sessions and rollouts are 
 
 The first product is:
 
-- A local Mac helper service.
+- A local macOS or Windows helper service.
 - A touch web app served by that helper.
 - A dashboard that works on iPad Safari and Android Chrome.
 - A local-only system by default.
@@ -117,11 +117,11 @@ The v1 touch app includes:
 Example flow:
 
 1. User opens Agent Pulse on an iPad.
-2. The iPad shows the running Codex threads from the Mac.
+2. The iPad shows the running Codex threads from the helper computer.
 3. One thread changes to yellow because it needs approval.
 4. User taps that thread on the iPad.
-5. Codex opens the matching thread on the Mac.
-6. User reviews and approves inside Codex on the Mac.
+5. Codex opens the matching thread on the helper computer.
+6. User reviews and approves inside Codex on the helper computer.
 
 Important: the tablet opens the thread. It does not approve the permission by itself in v1.
 
@@ -138,7 +138,7 @@ Agent Pulse touch web app
         |
         | local network API
         v
-Agent Pulse helper on Mac
+Agent Pulse helper on macOS or Windows
         |
         +--> codex app-server
         +--> ~/.codex local state
@@ -212,9 +212,9 @@ Security rules:
 
 ### Token lifetime
 
-- Tokens are stored in macOS Keychain under an Agent Pulse service entry (e.g. `com.agentpulse.helper`), scoped per device.
+- Tokens are stored in platform-local helper storage: macOS Keychain on macOS, and `%APPDATA%\Agent Pulse\devices.json` on Windows.
 - Tokens have no fixed expiry but can be rotated or revoked at any time from helper settings.
-- Helper restart preserves tokens; reinstalling the helper or clearing the Keychain entry resets all pairings.
+- Helper restart preserves tokens; clearing the platform-local pairing store resets all pairings.
 - A "rotate token" action invalidates the old token and emits a fresh pairing PIN for that device.
 
 ### Rate limits
@@ -238,7 +238,7 @@ The touch app keeps the same privacy promise:
 - No telemetry in v1.
 - No third-party server in v1.
 - No cloud account needed.
-- Codex data stays on the Mac and paired tablet.
+- Codex data stays on the helper computer and paired tablet.
 - The tablet receives only summary data needed for the dashboard.
 
 ## Required Screens
@@ -274,7 +274,7 @@ Requirements:
 - Does not hide important state behind small hover-only controls.
 - Uses short labels and simple language.
 - Has a dark mode friendly design.
-- Recovers cleanly when the Mac sleeps or the helper restarts.
+- Recovers cleanly when the helper computer sleeps or the helper restarts.
 
 ## Helper API Requirements
 
@@ -285,7 +285,7 @@ Requirements:
 
 ### Action endpoints
 
-- `POST thread/open` → opens a thread in Codex on the Mac. Body: `{ threadId: string }`. Response: `{ ok: boolean, error?: string }`.
+- `POST thread/open` → opens a thread in Codex on the helper computer. Body: `{ threadId: string }`. Response: `{ ok: boolean, error?: string }`.
 - `POST device/pair` → exchanges PIN for token. Body: `{ pin: string, deviceName: string }`. Response: `{ token: string, deviceId: string }`.
 - `POST device/revoke` → revokes a device. Body: `{ deviceId: string }`. Response: `{ ok: boolean }`.
 
@@ -319,10 +319,10 @@ The helper does not send raw rollout content, file paths, or tool-call arguments
 
 ## Tap-to-Open Mechanism (open question)
 
-`thread/open` requires the helper to focus the matching Codex thread on the Mac. The Codex `remote_control` feature flag exists but is not stable enough to depend on (see below). Candidate approaches to evaluate during design:
+`thread/open` requires the helper to focus the matching Codex thread on the local computer when the provider supports it. The Codex `remote_control` feature flag exists but is not stable enough to depend on (see below). Candidate approaches to evaluate during design:
 
 - Codex Desktop deep link (e.g. `codex://thread/<id>`), if one exists or can be added.
-- AppleScript / `osascript` to focus Codex Desktop and select the thread.
+- AppleScript / `osascript` on macOS, or the registered `codex://` URL handler on Windows, to focus Codex Desktop and select the thread.
 - A small accessibility-API helper that activates the Codex window.
 - Falling back to opening Codex Desktop with no thread selection if no targeted method works.
 
@@ -355,7 +355,7 @@ The first version does not include:
 - Auto approval from the tablet.
 - Direct tablet access to Codex files.
 - Direct tablet access to `codex app-server`.
-- Remote control of the Mac desktop.
+- Remote control of the helper computer desktop.
 
 ## Acceptance Criteria
 
@@ -365,7 +365,7 @@ The touch MVP is ready when:
 - A paired Android tablet can open the dashboard in Chrome.
 - Unpaired devices cannot see thread data.
 - The dashboard updates within 2 seconds when a Codex thread status changes.
-- Tapping a thread opens that thread in Codex on the Mac.
+- Tapping a thread opens that thread in Codex on the helper computer.
 - Revoking a device blocks future access immediately.
 - Helper restart keeps paired devices unless the user resets them.
 - LAN mode can be disabled completely; the listener stops accepting connections within 1 second.

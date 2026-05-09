@@ -892,7 +892,7 @@ function FileChangeSummaryCard({
   const disabledReason =
     summary.canUseCodexApplyPatch
       ? undefined
-      : summary.unavailableReason ?? 'Open Codex on your Mac to use this action.';
+      : summary.unavailableReason ?? 'Open Codex on this computer to use this action.';
   return (
     <section
       className={`codex-file-change-card${collapsed ? ' codex-file-change-card--collapsed' : ''}`}
@@ -1948,10 +1948,10 @@ export function ThreadView({
 
   // Status bar text logic:
   // - When sending: "Sending to {provider}..."
-  // - When sendState blocks sending: show the explicit reason (e.g. "Approve on Mac to continue")
-  //   only for hard blocks that really require the user to wait or use the Mac.
+  // - When sendState blocks sending: show the explicit reason (e.g. "Approve in Codex to continue")
+  //   only for hard blocks that really require the user to wait or use the helper computer.
   // - Else when the provider says the thread is active: "{provider} is working"
-  // - Otherwise: sendState.label (which may be "Ready", "Mobile sending is off on the Mac.", etc.)
+  // - Otherwise: sendState.label (which may be "Ready", "Mobile sending is off on this computer.", etc.)
   // - If loading and no transcript yet: "Loading conversation..."
   const sendBlockedLabel =
     transcript && !transcript.sendState.canSend && isHardSendBlock
@@ -3687,7 +3687,7 @@ export function ThreadView({
             <article className="codex-pending-request">
               <header className="codex-pending-request-title">Codex is waiting for approval</header>
               <p className="codex-pending-request-hint">
-                Waiting for the live approval details. Open Codex on your Mac if the buttons do not
+                Waiting for the live approval details. Open Codex on this computer if the buttons do not
                 appear.
               </p>
             </article>
@@ -4829,7 +4829,7 @@ function PendingRequestRow({
           </button>
         </div>
       ) : (
-        <p className="codex-pending-request-hint">Open Codex on your Mac to answer.</p>
+        <p className="codex-pending-request-hint">Open Codex on this computer to answer.</p>
       )}
       {error ? <p className="codex-pending-request-error">{error}</p> : null}
     </article>
@@ -4896,7 +4896,7 @@ function QuestionAnswerForm({
   const submitDisabled = Boolean(submitting) || !allAnswered;
 
   if (questions.length === 0) {
-    return <p className="codex-pending-request-hint">Open Codex on your Mac to answer.</p>;
+    return <p className="codex-pending-request-hint">Open Codex on this computer to answer.</p>;
   }
 
   return (

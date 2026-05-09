@@ -92,7 +92,9 @@ describe('resolveCopilotToken', () => {
       })
     );
 
-    await expect(resolveCopilotToken(copilotHome, { env: {}, execFileImpl })).resolves.toBe('keychain-token');
+    await expect(
+      resolveCopilotToken(copilotHome, { env: {}, execFileImpl, platform: 'darwin' })
+    ).resolves.toBe('keychain-token');
     expect(execFileImpl).toHaveBeenNthCalledWith(
       1,
       'gh',
@@ -105,5 +107,32 @@ describe('resolveCopilotToken', () => {
       ['find-generic-password', '-w', '-s', 'copilot-cli', '-a', 'https://github.com:monalisa'],
       { timeout: 2500 }
     );
+  });
+
+  it('does not call the macOS security command on Windows', async () => {
+    const copilotHome = await tempCopilotHome();
+    const execFileImpl = vi.fn(async (file: string) => {
+      if (file === 'gh') {
+        throw new Error('gh unavailable');
+      }
+      throw new Error(`unexpected command: ${file}`);
+    });
+    await writeCopilotConfig(
+      copilotHome,
+      JSON.stringify({
+        last_logged_in_user: {
+          host: 'https://github.com',
+          login: 'monalisa'
+        }
+      })
+    );
+
+    await expect(
+      resolveCopilotToken(copilotHome, { env: {}, execFileImpl, platform: 'win32' })
+    ).resolves.toBeUndefined();
+    expect(execFileImpl).toHaveBeenCalledTimes(1);
+    expect(execFileImpl).toHaveBeenCalledWith('gh', ['auth', 'token', '--hostname', 'github.com'], {
+      timeout: 2500
+    });
   });
 });

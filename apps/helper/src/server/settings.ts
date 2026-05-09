@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:net';
 import {
@@ -11,6 +10,7 @@ import {
   type AppearanceSettings,
   type RemoteAccessSettings
 } from '@agent-pulse/shared';
+import { agentPulseDataPath } from '../platform/paths';
 
 export type HelperSettings = {
   port: number;
@@ -23,13 +23,7 @@ export type HelperSettings = {
 
 export class HelperSettingsStore {
   constructor(
-    private readonly settingsPath = path.join(
-      homedir(),
-      'Library',
-      'Application Support',
-      'Agent Pulse',
-      'settings.json'
-    )
+    private readonly settingsPath = agentPulseDataPath('settings.json')
   ) {}
 
   async load(): Promise<HelperSettings> {

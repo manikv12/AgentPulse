@@ -31,6 +31,7 @@ export type ThreadOpenerOptions = {
   bundleId?: string;
   appPath?: string;
   scriptPath?: string;
+  platform?: NodeJS.Platform;
   setTimeoutFn?: typeof setTimeout;
   clearTimeoutFn?: typeof clearTimeout;
   now?: () => number;
@@ -69,6 +70,7 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
   const bundleId = options.bundleId ?? DEFAULT_BUNDLE_ID;
   const appPath = options.appPath ?? DEFAULT_APP_PATH;
   const scriptPath = options.scriptPath ?? resolveDefaultScriptPath();
+  const platform = options.platform ?? process.platform;
   const setTimeoutFn = options.setTimeoutFn ?? setTimeout;
   const clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
   const now = options.now ?? (() => Date.now());
@@ -109,6 +111,14 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
     targetUrl: string,
     options: { preflightUrl?: string; miniWindow?: boolean; miniWindowOpenMs?: number } = {}
   ): Promise<ThreadOpenResult> {
+    if (platform === 'win32') {
+      return openWindowsDeepLink(targetUrl);
+    }
+
+    if (platform !== 'darwin') {
+      return openGenericDeepLink(targetUrl);
+    }
+
     const scriptArgs = [scriptPath, bundleId, appPath, targetUrl];
     if (options.miniWindow) {
       scriptArgs.push('mini-window', String(options.miniWindowOpenMs ?? DEFAULT_MINI_WINDOW_OPEN_MS));
@@ -151,7 +161,7 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
                 ? fallbackError.message
                 : scriptError instanceof Error
                   ? scriptError.message
-                  : 'Could not refresh Codex on this Mac.'
+                  : 'Could not refresh Codex on this computer.'
           };
         }
       }
@@ -314,6 +324,14 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
 
   async function executeReveal(threadId: string): Promise<ThreadOpenResult> {
     const targetUrl = `codex://threads/${encodeURIComponent(threadId)}`;
+    if (platform === 'win32') {
+      return openWindowsDeepLink(targetUrl);
+    }
+
+    if (platform !== 'darwin') {
+      return openGenericDeepLink(targetUrl);
+    }
+
     try {
       await run('open', [targetUrl]);
       return { ok: true };
@@ -327,13 +345,17 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
           error:
             fallbackError instanceof Error
               ? fallbackError.message
-              : 'Could not open Codex on this Mac.'
+              : 'Could not open Codex on this computer.'
         };
       }
     }
   }
 
   async function executeIsCodexFrontmost(): Promise<boolean> {
+    if (platform !== 'darwin') {
+      return false;
+    }
+
     try {
       await run('osascript', [
         '-e',
@@ -348,6 +370,30 @@ export function createThreadOpener(options: ThreadOpenerOptions = {}): ThreadOpe
       return true;
     } catch {
       return false;
+    }
+  }
+
+  async function openWindowsDeepLink(targetUrl: string): Promise<ThreadOpenResult> {
+    try {
+      await run('cmd.exe', ['/c', 'start', '', targetUrl]);
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not open Codex on Windows.'
+      };
+    }
+  }
+
+  async function openGenericDeepLink(targetUrl: string): Promise<ThreadOpenResult> {
+    try {
+      await run('xdg-open', [targetUrl]);
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not open Codex.'
+      };
     }
   }
 

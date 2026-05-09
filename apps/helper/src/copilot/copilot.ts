@@ -433,6 +433,7 @@ export class CopilotProvider {
       child = this.spawnProcess(this.executable, args, {
         cwd,
         env: copilotSpawnEnv(),
+        shell: process.platform === 'win32',
         stdio: 'pipe'
       }) as ChildProcessWithoutNullStreams;
     } catch (error) {
@@ -1388,7 +1389,14 @@ function collectCopilotExecutableCandidates(): string[] {
   const pathCandidates = (process.env.PATH ?? '')
     .split(path.delimiter)
     .filter(Boolean)
-    .flatMap((dir) => [path.join(dir, 'copilot'), path.join(dir, 'github-copilot')]);
+    .flatMap((dir) => [
+      path.join(dir, 'copilot'),
+      path.join(dir, 'copilot.cmd'),
+      path.join(dir, 'copilot.exe'),
+      path.join(dir, 'github-copilot'),
+      path.join(dir, 'github-copilot.cmd'),
+      path.join(dir, 'github-copilot.exe')
+    ]);
   return [
     ...pathCandidates,
     path.join(home, '.npm-global', 'bin', 'copilot'),
@@ -1397,6 +1405,8 @@ function collectCopilotExecutableCandidates(): string[] {
     path.join(home, '.bun', 'bin', 'copilot'),
     path.join(home, '.volta', 'bin', 'copilot'),
     path.join(home, '.nvm', 'current', 'bin', 'copilot'),
+    path.join(home, 'AppData', 'Roaming', 'npm', 'copilot.cmd'),
+    path.join(home, 'AppData', 'Roaming', 'npm', 'github-copilot.cmd'),
     '/opt/homebrew/bin/copilot',
     '/usr/local/bin/copilot'
   ];
@@ -1432,6 +1442,7 @@ function copilotSpawnPath(): string {
     path.join(home, '.yarn', 'bin'),
     path.join(home, '.bun', 'bin'),
     path.join(home, '.volta', 'bin'),
+    path.join(home, 'AppData', 'Roaming', 'npm'),
     '/opt/homebrew/bin',
     '/usr/local/bin'
   ];

@@ -1,7 +1,7 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import path from 'node:path';
+import { agentPulseDataPath } from '../platform/paths';
 
 const DEFAULT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const SCRYPT_KEY_LEN = 32;
@@ -32,7 +32,7 @@ export class AdminAuth {
   constructor(options: AdminAuthOptions = {}) {
     this.credentialsPath =
       options.credentialsPath ??
-      path.join(homedir(), 'Library', 'Application Support', 'Agent Pulse', 'admin.json');
+      agentPulseDataPath('admin.json');
     this.tokenTtlMs = options.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS;
     this.now = options.now ?? (() => new Date());
     this.onPasscodeGenerated = options.onPasscodeGenerated;

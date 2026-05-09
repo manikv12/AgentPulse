@@ -950,9 +950,7 @@ function NewThreadDialog({
             </button>
           </div>
           {selectedLocation === 'chat' ? (
-            <p className="new-thread-selected-path">
-              Library/Application Support/Agent Pulse/Chats/{selectedProvider}
-            </p>
+            <p className="new-thread-selected-path">Agent Pulse/Chats/{selectedProvider}</p>
           ) : null}
 
           {selectedLocation === 'project' ? (
