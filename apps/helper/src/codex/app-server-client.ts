@@ -7,7 +7,11 @@ import { debugEnabled } from '../debug';
 import type { CodexAppServerTransport } from './app-server-chat';
 
 const STDERR_RING_LIMIT = 8 * 1024;
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// Codex can spend tens of seconds scanning very large session histories before
+// responding to `thread/read` etc. Killing the subprocess on a 30s timeout was
+// pegging the CPU in a spawn-and-kill loop on machines with big ~/.codex/sessions
+// (e.g. 10GB+). Give individual requests a generous ceiling instead.
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 const AUTH_ERROR_TEXT_PATTERNS = [
   '403 Forbidden',
   '401 Unauthorized',
@@ -241,18 +245,12 @@ export class CodexAppServerClient implements CodexAppServerTransport {
           const error = new Error(
             `Codex App Server timed out after ${timeoutMs}ms on ${method}${detail}`
           );
-          // Force restart on next request: subprocess is hung.
+          // Fail just this one request — don't kill the whole subprocess.
+          // On machines with large ~/.codex/sessions, a slow `thread/read`
+          // used to trigger a kill-and-respawn loop that pegged the CPU.
           console.warn(
-            `[codex app-server] killing pid=${this.process?.pid ?? 'unknown'} after ${timeoutMs}ms timeout on ${method}`
+            `[codex app-server] request timed out pid=${this.process?.pid ?? 'unknown'} after ${timeoutMs}ms on ${method}`
           );
-          try {
-            this.process?.kill();
-          } catch {
-            // ignore
-          }
-          this.process = undefined;
-          this.initialized = false;
-          this.emitConnectionChange(false);
           reject(error);
         }
       }, timeoutMs);

@@ -1276,20 +1276,22 @@ export class CodexAppServerChat {
         }
         state.pendingRequests.clear();
       }
-      // thread/status/changed is the authoritative running/idle signal. Do not
-      // keep an old activeTurnId alive after Codex reports a non-active status:
-      // turn/completed can arrive later, and waiting for it leaves the phone
-      // showing "Codex is working" after the desktop has already stopped.
-      state.isStreaming = type === 'active';
-      if (type !== 'active') {
+      // thread/status/changed is the only notification that should toggle isStreaming
+      // off. Codex can report a short idle/notLoaded status before turn/completed
+      // arrives; if we clear immediately, Agent Pulse hides a still-running thread.
+      // Keep the live turn until Codex sends the explicit completion event.
+      const shouldKeepActiveTurn = type !== 'active' && state.activeTurnId !== null;
+      state.isStreaming = type === 'active' || shouldKeepActiveTurn;
+      if (type !== 'active' && !shouldKeepActiveTurn) {
         state.activeTurnId = null;
         state.isCompacting = false;
       }
+      const visibleType = shouldKeepActiveTurn ? 'active' : type;
       this.emitLiveEvent({
         type: 'thread/status/changed',
         payload: {
           threadId,
-          status: mapAppServerStatus({ type, activeFlags } as AppServerThreadStatus)
+          status: mapAppServerStatus({ type: visibleType, activeFlags } as AppServerThreadStatus)
         }
       });
       this.emitThreadStateChanged(threadId);

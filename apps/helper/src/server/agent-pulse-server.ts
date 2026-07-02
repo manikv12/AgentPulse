@@ -306,6 +306,7 @@ export type CodexMirrorBridge = {
   resolveTranscriptionAuthContext?(refreshToken?: boolean): Promise<CodexTranscriptionAuthContext>;
   getFileChangeSummaries?(threadId: string): ThreadFileChangeSummary[];
   getPendingApprovalRequests?(threadId: string): PendingApprovalRequest[];
+  isThreadStreaming?(threadId: string): boolean;
   isThreadWaitingForApproval?(threadId: string): boolean;
   isThreadCompacting?(threadId: string): boolean;
   // Drops stale approval entries the mirror is still tracking for one thread.
@@ -538,7 +539,7 @@ function createWatchApnsDelivery(): WatchPushDelivery {
       const config = await resolveWatchApnsConfig(device, loadPrivateKeyPem);
       if (!config) {
         // eslint-disable-next-line no-console
-        console.info('[watch-push]', {
+        console.info('[phone-push]', {
           deviceId: device.deviceId,
           kind: notification.kind,
           threadId: notification.threadId,
@@ -735,6 +736,7 @@ function createApp(
   // status broadcast. Reset entries are fine — duplicate pushes on first sight
   // are not catastrophic, only noisy.
   const lastStatusByThread = new Map<string, Thread['status']>();
+  const pushTopicMismatchLogged = new Set<string>();
   // Pending model/effort overrides applied on the next turn/start for that thread.
   // Used by /threads/:id/model when no Codex window owns the thread. The override
   // is consumed when the user sends the next
@@ -805,6 +807,12 @@ function createApp(
 
   const pushPreferencesForDevice = (device: DeviceRecord): PushNotificationPreferences =>
     PushNotificationPreferencesSchema.parse(device.watchPushPreferences ?? {});
+  const configuredApnsTopic = (): string =>
+    process.env.AGENT_PULSE_WATCH_APNS_TOPIC?.trim() || DEFAULT_WATCH_APNS_TOPIC;
+  const deviceMatchesConfiguredPushTopic = (device: DeviceRecord): boolean => {
+    const registeredBundleId = device.watchPushBundleId?.trim();
+    return !registeredBundleId || registeredBundleId === configuredApnsTopic();
+  };
   const deviceAllowsPushNotification = (
     device: DeviceRecord,
     notification: WatchPushNotification
@@ -838,6 +846,24 @@ function createApp(
       .then((devices) => {
         if (devices.length === 0) return;
         for (const device of devices) {
+          if (!deviceMatchesConfiguredPushTopic(device)) {
+            // The watch app used to register its own APNs token. Current builds
+            // register the iPhone token and let iOS mirror alerts to Apple Watch.
+            // Sending the phone topic to an old watch token causes APNs
+            // DeviceTokenNotForTopic errors, so skip those stale registrations.
+            if (!pushTopicMismatchLogged.has(device.deviceId)) {
+              pushTopicMismatchLogged.add(device.deviceId);
+              // eslint-disable-next-line no-console
+              console.info('[phone-push]', {
+                deviceId: device.deviceId,
+                delivered: false,
+                reason: 'topic-mismatch',
+                registeredBundleId: device.watchPushBundleId,
+                configuredTopic: configuredApnsTopic()
+              });
+            }
+            continue;
+          }
           if (!deviceAllowsPushNotification(device, input)) {
             continue;
           }
@@ -845,7 +871,7 @@ function createApp(
             .send(device, input)
             .then(() => {
               // eslint-disable-next-line no-console
-              console.info('[watch-push]', {
+              console.info('[phone-push]', {
                 deviceId: device.deviceId,
                 kind: input.kind,
                 threadId: input.threadId,
@@ -856,7 +882,7 @@ function createApp(
             })
             .catch((error) => {
               // eslint-disable-next-line no-console
-              console.warn('[watch-push]', {
+              console.warn('[phone-push]', {
                 deviceId: device.deviceId,
                 kind: input.kind,
                 threadId: input.threadId,
@@ -5126,6 +5152,10 @@ export class LiveEventHub {
     client.on('close', () => this.clients.delete(client));
   }
 
+  hasClients(): boolean {
+    return this.clients.size > 0;
+  }
+
   broadcast(event: LiveEvent): void {
     const parsed = LiveEventSchema.parse(event);
     const body = JSON.stringify(parsed);
@@ -5199,9 +5229,13 @@ function startThreadPolling(
         workspaceDisplayRoots,
         chatRoot
       );
-      const toReconcile = threads.filter((thread) =>
-        shouldReconcileThread(thread, fullSweep, loadedIdsSet)
-      );
+      // Reading full Codex transcripts is the expensive part of this polling loop.
+      // Do it only when a live client can receive transcript updates; HTTP reads
+      // still fetch directly from Codex on demand.
+      const shouldBroadcastTranscripts = hub.hasClients();
+      const toReconcile = shouldBroadcastTranscripts
+        ? threads.filter((thread) => shouldReconcileThread(thread, fullSweep, loadedIdsSet))
+        : [];
       const reconciledActive = await reconcileThreads(toReconcile, appServer, transformTranscript);
 
       const reconciledById = new Map(
@@ -5329,8 +5363,9 @@ function applyAppServerLiveThreadStatus(
 ): Thread {
   // Live notification-derived state from in-memory flags (notifications are
   // pushed in real time and beat the snapshot returned by thread/loaded/list).
+  const isMirrorConnected = mirror?.isConnected() === true;
   const mirrorApprovalRequests =
-    mirror?.isConnected() && mirror?.isThreadWaitingForApproval?.(thread.threadId)
+    isMirrorConnected && mirror?.isThreadWaitingForApproval?.(thread.threadId)
       ? mirror.getPendingApprovalRequests?.(thread.threadId) ?? []
       : [];
   let inMemoryStatus: Thread['status'] | undefined;
@@ -5339,8 +5374,12 @@ function applyAppServerLiveThreadStatus(
     mirror?.isThreadWaitingForApproval?.(thread.threadId)
   ) {
     inMemoryStatus = 'waiting_approval';
+  } else if (isMirrorConnected && mirror?.isThreadCompacting?.(thread.threadId)) {
+    inMemoryStatus = 'compacting';
   } else if (appServer?.isThreadCompacting?.(thread.threadId)) {
     inMemoryStatus = 'compacting';
+  } else if (isMirrorConnected && mirror?.isThreadStreaming?.(thread.threadId)) {
+    inMemoryStatus = 'running';
   } else if (appServer?.isThreadStreaming?.(thread.threadId)) {
     inMemoryStatus = 'running';
   }

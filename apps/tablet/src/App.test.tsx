@@ -2,7 +2,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CatalogModel, ThreadMessageResponse, ThreadTranscript } from '@agent-pulse/shared';
-import { App, extractLatestModel, extractLatestReasoningEffort, extractPendingRequests } from './App';
+import {
+  App,
+  extractLatestModel,
+  extractLatestReasoningEffort,
+  extractPendingRequests,
+  shouldClearWorkingOnStreamingStopped,
+  shouldRefreshTranscriptAfterLiveEvent
+} from './App';
 import { TranscriptFetchTimeoutError } from './api';
 import { Dashboard } from './Dashboard';
 import { ThreadView } from './ThreadView';
@@ -155,6 +162,45 @@ describe('Agent Pulse tablet UI', () => {
         }
       })
     ).toBe('medium');
+  });
+
+  it('keeps Codex working state on noisy streaming stop events', () => {
+    expect(shouldClearWorkingOnStreamingStopped('thread-codex')).toBe(false);
+    expect(shouldClearWorkingOnStreamingStopped('claude-code:thread-1')).toBe(true);
+    expect(shouldClearWorkingOnStreamingStopped('copilot:thread-1')).toBe(true);
+  });
+
+  it('refreshes active live transcript events even when cached usage is present', () => {
+    expect(
+      shouldRefreshTranscriptAfterLiveEvent({
+        threadId: 'thread-live',
+        activeTurnId: 'turn-1',
+        sendState: {
+          canSend: false,
+          reason: 'thread_changed',
+          label: 'Codex is working'
+        },
+        usage: {
+          contextUsedPercent: 72
+        },
+        messages: []
+      })
+    ).toBe(true);
+    expect(
+      shouldRefreshTranscriptAfterLiveEvent({
+        threadId: 'thread-ready',
+        activeTurnId: null,
+        sendState: {
+          canSend: true,
+          reason: 'ready',
+          label: 'Ready'
+        },
+        usage: {
+          contextUsedPercent: 72
+        },
+        messages: []
+      })
+    ).toBe(false);
   });
 
   it('extracts pending permission requests from Codex patch broadcasts', () => {
@@ -2068,6 +2114,22 @@ describe('Agent Pulse tablet UI', () => {
       );
     });
 
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/status/changed',
+            payload: {
+              threadId: 'thread-live',
+              status: 'idle'
+            }
+          })
+        })
+      );
+    });
+
     await waitFor(() => expect(screen.queryByText('Codex is working')).not.toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Stop Codex' })).not.toBeInTheDocument();
   });
@@ -3853,6 +3915,19 @@ describe('Agent Pulse tablet UI', () => {
     });
 
     expect(await screen.findByText('Done now.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
+
+    await act(async () => {
+      sockets[0]?.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'thread/streaming-changed',
+            payload: { threadId: 'thread-live', isStreaming: false }
+          })
+        })
+      );
+    });
+
     expect(screen.getByRole('button', { name: 'Stop Codex' })).toBeInTheDocument();
 
     await act(async () => {

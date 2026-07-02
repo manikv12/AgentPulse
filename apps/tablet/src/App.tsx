@@ -241,6 +241,14 @@ function transcriptShowsLiveActive(transcript: ThreadTranscript): boolean {
   return false;
 }
 
+export function shouldRefreshTranscriptAfterLiveEvent(transcript: ThreadTranscript): boolean {
+  return transcriptShowsLiveActive(transcript);
+}
+
+export function shouldClearWorkingOnStreamingStopped(threadId: string): boolean {
+  return threadId.startsWith('copilot:') || threadId.startsWith('claude-code:');
+}
+
 function transcriptAfterStop(transcript: ThreadTranscript): ThreadTranscript {
   return ThreadTranscriptSchema.parse({
     ...transcript,
@@ -1719,6 +1727,13 @@ export function App() {
     [requestTranscriptRefresh]
   );
 
+  const queueTranscriptRefresh = useCallback(
+    (threadId: string) => {
+      window.setTimeout(() => requestTranscriptRefresh(threadId), 0);
+    },
+    [requestTranscriptRefresh]
+  );
+
   const clearApprovalWaitingState = useCallback(
     (threadId: string) => {
       const threadIsWaiting = threadsRef.current.some(
@@ -2248,6 +2263,7 @@ export function App() {
         }
 
         if (liveEvent.type === 'thread/transcript/changed') {
+          const shouldFetchFreshTranscript = shouldRefreshTranscriptAfterLiveEvent(liveEvent.payload);
           const guard = activeSendGuardsRef.current.get(liveEvent.payload.threadId);
           if (shouldAcceptTranscriptForActiveSend(liveEvent.payload, guard)) {
             setTranscripts((current) => upsertTranscriptCache(current, liveEvent.payload));
@@ -2255,8 +2271,8 @@ export function App() {
               activeSendGuardsRef.current.delete(liveEvent.payload.threadId);
             }
           }
-          if (!liveEvent.payload.usage) {
-            requestTranscriptRefresh(liveEvent.payload.threadId);
+          if (shouldFetchFreshTranscript) {
+            queueTranscriptRefresh(liveEvent.payload.threadId);
           }
           applyTranscriptActivityState(liveEvent.payload);
           applyTranscriptModel(
@@ -2328,12 +2344,15 @@ export function App() {
           if (isStreaming) {
             markThreadWorking(threadId);
           } else {
-            // Don't flip thread.status to idle from streaming-changed alone — Codex briefly
-            // pauses streaming between items inside one turn, and that would make the
-            // working badge flicker. Let thread/status/changed (active→idle) be the only
-            // thing that idles the thread; meanwhile we drop the spinner immediately and
-            // refresh the transcript so the latest reply text lands.
-            markThreadReady(threadId);
+            // Don't clear Codex working state from streaming-changed alone — Codex briefly
+            // pauses streaming between items inside one turn, and clearing here makes the
+            // home counter flicker 1 -> 0 -> 1 when the list snapshot still says idle.
+            // Let thread/status/changed be the thing that idles Codex. Provider-managed
+            // threads use their own live session state, so their streaming=false remains
+            // safe to apply immediately.
+            if (shouldClearWorkingOnStreamingStopped(threadId)) {
+              markThreadReady(threadId);
+            }
             requestSettledTranscriptRefresh(threadId);
           }
         }
@@ -2489,6 +2508,7 @@ export function App() {
     clearApprovalWaitingState,
     markThreadReady,
     markThreadWorking,
+    queueTranscriptRefresh,
     requestTranscriptRefresh,
     requestSettledTranscriptRefresh,
     syncWorkingStateFromThreads
