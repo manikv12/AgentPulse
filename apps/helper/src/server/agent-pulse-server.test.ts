@@ -3394,6 +3394,96 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
+  it('uses the IPC mirror streaming state when app-server loaded list misses the desktop thread', async () => {
+    const registry = new DeviceRegistry(new MemoryDeviceStore());
+    const pairing = new PairingManager(registry);
+    const thread: Thread = {
+      threadId: 'thread-mirror-running',
+      title: 'Analyze nail salon competition',
+      workspace: 'Chats',
+      status: 'idle',
+      lastActivityAt: new Date().toISOString(),
+      lastTurnSummary: ''
+    };
+    const transcript: ThreadTranscript = {
+      threadId: 'thread-mirror-running',
+      activeTurnId: null,
+      sendState: {
+        canSend: true,
+        reason: 'ready',
+        label: 'Ready'
+      },
+      messages: []
+    };
+    const appServer = {
+      isConnected: () => true,
+      listLoadedThreadStatuses: vi.fn(async () => new Map<string, Thread['status']>()),
+      readTranscript: vi.fn(async () => transcript),
+      sendMessage: vi.fn(),
+      isThreadStreaming: () => false,
+      isThreadCompacting: () => false
+    };
+    const mirror = {
+      isConnected: () => true,
+      sendMessage: vi.fn(),
+      isThreadWaitingForApproval: () => false,
+      getPendingApprovalRequests: () => [],
+      isThreadStreaming: (threadId: string) => threadId === 'thread-mirror-running',
+      isThreadCompacting: () => false,
+      isThreadOwned: () => true,
+      waitForOwnership: async () => true
+    };
+    const settings = {
+      port: await pickFreeHighPort(),
+      lanEnabled: false,
+      mobileSendEnabled: true,
+      remoteAccess: remoteAccessSettings()
+    };
+    const settingsStore = {
+      save: vi.fn(),
+      load: vi.fn()
+    } as unknown as HelperSettingsStore;
+    const opener = {
+      openThread: vi.fn(async () => ({ ok: true as const })),
+      revealThread: vi.fn(async () => ({ ok: true as const })),
+      refreshDesktop: vi.fn(),
+      dispose: vi.fn()
+    };
+    const server = await startAgentPulseServer({
+      settings,
+      settingsStore,
+      registry,
+      pairing,
+      adminAuth: createAdminAuth(),
+      threadProvider: { listThreads: async () => [thread] },
+      opener,
+      appServer,
+      mirror,
+      version: '0.1.0'
+    });
+
+    try {
+      const { token, deviceId } = await pairForTest(server.url, pairing);
+      const listResponse = await fetch(`${server.url}/threads/list`, {
+        headers: authHeaders(token, deviceId)
+      });
+
+      expect(listResponse.status).toBe(200);
+      await expect(listResponse.json()).resolves.toMatchObject({
+        threads: [
+          {
+            threadId: 'thread-mirror-running',
+            status: 'running'
+          }
+        ]
+      });
+      expect(appServer.listLoadedThreadStatuses).toHaveBeenCalled();
+      expect(appServer.readTranscript).toHaveBeenCalledWith('thread-mirror-running');
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('uses the IPC mirror approval state when Codex is waiting for permission', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
@@ -6726,7 +6816,7 @@ describe('Agent Pulse helper API', () => {
     }
   });
 
-  it('delivers a watch notification when a running thread finishes', async () => {
+  it('skips an old direct-watch push token when the helper is configured for the phone topic', async () => {
     const registry = new DeviceRegistry(new MemoryDeviceStore());
     const pairing = new PairingManager(registry);
     const settings = {
@@ -6805,30 +6895,15 @@ describe('Agent Pulse helper API', () => {
         payload: { threadId: thread.threadId, status: 'idle' }
       } as LiveEvent);
 
-      await waitForAssertion(() => {
-        expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
-      });
-      expect(watchPushDelivery.send).toHaveBeenCalledWith(
-        expect.objectContaining({
-          deviceId,
-          watchPushToken: 'push-token-12345678',
-          watchPushBundleId: 'com.agentpulse.watch',
-          watchPushEnvironment: 'sandbox'
-        }),
-        expect.objectContaining({
-          threadId: thread.threadId,
-          kind: 'finished',
-          title: 'Codex finished',
-          body: 'CodexPulse: Ready to review'
-        })
-      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(watchPushDelivery.send).not.toHaveBeenCalled();
 
       server.hub.broadcast({
         type: 'thread/status/changed',
         payload: { threadId: thread.threadId, status: 'idle' }
       } as LiveEvent);
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(watchPushDelivery.send).toHaveBeenCalledTimes(1);
+      expect(watchPushDelivery.send).not.toHaveBeenCalled();
     } finally {
       await server.stop();
     }
